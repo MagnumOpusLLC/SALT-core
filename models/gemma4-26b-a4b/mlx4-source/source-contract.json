@@ -1,0 +1,228 @@
+{
+  "schema": "salt.gemma4-mlx4-source-contract.v1",
+  "status": "metadata-qualified-payload-unverified-runtime-blocked",
+  "source": {
+    "repository": "mlx-community/gemma-4-26b-a4b-it-4bit",
+    "revision": "0d77464eeb233a2da68ebf9d7dc4edaac7db956d",
+    "declared_upstream_repository": "google/gemma-4-26B-A4B-it",
+    "declared_upstream_revision": "20da991ab4afab98e8f910c4a2e8f4fbefc404ad",
+    "semantic_reference_repository": "google/gemma-4-26B-A4B-it",
+    "semantic_reference_revision": "4d7ae4984b7db7de8f8457170b3f1a419ee76d52",
+    "transformers_revision": "242f5df996ded281cc328c5b9bcc1bee0ec48118",
+    "producer_provenance": "converter-commit-not-attested",
+    "license": "apache-2.0",
+    "license_link": "https://ai.google.dev/gemma/docs/gemma_4_license",
+    "access": "public-ungated"
+  },
+  "repository_tree": [
+    {
+      "name": ".gitattributes",
+      "storage": "git-blob",
+      "bytes": 1570,
+      "blob_id": "52373fe24473b1aa44333d318f578ae6bf04b49b",
+      "sha256": "34448b82c17d60fec9b65b1f093c115ddbaadc04beb1b0140b6bfed2e012a930",
+      "local_path": "metadata/gitattributes.txt"
+    },
+    {
+      "name": "README.md",
+      "storage": "git-blob",
+      "bytes": 753,
+      "blob_id": "0990166bfcc29f00da7e71f5616536686ff733b0",
+      "sha256": "f4750b035683ba5d6707f6d1302ac6894aef3096fff21845b9b593bc1465c888",
+      "local_path": "metadata/upstream-README.md"
+    },
+    {
+      "name": "chat_template.jinja",
+      "storage": "git-blob",
+      "bytes": 17466,
+      "blob_id": "e61bbfe9a31db79ea1e4e557b046f895ad7899d0",
+      "sha256": "36e3a42e5cf14cd0020e72d92e1fdd9970f59b82170e421f0cbe1bb42bead3f0",
+      "local_path": "metadata/chat_template.jinja"
+    },
+    {
+      "name": "config.json",
+      "storage": "git-blob",
+      "bytes": 12180,
+      "blob_id": "9e6233a7e7174ab214c49dca84f2828a8fb504ef",
+      "sha256": "419e13a27ec359654c1ce7dd06d1a87149fd07d0c8af9f770494185e62e1b2ba",
+      "local_path": "metadata/config.json"
+    },
+    {
+      "name": "generation_config.json",
+      "storage": "git-blob",
+      "bytes": 208,
+      "blob_id": "e605bb4523b1462ea9d9a3810b9e3ecf7ab7b1f6",
+      "sha256": "d4226bbe3117d2d253ba4609720ba82c6c4ce4627a9a6ae05387c78983ac03de",
+      "local_path": "metadata/generation_config.json"
+    },
+    {
+      "name": "model-00001-of-00003.safetensors",
+      "storage": "lfs",
+      "bytes": 5320218487,
+      "blob_id": "3163ffd186cf106b6bdc9fcc4eeb9960515bd622",
+      "sha256": "683f420ee09550b8027bf0335c4202e196b37eb520b60a4bcbe8690b9e388c07"
+    },
+    {
+      "name": "model-00002-of-00003.safetensors",
+      "storage": "lfs",
+      "bytes": 5363328422,
+      "blob_id": "ee972f8756bb021b6b424a52331f28f7a26d53f1",
+      "sha256": "feab2873c2976fb7ed666f8462549564a29409364388e0c8f6b015729d165e15"
+    },
+    {
+      "name": "model-00003-of-00003.safetensors",
+      "storage": "lfs",
+      "bytes": 4657658867,
+      "blob_id": "8f6e0a7ab8fade3fcdd1b917cb0f1450c4870a53",
+      "sha256": "bc607486deb1de5bc7e459932fda5c776a4f816b368feaa661bab8cfbb47e567"
+    },
+    {
+      "name": "model.safetensors.index.json",
+      "storage": "git-blob",
+      "bytes": 176940,
+      "blob_id": "f6f9e61c33077cc7e2ef701eff7056927a4a65e6",
+      "sha256": "bf198c9f5ea6462addca1966e5dd669c407537a876e82cf06db9084c5c850b13",
+      "local_path": "metadata/model.safetensors.index.json"
+    },
+    {
+      "name": "processor_config.json",
+      "storage": "git-blob",
+      "bytes": 1316,
+      "blob_id": "a086fb7e04b477c291a120b0a004abb78b11c6d2",
+      "sha256": "de3e580aebdc98272d4c4547daffe6525fcbae18a83a0e0bcf0d7444d4ee6f37",
+      "local_path": "metadata/processor_config.json"
+    },
+    {
+      "name": "tokenizer.json",
+      "storage": "lfs",
+      "bytes": 32169626,
+      "blob_id": "1ff9f3e3439a939b971f9919e821bf87e835a503",
+      "sha256": "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f"
+    },
+    {
+      "name": "tokenizer_config.json",
+      "storage": "git-blob",
+      "bytes": 2740,
+      "blob_id": "cf6235aee46a24bf71f251c0a4e7a0379948f7d2",
+      "sha256": "080d9e1aff284e2f6043889cd05367966f7c7b80e025fbc0b06745e218158656",
+      "local_path": "metadata/tokenizer_config.json"
+    }
+  ],
+  "headers": [
+    {
+      "shard": "model-00001-of-00003.safetensors",
+      "authority_path": "headers/model-00001-of-00003.safetensors.json",
+      "authority_sha256": "8900ed84cea77cd7e4b162426f85e7e6f03af64fc7c485e71b1077fd6702a1d7",
+      "header_bytes": 64091,
+      "header_sha256": "228d184bd285a79f9b5953f81d1f4e13d302264a20aa1c1db7840286e397676c",
+      "payload_bytes": 5320154388,
+      "tensor_count": 488
+    },
+    {
+      "shard": "model-00002-of-00003.safetensors",
+      "authority_path": "headers/model-00002-of-00003.safetensors.json",
+      "authority_sha256": "fc68be8b39cd6b48fd5f8abbfdde436961b2233727b99616a2ef53ef33d4d643",
+      "header_bytes": 70022,
+      "header_sha256": "e24e953b8363c11331d0fd1ee0249bf7e2bd67f80cf296c5ac11fad17a86faa6",
+      "payload_bytes": 5363258392,
+      "tensor_count": 530
+    },
+    {
+      "shard": "model-00003-of-00003.safetensors",
+      "authority_path": "headers/model-00003-of-00003.safetensors.json",
+      "authority_sha256": "e5928cce8e15b936d41e8852cf8a7c2d2785275743f30130b8559799bd35afa6",
+      "header_bytes": 90235,
+      "header_sha256": "f9010ed1a67279c1d54f454e8ad5e56394e30777b027f5bcaa8de61c4d2537fd",
+      "payload_bytes": 4657568624,
+      "tensor_count": 679
+    }
+  ],
+  "tensor_inventory": {
+    "tensor_count": 1697,
+    "tensor_payload_bytes": 15340981404,
+    "stored_dtype_bytes": {
+      "BF16": 2717731996,
+      "U32": 12623249408
+    },
+    "affine_bundle_count": 327,
+    "q4_bundle_count": 297,
+    "q8_bundle_count": 30,
+    "group_size": 64,
+    "packed_dtype": "U32",
+    "packed_word_byte_order": "little-endian",
+    "q4_nibble_order": "low-to-high",
+    "q8_byte_lane_order": "low-to-high",
+    "code_domain": "unsigned",
+    "quantization_axis": "last-dimension-contiguous-groups",
+    "matrix_orientation": "output-by-input-row-major-no-transpose",
+    "scale_dtype": "BF16",
+    "bias_dtype": "BF16",
+    "scale_bias_byte_order": "little-endian",
+    "dequantization": "q * scale + bias"
+  },
+  "module_precision": {
+    "default_affine_matrices": "Q4",
+    "language_router_projection": "Q8",
+    "language_router_import_status": "source-pinned-runtime-unqualified",
+    "vision_tower": "BF16",
+    "vision_to_text_projection": "Q4",
+    "vision_to_text_import_status": "source-pinned-import-not-yet-mapped",
+    "runtime_accumulation": "FP32"
+  },
+  "expert_import": {
+    "verdict": "byte-direct-copy-compatible-relocation-required",
+    "runtime_manifest_status": "blocked-until-gemma-geglu-runtime-exists",
+    "layers": 30,
+    "experts_per_layer": 128,
+    "source_tensor_prefix": "language_model.model.layers.{layer}.experts.switch_glu.{component}.{part}",
+    "projection_order": [
+      "gate_proj",
+      "up_proj",
+      "down_proj"
+    ],
+    "part_order": [
+      "weight",
+      "scales",
+      "biases"
+    ],
+    "expert_slot_bytes": 3345408,
+    "pool_header_bytes": 24,
+    "pool_payload_bytes": 12846366720,
+    "pool_file_bytes": 12846366744,
+    "minimum_free_after_materialize_bytes": 10737418240,
+    "copy_range_count": 34560,
+    "copy_map_sha256": "51fa40aca8cb910896328026fcfb3f07c36a7519d0bd76e6fce574ba3c178a3e",
+    "components": [
+      {
+        "name": "gate_proj",
+        "shape": [704, 2816],
+        "value_relative_offset": 0,
+        "value_bytes": 991232,
+        "scale_relative_offset": 991232,
+        "scale_bytes": 61952,
+        "bias_relative_offset": 1053184,
+        "bias_bytes": 61952
+      },
+      {
+        "name": "up_proj",
+        "shape": [704, 2816],
+        "value_relative_offset": 1115136,
+        "value_bytes": 991232,
+        "scale_relative_offset": 2106368,
+        "scale_bytes": 61952,
+        "bias_relative_offset": 2168320,
+        "bias_bytes": 61952
+      },
+      {
+        "name": "down_proj",
+        "shape": [2816, 704],
+        "value_relative_offset": 2230272,
+        "value_bytes": 991232,
+        "scale_relative_offset": 3221504,
+        "scale_bytes": 61952,
+        "bias_relative_offset": 3283456,
+        "bias_bytes": 61952
+      }
+    ]
+  }
+}

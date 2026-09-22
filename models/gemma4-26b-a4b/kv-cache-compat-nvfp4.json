@@ -1,0 +1,91 @@
+{
+  "cache_abi": {
+    "header_bytes": 256,
+    "magic": "G4KVC006",
+    "payload": "hybrid-shared-projection-v-base-finite-ieee754-binary32-little-endian",
+    "version": 6
+  },
+  "chat_template_abi": "gemma4-nvfp4-serial-v1:full-prompt;fixed-control-tokens;thinking-channel-split",
+  "engine_contract_files": [
+    "Makefile",
+    "include/salt/attn.h",
+    "include/salt/attn_batch.h",
+    "include/salt/bitmath.h",
+    "include/salt/gpu.h",
+    "include/salt/gpu_resource.h",
+    "include/salt/kernels.h",
+    "include/salt/model.h",
+    "include/salt/moe_group.h",
+    "include/salt/nvfp4.h",
+    "include/salt/salt.h",
+    "include/salt/state.h",
+    "include/salt/text_exec.h",
+    "include/salt/tokenizer.h",
+    "models/gemma4-26b-a4b/engine.config",
+    "models/gemma4-26b-a4b/gemma4.c",
+    "models/gemma4-26b-a4b/gemma4.h",
+    "models/gemma4-26b-a4b/gemma4_kv_file.h",
+    "models/gemma4-26b-a4b/gemma4_text.c",
+    "models/gemma4-26b-a4b/gemma4_text.h",
+    "models/gemma4-26b-a4b/model.c",
+    "models/gemma4-26b-a4b/nvfp4-source/source-contract.json",
+    "models/qwen36/model.c",
+    "models/registry.c",
+    "server/gemma4_build.py",
+    "server/gemma4_compat.py",
+    "src/attn.c",
+    "src/attn_batch.c",
+    "src/bitmath.c",
+    "src/cache.c",
+    "src/compiler.h",
+    "src/gpu_cuda.cu",
+    "src/gpu_metal.m",
+    "src/gpu_stub.c",
+    "src/kernels.c",
+    "src/model.c",
+    "src/moe_group.c",
+    "src/nvfp4.c",
+    "src/sha256.c",
+    "src/sha256.h",
+    "src/simd.c",
+    "src/state.c",
+    "src/text_exec.c",
+    "src/tokenizer.c",
+    "tools/engine_config.py",
+    "tools/gemma4-nvfp4-qa.py",
+    "tools/gemma4-nvfp4-source.py",
+    "tools/gemma4-qa.c",
+    "tools/gemma4-qa.py"
+  ],
+  "legacy_read_abis": [
+    {
+      "compatibility_sha256": "fa7276d75c1292b320d73b266cb8c75298b04b930d110d856884a80ef6003e6c",
+      "magic": "G4KVC005",
+      "version": 5
+    },
+    {
+      "compatibility_sha256": "760de74a551c36065460a1b7d067b3f86b85d6c781120d0df31225fc045ecdd9",
+      "magic": "G4KVC004",
+      "version": 4
+    }
+  ],
+  "model": "gemma-4-26b-a4b-it",
+  "schema": "salt.gemma4.kv-compat.v5",
+  "source_authority": {
+    "copy_map_sha256": "62fd36b05775b9462b7914af3f911998d372d8d5a200a34b9c5ae88666dce56f",
+    "role_map_sha256": "a3b605e1888cfdd23b5176b4587bf6e14944f5f71bac509b996e687a9b4a376b",
+    "source_contract_sha256": "abf0073037606dfecc1b90d0b51aaa83be712d4d44b914d3cd6d48f74c51ba6b"
+  },
+  "tokenizer_control": {
+    "bos": "<bos>",
+    "channel_close": "<channel|>",
+    "stop_token_ids": [
+      1,
+      50,
+      106
+    ],
+    "thought_open": "<|channel>thought",
+    "turn_close": "<turn|>",
+    "turn_open": "<|turn>"
+  }
+}

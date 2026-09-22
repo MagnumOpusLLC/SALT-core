@@ -1,0 +1,107 @@
+{
+  "schema": "salt.gemma4-package-plan.v1",
+  "status": "foundation-only-no-weights",
+  "model": {
+    "registry_name": "gemma4-26b-a4b",
+    "repository": "google/gemma-4-26B-A4B-it",
+    "revision": "4d7ae4984b7db7de8f8457170b3f1a419ee76d52",
+    "transformers_revision": "242f5df996ded281cc328c5b9bcc1bee0ec48118",
+    "license": "Apache-2.0"
+  },
+  "source": {
+    "dtype": "BF16",
+    "tensor_count": 1013,
+    "tensor_bytes": 51611872412,
+    "shards": [
+      {
+        "name": "model-00001-of-00002.safetensors",
+        "file_bytes": 49907246508,
+        "sha256": "1127684971bbca40465435a5cad69d67ad603bf5e61c6dfd5561fae4a3bcfdb3"
+      },
+      {
+        "name": "model-00002-of-00002.safetensors",
+        "file_bytes": 1704763408,
+        "sha256": "aab47033e1e8a492ef8e581efae1cf36478d0433567e7729b3c1728bc8970db7"
+      }
+    ]
+  },
+  "precision": {
+    "text_large_matrices": "affine-q4",
+    "q4_group_size": 64,
+    "q4_values": "U32-packed",
+    "q4_scale": "BF16",
+    "q4_bias": "BF16",
+    "text_router_norms_scalars": "BF16",
+    "vision": "BF16",
+    "runtime_accumulation": "FP32"
+  },
+  "text": {
+    "layers": 30,
+    "hidden": 2816,
+    "dense_intermediate": 2112,
+    "routed_intermediate": 704,
+    "experts": 128,
+    "topk": 8,
+    "activation": "gelu_pytorch_tanh",
+    "vision_bidirectional_local": true,
+    "global_layers": [5, 11, 17, 23, 29],
+    "sliding_window": 1024,
+    "sliding_attention": {
+      "heads": 16,
+      "kv_heads": 8,
+      "head_dim": 256,
+      "rope_dim": 256,
+      "rope_base_dim": 256,
+      "rope_type": "default",
+      "rope_theta": 10000.0
+    },
+    "global_attention": {
+      "heads": 16,
+      "kv_heads": 2,
+      "head_dim": 512,
+      "rope_dim": 128,
+      "rope_base_dim": 512,
+      "rope_type": "proportional",
+      "rope_theta": 1000000.0,
+      "shared_kv_projection": true
+    },
+    "embedding_scale_bf16": 53.0,
+    "logit_softcap": 30.0,
+    "eos_token_ids": [1, 106, 50]
+  },
+  "vision": {
+    "enabled": true,
+    "lazy": true,
+    "layers": 27,
+    "hidden": 1152,
+    "intermediate": 4304,
+    "heads": 16,
+    "head_dim": 72,
+    "patch_size": 16,
+    "position_embedding_size": 10240,
+    "pooling_kernel_size": 3,
+    "default_soft_tokens": 280,
+    "rope_theta": 100.0,
+    "projection_output": 2816,
+    "image_token_id": 258880,
+    "boi_token_id": 255999,
+    "eoi_token_id": 258882
+  },
+  "artifacts": {
+    "pool": "pool.bin",
+    "trunk": "trunk.bin",
+    "embedding": "embed.bin",
+    "head": "head.bin",
+    "vision": "vision.bin",
+    "processor": "processor_config.json",
+    "tokenizer": "tokenizer.json",
+    "generation": "generation_config.json",
+    "chat_template": "chat_template.jinja"
+  },
+  "estimates": {
+    "expert_slot_bytes": 3345408,
+    "text_package_with_separate_head_bytes": 14625429564,
+    "vision_bf16_bytes": 1145588832,
+    "total_package_bytes": 15771018396
+  }
+}

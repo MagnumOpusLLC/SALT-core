@@ -1,0 +1,7 @@
+default_stage:
+  default_modifiers:
+    QuantizationModifier:
+      targets: [Linear]
+      ignore: [lm_head, 're:.*embed.*', 're:.*router', 're:.*vision_tower.*']
+      scheme: NVFP4
+      bypass_divisibility_checks: false

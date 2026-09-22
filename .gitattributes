@@ -1,0 +1,2 @@
+# Safetensors JSON headers may carry authenticated trailing-space padding.
+models/gemma4-26b-a4b/nvfp4-source/headers/model.safetensors.header.json -text -diff

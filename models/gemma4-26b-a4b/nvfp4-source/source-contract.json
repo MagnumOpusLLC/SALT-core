@@ -1,0 +1,85 @@
+{
+  "schema": "salt.gemma4-nvfp4-source-contract.v1",
+  "status": "payload-authenticated-external-control-passed-salt-runtime-blocked",
+  "source": {
+    "repository": "RedHatAI/gemma-4-26B-A4B-it-NVFP4",
+    "revision": "985ef63dfdaf51a74df35bac3ae54a69d7bbf351",
+    "base_repository": "google/gemma-4-26B-A4B-it",
+    "access": "public-ungated",
+    "quant_method": "compressed-tensors",
+    "format": "nvfp4-pack-quantized"
+  },
+  "payload": {
+    "name": "model.safetensors",
+    "file_bytes": 16423500596,
+    "sha256": "62fd36b05775b9462b7914af3f911998d372d8d5a200a34b9c5ae88666dce56f",
+    "header_bytes": 6465576,
+    "header_sha256": "a3b605e1888cfdd23b5176b4587bf6e14944f5f71bac509b996e687a9b4a376b",
+    "header_authority_path": "headers/model.safetensors.header.json",
+    "tensor_count": 47648,
+    "tensor_payload_bytes": 16417035012,
+    "dtype_tensor_counts": {
+      "BF16": 748,
+      "F32": 23450,
+      "F8_E4M3": 11725,
+      "U8": 11725
+    },
+    "dtype_bytes": {
+      "BF16": 2645011612,
+      "F32": 93800,
+      "F8_E4M3": 1530214400,
+      "U8": 12241715200
+    }
+  },
+  "controls": {
+    "README.md": {"bytes": 1791, "sha256": "eb522ecfb2b8f44c4f5565576e8cbe8c6201e77784e605a3c582065e82e74e86", "local_path": "metadata/upstream-README.md"},
+    "chat_template.jinja": {"bytes": 12045, "sha256": "2dfbfc7d538912f4ea11d29d85b4e25d7bc26386e53f57529f1d707c28b5828c", "local_path": "metadata/chat_template.jinja"},
+    "config.json": {"bytes": 19708, "sha256": "6b9f7fb34b97dd8bbc7a771982c366a46584d6fb97fa6caf91d845af4a1da377", "local_path": "metadata/config.json"},
+    "generation_config.json": {"bytes": 203, "sha256": "5439541d3bf0ba9ade7c1122dc14703f85f32a520150351b344b14f48c574cc2", "local_path": "metadata/generation_config.json"},
+    "model.safetensors.index.json": {"bytes": 4548031, "sha256": "aac8ec3524df266ae9128b5e4f92df3054e81891b16cd4a9981309faca2f69ff", "local_path": "metadata/model.safetensors.index.json"},
+    "processor_config.json": {"bytes": 1689, "sha256": "32bdf45d2ad4cc29a0822ddd157a182de76644f0419a6228d151495256e9813c", "local_path": "metadata/processor_config.json"},
+    "recipe.yaml": {"bytes": 224, "sha256": "8e03ba6a83c2161c7841d954e6a01c6a81189109a631f75d80fdf92c96e3306d", "local_path": "metadata/recipe.yaml"},
+    "tokenizer.json": {"bytes": 32169725, "sha256": "d93b194780d6d3212d02d300123b13009b4e46871c1a8395e3294d7205d349a8", "external_only": true},
+    "tokenizer_config.json": {"bytes": 2686, "sha256": "820ad481cb4152f8df6061f4ae6ae20255777c39b77a9970f1e3cbd427b21511", "local_path": "metadata/tokenizer_config.json"}
+  },
+  "layout": {
+    "matrix_orientation": "output-by-input-row-major-no-transpose",
+    "group_size": 16,
+    "packed_dtype": "U8",
+    "packed_values_per_byte": 2,
+    "nibble_order": "low-then-high",
+    "fp4_format": "E2M1",
+    "fp4_codebook_positive": [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
+    "weight_scale_dtype": "F8_E4M3FN",
+    "weight_global_scale_dtype": "F32",
+    "input_global_scale_dtype": "F32",
+    "weight_dequantization": "fp4(code) * fp8_e4m3fn(weight_scale[row,col/16]) * reciprocal_rn(stored_weight_global_divisor[0])",
+    "activation_quantization": "dynamic-group16-fp4-with-fp8-e4m3fn-block-scale-and-input-global-scale",
+    "runtime_accumulation": "tensor-core-reference-pending"
+  },
+  "module_precision": {
+    "target": "Linear",
+    "quantized_linear_count": 11725,
+    "ignored_module_count": 222,
+    "router_projection": "BF16",
+    "vision_tower": "BF16",
+    "lm_head": "BF16"
+  },
+  "external_control": {
+    "package_receipt_sha256": "a1bfdf373773f552f9ce1eb21930c60f3ca8c7b684a5188924e18e1d5d6d685b",
+    "benchmark_receipt_sha256": "ee108a54f6a9a2403cdf92d58eb068c6a6916932b2d484ce688000c0be4bce09",
+    "coherence": "PASS",
+    "apollo": "Michael Collins",
+    "pp2048_tps": 9195.580987974046,
+    "pp2048_depth4096_tps": 7335.916707355921,
+    "tg32_tps": 51.68149968581025,
+    "tg32_depth4096_tps": 50.4895366884283
+  },
+  "salt_runtime": {
+    "status": "c99-cuda-canonical-projection-exact-tensor-core-reduction-blocked",
+    "c99_reference": "portable-arm64-x86-pass",
+    "cuda_canonical_projection": "production-matrix-diff-zero",
+    "cuda_tensor_core_projection": "blocked-measured-bit-divergence",
+    "runtime_ready": false
+  }
+}

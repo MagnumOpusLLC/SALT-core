@@ -1,0 +1,83 @@
+{
+  "schema": "salt.gemma4.kv-compat-projection.v1",
+  "compatibility_manifest": "models/gemma4-26b-a4b/kv-cache-compat.json",
+  "overrides": [
+    {
+      "logical_path": "Makefile",
+      "snapshot_path": "models/gemma4-26b-a4b/compat/v6/Makefile",
+      "snapshot_sha256": "f34e7285395963b84600379f3a3a1065c3f1d5d38dc8d04c2f7776b07fb8e212",
+      "live_projection": "pin-live-source-v1",
+      "live_sha256": "f62dd78f158cb181e1edb59b2e63f2075ca5a5172501f5b6d21eb208dbf0cf9d"
+    },
+    {
+      "logical_path": "models/gemma4-26b-a4b/gemma4_text.c",
+      "snapshot_path": "models/gemma4-26b-a4b/compat/v6/models/gemma4-26b-a4b/gemma4_text.c",
+      "snapshot_sha256": "2276829cd1e01df341577ea3e1b0227e2c54b171174ea3c74098d2543c3b6952",
+      "live_projection": "strip-physical-build-blocks-v1",
+      "physical_blocks_sha256": "5be7ea76211a01006f0d03766583803f36e5ed1c60b167db99d9cb964aedf66e"
+    },
+    {
+      "logical_path": "models/gemma4-26b-a4b/server.c",
+      "snapshot_path": "models/gemma4-26b-a4b/compat/v6/models/gemma4-26b-a4b/server.c",
+      "snapshot_sha256": "2a725507b84562a9bd0bbde21b7c7f1a2aff61be585fb54df10f0924344cfd83",
+      "live_projection": "pin-live-source-v1",
+      "live_sha256": "cd2d2d723e79f1af7f9e98f74c45cd0a220998745f10824c74df99822898d9f1"
+    },
+    {
+      "logical_path": "models/gemma4-26b-a4b/server.config",
+      "snapshot_path": "models/gemma4-26b-a4b/compat/v6/models/gemma4-26b-a4b/server.config",
+      "snapshot_sha256": "d302c130e4b722a3aa0b7cacc02e0fcd27204e70aec89e9cc451b5f17b1c224c",
+      "live_projection": "strip-physical-build-blocks-v1",
+      "physical_blocks_sha256": "7c791756b848373cd3854bf0bd20e2d37ccb8148ed4e29e4365842aa5538f633"
+    },
+    {
+      "logical_path": "server/gemma4-launch.sh",
+      "snapshot_path": "models/gemma4-26b-a4b/compat/v6/server/gemma4-launch.sh",
+      "snapshot_sha256": "0d5bc787bd740fddad0e21ef9c0f2c2af534bf50dc32f8006b1f1886c8b37d37",
+      "live_projection": "strip-physical-build-blocks-v1",
+      "physical_blocks_sha256": "92755de72e39166a1411a1f0f1cd66dfafc44daf8339dca87a24b332df5eed16"
+    },
+    {
+      "logical_path": "server/gemma4_backend.py",
+      "snapshot_path": "models/gemma4-26b-a4b/compat/v6/server/gemma4_backend.py",
+      "snapshot_sha256": "361facedbc836412b3423eee3fea0261aeec01fdec3dc0ba061c7961ceaa7562",
+      "live_projection": "strip-physical-build-blocks-v1",
+      "physical_blocks_sha256": "2fb6e8bd042bd53284d21025279157495ef7360d0fb9a314434db1482d06b015"
+    },
+    {
+      "logical_path": "server/gemma4_compat.py",
+      "snapshot_path": "models/gemma4-26b-a4b/compat/v6/server/gemma4_compat.py",
+      "snapshot_sha256": "a903d9a6b88d0f592da176fcc7bd0bfdf4c57edb3d4ccd1088de7532096436c2",
+      "live_projection": "strip-physical-build-blocks-v1",
+      "physical_blocks_sha256": "e6edace912461ddb3a4b1ed70869af25172432e17cb233b11dcfb0022b4484bb"
+    },
+    {
+      "logical_path": "server/serve.py",
+      "snapshot_path": "models/gemma4-26b-a4b/compat/v6/server/serve.py",
+      "snapshot_sha256": "2cafc3835c8a9f8f1006223262751ea00b79a981d66a88350ebc1e70508b7c8e",
+      "live_projection": "strip-physical-build-blocks-v1",
+      "physical_blocks_sha256": "654d0b9df8591dec4c3816736bf8080093658b748b1de98a133e0661fc7d304c"
+    },
+    {
+      "logical_path": "tools/gemma4-mentor-state.py",
+      "snapshot_path": "models/gemma4-26b-a4b/compat/v6/tools/gemma4-mentor-state.py",
+      "snapshot_sha256": "c3deb405aed33a5d314c8ffef6eed30caf63807bba791bcaa5999ce50b90043c",
+      "live_projection": "strip-physical-build-blocks-v1",
+      "physical_blocks_sha256": "98cc2ecb1f2b6e88fe968ba5711982effc3947341af920d4d3afae3999208f59"
+    },
+    {
+      "logical_path": "tools/gemma4-multimodal-qa.py",
+      "snapshot_path": "models/gemma4-26b-a4b/compat/v6/tools/gemma4-multimodal-qa.py",
+      "snapshot_sha256": "b56c214b9a7569e3c8bd4d6d8cc191f0f8af34ceab4accf00f22a18e96d61a21",
+      "live_projection": "strip-physical-build-blocks-v1",
+      "physical_blocks_sha256": "2cf3abc9e79946fca180234f432cfb02aedb2dcb3f9c32d62d03c5b4a3eb2770"
+    },
+    {
+      "logical_path": "tools/gemma4-qa.py",
+      "snapshot_path": "models/gemma4-26b-a4b/compat/v6/tools/gemma4-qa.py",
+      "snapshot_sha256": "c03631c3a1ccf9947e5a5cc948e2901b9310ded2c85e2a0e90854fb0cf44c7d0",
+      "live_projection": "strip-physical-build-blocks-v1",
+      "physical_blocks_sha256": "992915b166e09366e77829e61d23b569e166c4957e70942de5266a645c0695ca"
+    }
+  ]
+}

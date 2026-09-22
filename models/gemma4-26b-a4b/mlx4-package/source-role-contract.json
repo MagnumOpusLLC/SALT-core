@@ -1,0 +1,39 @@
+{
+  "schema": "salt.gemma4-mlx4-source-role-contract.v1",
+  "status": "source-roles-qualified-runtime-ready",
+  "source": {
+    "repository": "mlx-community/gemma-4-26b-a4b-it-4bit",
+    "revision": "0d77464eeb233a2da68ebf9d7dc4edaac7db956d",
+    "contract_sha256": "312e73b836f39d06f5c982f4b5a83575d7c4bb23539b787293a247cd2bc71949",
+    "declared_upstream_repository": "google/gemma-4-26B-A4B-it",
+    "declared_upstream_revision": "20da991ab4afab98e8f910c4a2e8f4fbefc404ad",
+    "semantic_reference_repository": "google/gemma-4-26B-A4B-it",
+    "semantic_reference_revision": "4d7ae4984b7db7de8f8457170b3f1a419ee76d52",
+    "weight_parity_claim": false
+  },
+  "mapping": {
+    "role_map_framing": "sorted role; UTF-8 json(sort_keys=true,separators=(',',':'),ensure_ascii=true) plus LF per entry",
+    "source_tensor_count": 1697,
+    "source_tensor_bytes": 15340981404,
+    "role_entry_count": 1043,
+    "role_map_sha256": "fb4980b498cbe3985220560eca5ab0636fd1298d2f05c94f6367c93fb129c46c",
+    "package_components": {
+      "embedding": 1,
+      "expert_pool": 90,
+      "text_final": 1,
+      "text_trunk": 595,
+      "vision_lazy": 355,
+      "vision_projection": 1
+    }
+  },
+  "tied_head": {
+    "logical_roles": [
+      "text.embedding",
+      "text.output_head"
+    ],
+    "separate_source_tensor": false,
+    "source_role": "text.embedding",
+    "runtime_loader_ready": true
+  },
+  "runtime_ready": true
+}

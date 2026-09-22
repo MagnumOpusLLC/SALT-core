@@ -1,0 +1,63 @@
+{
+  "audio_seq_length": 750,
+  "image_processor": {
+    "do_convert_rgb": true,
+    "do_normalize": false,
+    "do_rescale": true,
+    "do_resize": true,
+    "image_mean": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "image_processor_type": "Gemma4ImageProcessor",
+    "image_seq_length": 280,
+    "image_std": [
+      1.0,
+      1.0,
+      1.0
+    ],
+    "max_soft_tokens": 280,
+    "patch_size": 16,
+    "pooling_kernel_size": 3,
+    "resample": 3,
+    "rescale_factor": 0.00392156862745098,
+    "size": {
+      "height": 224,
+      "width": 224
+    }
+  },
+  "image_seq_length": 280,
+  "processor_class": "Gemma4Processor",
+  "video_processor": {
+    "default_fps": 2.0,
+    "do_normalize": true,
+    "do_rescale": true,
+    "image_mean": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "image_std": [
+      1.0,
+      1.0,
+      1.0
+    ],
+    "max_soft_tokens": 70,
+    "num_frames": 32,
+    "patch_size": 16,
+    "pooling_kernel_size": 3,
+    "rescale_factor": 0.00392156862745098,
+    "video_processor_type": "Gemma4VideoProcessor"
+  },
+  "feature_extractor": {
+    "feature_extractor_type": "Gemma4AudioFeatureExtractor",
+    "sampling_rate": 16000,
+    "num_mel_filters": 128,
+    "fft_length": 512,
+    "hop_length": 160,
+    "chunk_duration": 8.0,
+    "overlap_duration": 1.0
+  },
+  "audio_ms_per_token": 40
+}
