@@ -5,6 +5,9 @@ closed work-order records, future backlog, and historical material.
 
 ## Start here
 
+- [`FORMAL-PROOFS.md`](FORMAL-PROOFS.md) — curated TLA+/TLAPS sources,
+  reproduced proof results, and explicit limits on runtime correspondence.
+
 1. [`COGNITIVE-STATE-RISK.md`](COGNITIVE-STATE-RISK.md) — KV Cache and Persistent
    Agent State Statement: beyond-prompt state, rights, consent, risks, and the
    separation of computational continuity from authority to act.

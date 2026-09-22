@@ -21,5 +21,9 @@ This snapshot was staged from private source revision `d3a2037f404d520998ac2d3b2
 (`2026-09-21T19:50:34-04:00`). It contains no model weights. Model artifacts retain their own
 licenses and must be obtained separately.
 
+The scoped [formal proof bundle](docs/FORMAL-PROOFS.md) contains executable TLA+
+models and TLAPS proof sources. Its documented proof boundary is not a claim
+that the complete runtime or concrete KV bytes are formally verified.
+
 The public build, supported-platform, security, contribution, and release
 documents are still review gates. Do not publish this dry-run tree.
