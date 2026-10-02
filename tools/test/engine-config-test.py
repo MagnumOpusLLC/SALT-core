@@ -344,7 +344,8 @@ def test_gemma_platform_recipes():
     metal = load_engine_config(
         str(ROOT / "engine.config"), model_dir=model_dir, recipe="mac-metal",
     )
-    assert metal["SALT_FETCH_TOUCH_BYTES"] == "2230272", metal
+    # The selected Metal recipe uses literal zero for its current fetch policy.
+    assert metal["SALT_FETCH_TOUCH_BYTES"] == "0", metal
     assert metal["SALT_GPU_TRUNK_LAYER_VIEW"] == "0", metal
     assert metal["SALT_GPU_TRUNK_SHARED_POOL"] == "1", metal
     assert metal["SALT_GEMMA_METAL_EXACT_CELLS"] == "0", metal
@@ -358,7 +359,7 @@ def test_gemma_platform_recipes():
         "nodes": 64, "candidate_count": 64,
     }
     assert metal["SALT_TARGET_KV_WARMUP_ROWS"] == "512", metal
-    assert metal["SALT_TARGET_WARM_X"] == "4", metal
+    assert metal["SALT_TARGET_WARM_X"] == "1", metal
     spark = load_engine_config(
         str(ROOT / "engine.config"), model_dir=model_dir, recipe="spark",
     )

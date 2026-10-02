@@ -7,7 +7,7 @@
       "snapshot_path": "models/gemma4-26b-a4b/compat/v6/Makefile",
       "snapshot_sha256": "f34e7285395963b84600379f3a3a1065c3f1d5d38dc8d04c2f7776b07fb8e212",
       "live_projection": "pin-live-source-v1",
-      "live_sha256": "f62dd78f158cb181e1edb59b2e63f2075ca5a5172501f5b6d21eb208dbf0cf9d"
+      "live_sha256": "493aabb7dcc7bb2426c310044b6aa167e3797114dfbf99993bb3735809d898d9"
     },
     {
       "logical_path": "models/gemma4-26b-a4b/gemma4_text.c",

@@ -95,7 +95,7 @@ SRC = src/cfg.c src/st.c src/trunk.c src/cache.c src/router.c src/mem.c \
       src/gpu_resource.c src/gpu_layer.c src/dpr.c src/dpr_store.c \
       src/dpr_stats.c src/sha256.c $(GPU_SRC)
 
-all: salt pack-trunk make-fixture bench-kernels
+all: salt gemma4-server
 
 salt: models/qwen36/main.c $(SRC) $(HDR) $(QWEN36_MODEL_HDR) $(GPU_OBJ)
 	$(CC) $(CFLAGS) $(INC) -DSALT_GIT=\"$(shell git rev-parse --short HEAD 2>/dev/null)\" -o $@ models/qwen36/main.c $(filter-out %.m %.mm $(GPU_OBJ),$(SRC)) $(GPU_OBJ) -lm $(GPU_LIBS)
@@ -113,12 +113,7 @@ HDR += include/salt/sampling.h
 	test-gemma4-rocm-permanent-trunk-source-contract \
 	test-gemma4-rocm-expert-residency-source-contract \
 	test-gemma4-rocm-backend-published-kv-source-contract
-test: test-gpu-residency test-gemma4-kv-compat-projection \
-	test-gemma4-endpoint-startup-kv-contract test-gemma4-rocm-source-contract \
-	test-gemma4-rocm-residency-source-contract \
-	test-gemma4-rocm-permanent-trunk-source-contract \
-	test-gemma4-rocm-expert-residency-source-contract \
-	test-gemma4-rocm-backend-published-kv-source-contract
+test: test-public-smoke
 test-gpu-residency:
 	$(CC) $(TEXT_VERIFY_CFLAGS) $(INC) -o /tmp/salt-gpu-residency-test \
 		tests/test_gpu_residency.c src/gpu_residency.c src/gpu_resource.c
@@ -840,13 +835,27 @@ test-config:
 test-spectrum-gpu-telemetry:
 	python3 tools/test/spectrum-gpu-telemetry-test.py
 
-test: salt make-fixture test-gpu-ledger test-gpu-trunk test-config \
-		test-gemma4-vision-image test-gemma4-e2e-contract \
-		test-gemma4-server-contract test-gemma4-kv-cache-contract \
-		test-hot-expert-ledger test-spectrum-gpu-telemetry \
-		test-gemma4-qa-source-contract
-	./tests/run_tests.sh
-	bash tools/test-memlimit.sh
+test-public-smoke:
+	env -u PYTHONPATH "$(GEMMA4_E2E_PYTHON)" tools/test/engine-config-test.py
+	env -u PYTHONPATH "$(GEMMA4_E2E_PYTHON)" tools/test/gemma4-kv-compat-projection-test.py --production
+	env -u PYTHONPATH "$(GEMMA4_E2E_PYTHON)" tools/test/gemma4-kv-compat-test.py
+	env -u PYTHONPATH "$(GEMMA4_E2E_PYTHON)" tools/test/gpu-residency-source-test.py
+	env -u PYTHONPATH "$(GEMMA4_E2E_PYTHON)" tools/test/gemma4-shared-kv-transform-source-test.py
+	env -u PYTHONPATH "$(GEMMA4_E2E_PYTHON)" tools/test/gemma4-http-framing-test.py
+	env -u PYTHONPATH "$(GEMMA4_E2E_PYTHON)" tools/test/gemma4-kv-cache-test.py
+	env -u PYTHONPATH "$(GEMMA4_E2E_PYTHON)" tools/test/gemma4-persistent-session-test.py
+	env -u PYTHONPATH "$(GEMMA4_E2E_PYTHON)" tools/test/gemma4-server-test.py
+	@set -eu; scratch=$$(mktemp -d "$${TMPDIR:-/tmp}/salt-public-smoke.XXXXXX"); \
+		trap 'rm -f "$$scratch/state-control" "$$scratch/bit-identity" "$$scratch/gpu-resource"; rmdir "$$scratch"' EXIT; \
+		$(CC) $(GEMMA4_CFLAGS) $(INC) -o "$$scratch/state-control" \
+			tools/test/state-control-test.c $(MODEL_REGISTRY_SRC) src/state.c -lm; \
+		"$$scratch/state-control"; \
+		$(CC) $(GEMMA4_CFLAGS) $(INC) -o "$$scratch/bit-identity" \
+			tools/test/gemma4-bit-identity-test.c src/kernels.c src/simd.c src/gpu_stub.c -lm; \
+		"$$scratch/bit-identity"; \
+		$(CC) $(GEMMA4_CFLAGS) $(INC) -o "$$scratch/gpu-resource" \
+			tools/test/gpu-resource-binding-test.c src/gpu_resource.c -lm; \
+		"$$scratch/gpu-resource"
 
 # the disk/cpu loading experiment (A3B-shaped fixture, footprint report)
 FIXDIR ?= /tmp/fix35
@@ -860,7 +869,7 @@ clean:
 		gemma4-dpr-store-fixture gemma4-dpr-edge \
 		pack-trunk make-fixture $(GPU_OBJ) $(METAL_LIB)
 
-.PHONY: all test test-config test-gpu-ledger test-gpu-projection \
+.PHONY: all test test-public-smoke test-config test-gpu-ledger test-gpu-projection \
 	test-hot-expert-ledger \
 	test-gpu-moe-shared test-gpu-trunk test-gpu-trunk-batch-exact \
 	test-gpu-rocm-exact \

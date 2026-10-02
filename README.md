@@ -30,14 +30,15 @@ The scoped [formal proof bundle](docs/FORMAL-PROOFS.md) contains executable TLA+
 models and TLAPS proof sources. Its documented proof boundary is not a claim
 that the complete runtime or concrete KV bytes are formally verified.
 
-The refreshed source passed isolated Linux CPU builds of `salt` and
-`gemma4-server`, a CUDA build of `gemma4-server`, and focused KV-compatibility
-tests. Two independent limits remain: the model-config test also fails on the
-private source because its Mac Metal fetch-touch expectation is stale (expected
-`2230272`, recipe `0`), and the public `make -n test` target lacks the excluded
-`tools/test/make-fixture.c` prerequisite. Neither was repaired by changing
-source during this exact-byte sync. No real inference, HIP/Metal build, or
-complete state/KV parity was qualified from this exported tree.
+The refreshed source passed isolated Linux CPU and CUDA builds, focused
+KV-compatibility tests, and a curated public `make test` smoke suite covering
+configuration, state control, Q4 byte identity, resource binding, and server
+framing/session contracts. `make all` and `make -n test all` also pass on Linux.
+The public config test now pins the selected Mac Metal recipe's exact values;
+the private-source test still has older expectations. The source compatibility
+projection preserves the existing logical MLX-Q4 state identity despite the
+public Makefile change. No real inference, HIP/Metal build, or complete
+state/KV parity was qualified from this exported tree.
 
 The public build, supported-platform, security, contribution, and release
 documents are still review gates. Do not publish this dry-run tree.
