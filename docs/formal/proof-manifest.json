@@ -2,7 +2,15 @@
   "schema": "salt.public-formal-proof-manifest.v1",
   "source_baseline": "d3a2037f404d520998ac2d3b2d182ca58f529c82",
   "source_timestamp": "2026-09-21T19:50:34-04:00",
-  "scope": "Nine fully proved abstract modules; no complete current-runtime refinement or concrete KV bit-identity certificate.",
+  "scope": "Nine historical abstract modules plus one later, independently checked supplemental loader module. No complete current-runtime refinement or concrete KV bit-identity certificate.",
+  "supplemental_loader_source": {
+    "proof_commit": "beab7291b7dd7ae11bb7d21ea0735e83ad7c0fa0",
+    "proof_timestamp": "2026-10-02T10:49:29-04:00",
+    "mapped_runtime_commit": "9f5c1e0b26059e79f557e4c5a5994579e4634aec",
+    "mapped_runtime_timestamp": "2026-10-02T08:25:11-04:00",
+    "transmutation_ground_commit": "e1eb51eead6a153bd1bd7832718edae750400102",
+    "correspondence": "manual three-loader source map only; Rosarium refused rose_source_untraced"
+  },
   "files": {
     "docs/formal/core-runtime/SaltPrefillControl.tla": "e569aecaf97d23c75b3e739eeb02537137f0c5cd688ef323562f77240df9ed6f",
     "docs/formal/core-runtime/SaltPrefillControl.cfg": "cc742bf1b03513fc729fb981faa5823bf1f4e11baab5447d3d159c8bacec89f5",
@@ -31,7 +39,11 @@
     "docs/formal/dpr-orthogonal-nomograms/DprOrthogonalNomogramsRed.cfg": "40a99db0cdd4eb273d377328b53b26655ad078dcc38d65be076bb884c8c749a0",
     "docs/formal/dpr-target-block-executor/DprTargetBlockExecutor.tla": "340638d88e2a607dae9002970c6abe0cfd32a5ecc122b0a0f6815b5968b2db48",
     "docs/formal/dpr-target-block-executor/DprTargetBlockExecutor.cfg": "d9e8ad08f88b73161eeceb8ff85b73b318c5142188c81319bf723702934bd26f",
-    "docs/formal/dpr-target-block-executor/DprTargetBlockExecutorProofs.tla": "38ddaf4182175794872be065eacbc743a594e186d5c2bc3b4a53f9855f74b8ab"
+    "docs/formal/dpr-target-block-executor/DprTargetBlockExecutorProofs.tla": "38ddaf4182175794872be065eacbc743a594e186d5c2bc3b4a53f9855f74b8ab",
+    "docs/formal/resource-load-lifecycle/LoadFailureResources.tla": "b3d0ca85089428650c429d3de6551ae41289d3cd32e5dda069af2b3e948f800f",
+    "docs/formal/resource-load-lifecycle/LoadFailureResources.cfg": "fcfd4ec7bc704e774d80583049a1ddb0a655f0fdd367c5236e39a333a9ed5c1d",
+    "docs/formal/resource-load-lifecycle/LoadFailureResourcesProofs.tla": "1a66b93f1d8cd7e22cb5a918d3e333e7f4bdd35da7d27fb597b3826463a190d7",
+    "docs/formal/resource-load-lifecycle/LoadFailureResourcesRed.cfg": "84c0aed28b3d72d9533cfd85a484ce460a837abfd9f92da861641988ff264849"
   },
   "standard_dependencies": [
     "FiniteSets",
@@ -43,5 +55,7 @@
     "TLC"
   ],
   "target_proof_obligations": 67,
-  "target_public_recheck": "PASS"
+  "target_public_recheck": "PASS",
+  "loader_proof_obligations": 20,
+  "loader_public_recheck": "PASS"
 }

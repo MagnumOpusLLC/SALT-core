@@ -7,6 +7,8 @@ closed work-order records, future backlog, and historical material.
 
 - [`FORMAL-PROOFS.md`](FORMAL-PROOFS.md) — curated TLA+/TLAPS sources,
   reproduced proof results, and explicit limits on runtime correspondence.
+- [`TRANSMUTATION.md`](TRANSMUTATION.md) — curated Citrinitas/Rosarium findings,
+  the scoped loader proof, and its unresolved source-provenance boundary.
 
 1. [`COGNITIVE-STATE-RISK.md`](COGNITIVE-STATE-RISK.md) — KV Cache and Persistent
    Agent State Statement: beyond-prompt state, rights, consent, risks, and the

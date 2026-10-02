@@ -1,19 +1,23 @@
 # Formal proof sources and scope
 
-This repository includes **nine fully discharged abstract TLA+/TLAPS modules**.
-All copied modules were independently checked inside Docker: **9/9 TLC
-configurations and 9/9 TLAPS proof modules passed**, using clean proof
-fingerprints. The target-block module was checked after the initial eight-module
-bundle; hashes verify that those eight modules remained unchanged.
+This repository includes **ten fully discharged abstract TLA+/TLAPS modules**:
+nine earlier modules and one later supplemental loader model. Their receipts
+record **10/10 TLC configurations and 10/10 TLAPS proof modules passed**.
+The loader model was independently checked from these copied bytes with clean
+proof fingerprints; the earlier nine retain their historical results and
+unchanged proof-input hashes. This is not a fresh rerun of all ten together.
 
 This is **not a complete formal verification of SALT's implementation**. A proved
 abstract model, a source-correspondence argument, and concrete cross-platform
 KV/state bit identity are separate evidence classes.
 
-Runtime source baseline: `d3a2037f404d520998ac2d3b2d182ca58f529c82`
-(**2026-09-21 19:50:34 −04:00**). The proof sources include subsequent proof-only
-updates; their exact hashes are recorded in the manifest rather than implied to
-have existed in that runtime commit.
+Exported runtime source baseline: `d3a2037f404d520998ac2d3b2d182ca58f529c82`
+(**2026-09-21 19:50:34 −04:00**). The supplemental loader proof was copied from
+`beab7291b7dd7ae11bb7d21ea0735e83ad7c0fa0`
+(**2026-10-02 10:49:29 −04:00**) and manually maps three loader paths in later
+private source `9f5c1e0b26059e79f557e4c5a5994579e4634aec`
+(**2026-10-02 08:25:11 −04:00**). These later bytes are **not** the exported
+runtime baseline. The manifest pins the proof bytes separately.
 
 ## Included modules
 
@@ -28,16 +32,31 @@ have existed in that runtime commit.
 | `dpr-nfq-token-epoch/` | `DprNfqTokenEpoch` / `DprNfqTokenEpochProofs` | 20 | **Retained historical abstraction**, not current independent-X serving correspondence |
 | `gemma4-runtime/` | `GemmaRuntime` / `GemmaRuntimeProofs` | 186 | Supplemental abstract Gemma state transitions |
 | `qwen-runtime/` | `QwenRuntime` / `QwenRuntimeProofs` | 191 | Supplemental abstract Qwen state/history transitions |
+| `resource-load-lifecycle/` | `LoadFailureResources` / `LoadFailureResourcesProofs` | 20 | Supplemental loader-failure ownership and conditional OS-success unmap; no source-refinement seal |
 
 Each model has its finite `.cfg` witness and its `Proofs.tla` module. The bundle
-also retains the intentional `DprOrthogonalNomogramsRed.cfg` negative control;
-that configuration is expected to violate an invariant, not pass.
+also retains intentional `DprOrthogonalNomogramsRed.cfg` and
+`LoadFailureResourcesRed.cfg` negative controls; each is expected to violate
+its stated invariant, not pass.
 
 - [Exact proof-source manifest](formal/proof-manifest.json)
 - [Verification results for the copied bundle](formal/verification-results.json)
 
 No private worklogs, raw prover logs, host inventories, credentials or in-house
 SOPs are part of this proof export.
+
+## Transmutation-guided supplemental loader proof
+
+The curated [transmutation account](TRANSMUTATION.md) distinguishes structural
+Citrinitas candidate records from source-reviewed findings and preserves
+Rosarium's `rose_source_untraced` refusal. The new model proves that a
+full-span `munmap` **success** (an external POSIX return condition) releases
+the modeled mapping and proves no pool publication on an error outcome. The C
+caller does not check that syscall return. TLC checked 22 distinct states;
+the deliberate `ActualFullPoolRelease` RED control reached
+`PoolMap(5) -> PoolReject(FALSE)`. Clean-fingerprint TLAPS proved all 20
+obligations on the copied model and proof. The sanitized receipt binds inputs,
+tool hashes, and the separate earlier nine-model results.
 
 ## Important limits
 
@@ -68,6 +87,11 @@ SOPs are part of this proof export.
    nor permission to preserve or execute human-derived state. The
    [KV Cache and Persistent Agent State Statement](COGNITIVE-STATE-RISK.md)
    remains applicable.
+7. The loader proof is a hand-written, single-invocation abstraction mapped to
+   **later private source**, not a formal refinement of the exported runtime
+   baseline. An OS-success premise cannot establish that `munmap` succeeded in
+   any real request or that a failed call released its mapping. Rosarium has no
+   provenance-bearing `origin.path`, so no full source seal follows.
 
 ## Reproduce with an existing Docker toolchain
 
@@ -95,7 +119,7 @@ no-error completion and TLAPS's `All ... obligations proved` result as well as
 exit status zero. A script that continues after a failed module is not evidence
 that every module passed.
 
-The separate ND/NM negative control is:
+Run negative controls separately. For the ND/NM model:
 
 ```sh
 java -cp /path/to/tla2tools.jar tlc2.TLC -workers 1 \
@@ -103,7 +127,10 @@ java -cp /path/to/tla2tools.jar tlc2.TLC -workers 1 \
   -config DprOrthogonalNomogramsRed.cfg DprOrthogonalNomograms.tla
 ```
 
-It must report the expected invariant violation. Preserve results, then remove
-only run-owned TLC scratch and TLAPS caches after all provers have exited.
+For the loader model, use `LoadFailureResourcesRed.cfg` with
+`LoadFailureResources.tla` in the same manner; require the
+`ActualFullPoolRelease` violation on `PoolReject(FALSE)`. Neither RED result
+counts as a passing invariant. Preserve results, then remove only run-owned
+TLC scratch and TLAPS caches after all provers have exited.
 
 The formal bundle does not promote the repository to release-ready status.
