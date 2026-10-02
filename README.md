@@ -1,3 +1,5 @@
+![SALT logo](salt-logo-white.svg)
+
 # SALT - State Assured Latent-Trasition engine
 
 > **Dry-run public export — not yet a release.**
