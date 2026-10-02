@@ -323,6 +323,7 @@ struct SaltGemma4Text {
     int full_gpu_intent;
     int metal_exact_cells;
     int fine_token_enabled;
+    int decode_gpu_only;
     int gpu_bounded_weights;
     int gpu_expert_layer_view;
     int gpu_trunk_layer_view;
@@ -496,18 +497,18 @@ struct SaltGemma4Text {
     SaltTextVerifyExecutor text_executor;
     SaltAreaWfqRuntime target_wfq;
     SaltAreaWfqBranch target_wfq_branches[
-        SALT_GEMMA4_TEXT_TARGET_MAX_CANDIDATES];
+        SALT_GEMMA4_TEXT_NFQ_MAX_CANDIDATES];
     SaltAreaWfqItem target_wfq_items[
-        SALT_GEMMA4_TEXT_TARGET_MAX_CANDIDATES];
+        SALT_GEMMA4_TEXT_NFQ_MAX_CANDIDATES];
     SaltAreaWfqItemResult target_wfq_results[
-        SALT_GEMMA4_TEXT_TARGET_MAX_CANDIDATES];
+        SALT_GEMMA4_TEXT_NFQ_MAX_CANDIDATES];
     SaltAreaNfqMatrix target_nfq;
     SaltAreaNfqRoute target_nfq_routes[
-        SALT_GEMMA4_TEXT_TARGET_MAX_CANDIDATES];
+        SALT_GEMMA4_TEXT_NFQ_MAX_CANDIDATES];
     SaltAreaNfqItem target_nfq_items[
-        SALT_GEMMA4_TEXT_TARGET_MAX_CANDIDATES * 8u];
+        SALT_GEMMA4_TEXT_NFQ_MAX_CANDIDATES * 8u];
     SaltTextTargetNode target_nfq_nodes[
-        SALT_GEMMA4_TEXT_TARGET_MAX_CANDIDATES];
+        SALT_GEMMA4_TEXT_NFQ_MAX_CANDIDATES];
     uint32_t target_nfq_ready[32];
 /* SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1 */
     SaltTextProjectionWindow target_projection;
@@ -879,29 +880,43 @@ static int g4_compact_hmm_gpu_program(const SaltGemma4Text *model) {
         model->gpu_weight_addressability == SALT_GPU_WEIGHT_ADDRESS_PAGEABLE;
 }
 
+/* The explicit full-GPU registered CUDA cell uses the existing C99 text
+ * program; the phase-mixed cell retains its established callback path. */
+static int g4_registered_cuda_gpu_program(const SaltGemma4Text *model) {
+    return model && model->full_gpu_intent && model->decode_gpu_only &&
+        !model->fine_token_enabled && !model->gpu_bounded_weights &&
+        !model->gpu_expert_layer_view && g4_target_gpu_program(model) &&
+        model->gpu_weight_addressability ==
+            SALT_GPU_WEIGHT_ADDRESS_REGISTERED_PERSISTENT &&
+        salt_gpu_cuda_present();
+}
+
+/* The registered plan counts retained history; ordinary attention also needs
+ * the current token's seat before consuming that history. Keep the established
+ * live ring geometry independently of CPU/GPU execution policy. */
+static size_t g4_live_kv_capacity(const SaltGemma4Text *model, int layer) {
+    size_t capacity = model->kv_plan[layer].token_capacity;
+    if (model->layer_plan[layer].attention.kind == SALT_ATTN_SLIDING &&
+        capacity < (size_t)model->max_context)
+        capacity++;
+    return capacity;
+}
+
 static int g4_apply_kv_forecast_policy(SaltGemma4Text *model) {
     size_t total = 0;
-    int gpu_attention = 0, gpu_kv_ring = 0;
-    if (!model || g4_recipe_int("SALT_PREFILL_GPU_ATTENTION", 0, 1,
-                                &gpu_attention) != 0 ||
-        g4_recipe_int("SALT_GEMMA_GPU_KV_RING", 0, 1,
-                      &gpu_kv_ring) != 0)
-        return -1;
-    if (!gpu_attention || gpu_kv_ring || g4_compact_hmm_gpu_program(model))
-        return 0;
+    if (!model || model->max_context < 1) return -1;
     for (int i = 0; i < G4_LAYERS; i++) {
         const SaltKvLayerPlan *plan = &model->kv_plan[i];
-        size_t width;
-        size_t layer_floats;
-        if (plan->k_width < 1 || plan->v_width < 1)
+        size_t capacity = g4_live_kv_capacity(model, i);
+        size_t width, count;
+        if (plan->k_width < 1 || plan->v_width < 1 ||
+            capacity == 0 || capacity > (size_t)model->max_context)
             return -1;
         width = (size_t)plan->k_width + (size_t)plan->v_width;
-        if ((size_t)model->max_context > SIZE_MAX / width)
-            return -1;
-        layer_floats = (size_t)model->max_context * width;
-        if (total > SIZE_MAX - layer_floats)
-            return -1;
-        total += layer_floats;
+        if (capacity > SIZE_MAX / width) return -1;
+        count = capacity * width;
+        if (total > SIZE_MAX - count) return -1;
+        total += count;
     }
     model->planned_kv_floats = total;
     return 0;
@@ -1511,7 +1526,10 @@ int salt_gemma4_text_validate_proof(SaltGemma4Text *model) {
 /* SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1 */
 int salt_gemma4_text_set_proof_state(SaltGemma4Text *model, int enabled) {
     if (!model || !model->expert_cache_set) return -1;
-    return salt_cache_set_proof_state(&model->expert_cache, enabled);
+    if (salt_cache_set_proof_state(&model->expert_cache, enabled) != 0)
+        return -1;
+    model->text_program.proof_state = enabled;
+    return 0;
 }
 
 const char *salt_gemma4_text_expert_cache_mode(const SaltGemma4Text *model) {
@@ -1590,7 +1608,7 @@ static int add_pool(SaltGemma4Text *model, int fd,
     uint64_t header[3];
     memcpy(header, base, sizeof header);
     if (header[0] != slot || header[1] != layers || header[2] != experts) {
-        munmap(base, G4_POOL_HEADER);
+        munmap(base, map_len);
         return -1;
     }
     memset(&model->pool, 0, sizeof model->pool);
@@ -1653,7 +1671,10 @@ static int preload_expert_layers(SaltGemma4Text *model, uint64_t layer_mask,
     for (int expert = 0; expert < G4_EXPERTS; expert++)
         experts[expert] = expert;
     prior_touch = model->expert_cache.fetch_touch_bytes;
-    model->expert_cache.fetch_touch_bytes = G4_SLOT_BYTES;
+    /* A preload widens only an enabled operational touch. Do not turn a
+     * registered all-expert preload into an implicit whole-pool page walk. */
+    if (prior_touch > 0)
+        model->expert_cache.fetch_touch_bytes = G4_SLOT_BYTES;
     for (int layer = 0; layer < G4_LAYERS; layer++) {
         int fetched;
         if (!(layer_mask & (UINT64_C(1) << layer))) continue;
@@ -1972,16 +1993,26 @@ static int g4_selected_cache_bind(void *opaque, int slot,
                                   int layer, int expert,
                                   const void *base, size_t nbytes,
                                   const void *payload) {
+/* SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1 */
+    SaltGemma4Text *model = (SaltGemma4Text *)opaque;
+    uint64_t logical;
+    if (!model || layer < 0 || layer >= G4_LAYERS ||
+        expert < 0 || expert >= G4_EXPERTS)
+        return -1;
+#if 0
+/* SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1 */
     uint64_t logical;
     (void)opaque;
     if (layer < 0 || layer >= G4_LAYERS ||
         expert < 0 || expert >= G4_EXPERTS)
         return -1;
 /* SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1 */
-    if (((SaltGemma4Text *)opaque)->gpu_device_residency)
+#endif
+/* SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1 */
+/* SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1 */
+    if (model->gpu_device_residency)
         return g4_selected_cache_bind_resident(
-            (SaltGemma4Text *)opaque, slot, layer, expert,
-            base, nbytes, payload);
+            model, slot, layer, expert, base, nbytes, payload);
 /* SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1 */
     logical = (uint64_t)(uint32_t)layer * G4_EXPERTS + (uint32_t)expert;
     return salt_gpu_selected_resource_bind(
@@ -1994,15 +2025,26 @@ static int g4_selected_cache_fence(void *opaque) {
 
 static int g4_selected_cache_unbind(void *opaque, int slot,
                                     int layer, int expert) {
+/* SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1 */
+    SaltGemma4Text *model = (SaltGemma4Text *)opaque;
+    uint64_t logical;
+    if (!model || layer < 0 || layer >= G4_LAYERS ||
+        expert < 0 || expert >= G4_EXPERTS)
+        return -1;
+#if 0
+/* SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1 */
     uint64_t logical;
     (void)opaque;
     if (layer < 0 || layer >= G4_LAYERS ||
         expert < 0 || expert >= G4_EXPERTS)
         return -1;
 /* SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1 */
-    if (((SaltGemma4Text *)opaque)->gpu_device_residency)
+#endif
+/* SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1 */
+/* SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1 */
+    if (model->gpu_device_residency)
         return g4_selected_cache_unbind_resident(
-            (SaltGemma4Text *)opaque, slot, layer, expert);
+            model, slot, layer, expert);
 /* SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1 */
     logical = (uint64_t)(uint32_t)layer * G4_EXPERTS + (uint32_t)expert;
     return salt_gpu_selected_resource_unbind(slot, logical);
@@ -2352,6 +2394,8 @@ static int g4_startup_admit_full_gpu(SaltGemma4Text *model) {
      * logical host KV geometry for diagnostics, but do not charge the same
      * bytes again to the host-resident startup forecast. */
     if (gpu_attention) resident_kv_bytes = 0;
+    /* CUDA attention borrows mapped host KV, not a second device allocation. */
+    if (salt_gpu_cuda_present()) resident_kv_bytes = kv_bytes;
 /* SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1 */
     if (g4_prefill_ffn_scratch_bytes(prefill_capacity, &ffn_bytes) != 0 ||
         g4_prefill_attention_scratch_bytes(
@@ -2446,7 +2490,8 @@ static int g4_startup_admit_full_gpu(SaltGemma4Text *model) {
     model->startup_backend_pinned_bytes = backend.fixed_pinned_host_bytes;
     model->startup_backend_device_bytes = backend.fixed_device_bytes;
     model->startup_device_kv_bytes =
-        gpu_attention && !compact_hmm_gpu_program ? kv_bytes : 0;
+        gpu_attention && !compact_hmm_gpu_program && !salt_gpu_cuda_present()
+            ? kv_bytes : 0;
     model->startup_cache_metadata_bytes = cache_bytes;
     model->startup_rope_bytes = rope_bytes;
     model->startup_descriptor_bytes = backend.descriptor_bytes;
@@ -2655,6 +2700,22 @@ static int init_full_gpu(SaltGemma4Text *model) {
         salt_gpu_weight_resource_activate(SALT_GPU_RESOURCE_EXPERT_LAYER,
             15, policy) != 0)
         return -1;
+    /* The registered Spark pool is already activated and every expert is
+     * preloaded in the existing zerocopy cache. Bind those READY slots to the
+     * same selected-resource ledger before compiling the target program. */
+    if (g4_target_gpu_program(model) && !model->gpu_bounded_weights &&
+        !model->gpu_expert_layer_view && !model->nvfp4_mode &&
+        (policy != SALT_GPU_WEIGHT_ADDRESS_REGISTERED_PERSISTENT ||
+         !model->gpu_pool_registered || !model->expert_cache_set ||
+         !model->expert_preload_enabled ||
+         model->expert_preloaded_slots != G4_LAYERS * G4_EXPERTS ||
+         model->expert_cache.nslot != G4_LAYERS * G4_EXPERTS ||
+         salt_gpu_selected_resources_prepare(model->expert_cache.nslot,
+             G4_LAYERS * G4_EXPERTS) != 0 ||
+         salt_cache_set_resource_hooks(&model->expert_cache,
+             g4_selected_cache_fence, g4_selected_cache_bind,
+             g4_selected_cache_unbind, model) != 0))
+        return -1;
     if (profile) resources_done = g4_now_s();
     if (gpu_register_q(model, &model->embedding) != 0) return -1;
     for (int layer = 0; layer < G4_LAYERS; layer++) {
@@ -2820,47 +2881,35 @@ static int allocate_runtime(SaltGemma4Text *model) {
     compact_hmm_gpu_program = g4_compact_hmm_gpu_program(model);
     for (int i = 0; i < G4_LAYERS; i++) {
         G4Layer *l = &model->layers[i];
-        size_t count, capacity = (size_t)model->max_context;
-        if ((!gpu_attention || gpu_kv_ring || compact_hmm_gpu_program) &&
-            !l->full_attention &&
-            capacity > G4_SLIDING_WINDOW)
-            capacity = G4_SLIDING_WINDOW;
-        if (l->kv_dim < 1 || capacity == 0 || capacity > INT_MAX ||
+        const SaltKvLayerPlan *plan = &model->kv_plan[i];
+        size_t count, capacity = g4_live_kv_capacity(model, i);
+        /* KV geometry belongs to the registered model, not the backend or
+         * GPU attention policy. All executors bind these same bounded seats. */
+        if (l->kv_dim < 1 || plan->k_width != l->kv_dim ||
+            plan->v_width != l->kv_dim ||
+            capacity == 0 || capacity > (size_t)model->max_context ||
+            capacity > INT_MAX ||
             capacity > SIZE_MAX / (size_t)l->kv_dim)
             return -1;
         l->kv_capacity = (int)capacity;
-        l->kv_ring = (!gpu_attention || gpu_kv_ring || compact_hmm_gpu_program) &&
-            !l->full_attention &&
+        l->kv_ring = !l->full_attention &&
             capacity < (size_t)model->max_context;
         count = capacity * (size_t)l->kv_dim;
         if (count > (SIZE_MAX - kv_floats) / 2u) return -1;
         kv_floats += 2u * count;
     }
-    if (kv_floats == 0 || kv_floats > SIZE_MAX / sizeof(float))
+    if (kv_floats == 0 || kv_floats != model->planned_kv_floats ||
+        kv_floats > SIZE_MAX / sizeof(float))
         return -1;
     if (gpu_attention || compact_hmm_gpu_program) {
         size_t kv_bytes = kv_floats * sizeof(float);
         if (!model->full_gpu_intent || !model->gpu_initialized)
             return -1;
-        if (compact_hmm_gpu_program && salt_gpu_pageable_mmap_active()) {
-            int zero_fd = open("/dev/zero", O_RDWR);
-            if (zero_fd < 0) return -1;
-            void *contents = mmap(
-                NULL, kv_bytes, PROT_READ | PROT_WRITE,
-                MAP_PRIVATE, zero_fd, 0);
-            if (close(zero_fd) != 0 || contents == MAP_FAILED) {
-                if (contents != MAP_FAILED) munmap(contents, kv_bytes);
-                return -1;
-            }
-            model->kv_shared.contents = contents;
-            model->kv_shared.nbytes = kv_bytes;
-            model->kv_shared.backend = contents;
-            model->kv_pageable_mapping = 1;
-        } else {
-            if (salt_gpu_shared_buffer_alloc(&model->kv_shared, kv_bytes) != 0)
-                return -1;
-            memset(model->kv_shared.contents, 0, kv_bytes);
-        }
+        /* Weight addressability never selects live KV backing. Both ordinary
+         * and compiled execution consume the initialized shared seat. */
+        if (salt_gpu_shared_buffer_alloc(&model->kv_shared, kv_bytes) != 0)
+            return -1;
+        memset(model->kv_shared.contents, 0, kv_bytes);
         model->kv_arena = (float *)model->kv_shared.contents;
         if (!compact_hmm_gpu_program) {
             if (salt_gpu_attention_prepare(&model->kv_shared) != 0)
@@ -3282,6 +3331,7 @@ SaltGemma4Text *salt_gemma4_text_load(FILE *binding, int max_context,
                                       char *error, size_t error_size) {
     char line[640];
     const char *compute_node = getenv("SALT_GEMMA_COMPUTE_NODE");
+    const char *platform_recipe = getenv("SALT_GEMMA_PLATFORM_RECIPE");
     SaltTextExecutionClass requested_target_execution;
     int auth_seen = 0, model_seen = 0, end_seen = 0;
     SaltGemma4Text *model = NULL;
@@ -3315,7 +3365,12 @@ SaltGemma4Text *salt_gemma4_text_load(FILE *binding, int max_context,
         ? SALT_TEXT_EXECUTION_GPU_ONLY : SALT_TEXT_EXECUTION_CPU_ONLY;
     if (salt_text_target_policy_compile_environment(
             &model->target_policy, requested_target_execution,
-            SALT_GEMMA4_TEXT_TARGET_MAX_CANDIDATES) != 0) {
+            SALT_GEMMA4_TEXT_TARGET_MAX_CANDIDATES) != 0 ||
+        model->target_policy.candidate_count >
+            SALT_GEMMA4_TEXT_NFQ_MAX_CANDIDATES ||
+        (model->target_policy.target_rows >
+             SALT_GEMMA4_TEXT_NFQ_MAX_CANDIDATES &&
+         (!platform_recipe || strcmp(platform_recipe, "rocm") != 0))) {
         set_error(error, error_size, "invalid engine TARGET policy");
         goto fail;
     }
@@ -3364,6 +3419,21 @@ SaltGemma4Text *salt_gemma4_text_load(FILE *binding, int max_context,
         }
         model->metal_exact_cells = exact_cells && !strcmp(exact_cells, "1");
         model->fine_token_enabled = fine_token && !strcmp(fine_token, "1");
+        model->decode_gpu_only = model->fine_token_enabled;
+        {
+            const char *decode_mode = getenv("SALT_GEMMA_DECODE_MODE");
+            if (decode_mode && strcmp(decode_mode, "recipe") != 0) {
+                if ((strcmp(decode_mode, "mixed") != 0 &&
+                     strcmp(decode_mode, "full-gpu") != 0) ||
+                    !model->full_gpu_intent || salt_gpu_rocm_present() ||
+                    model->metal_exact_cells || !g4_target_gpu_program(model)) {
+                    set_error(error, error_size,
+                              "Gemma decode mode requires Metal/CUDA mixed or full-gpu");
+                    goto fail;
+                }
+                model->decode_gpu_only = !strcmp(decode_mode, "full-gpu");
+            }
+        }
         if (model->metal_exact_cells && !model->full_gpu_intent) {
             set_error(error, error_size,
                       "exact Metal cells require full GPU intent");
@@ -5119,6 +5189,11 @@ static int g4_text_state_publish(SaltGemma4Text *model, int position) {
     model->text_kv_state.position = (uint32_t)position;
     if (model->text_program.ready)
         model->text_kv_state.transition_generation++;
+    /* The retained ordinary executor consumes the same committed generation
+     * after PREFILL/import as the compiled executor. Never start a second
+     * token-generation sequence when changing physical phase callers. */
+    model->token_transition_generation =
+        model->text_kv_state.transition_generation;
     return 0;
 }
 
@@ -5130,6 +5205,8 @@ static int g4_text_state_sync_from_kv(SaltGemma4Text *model) {
     memset(&model->target_projection, 0, sizeof model->target_projection);
 /* SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1 */
     model->position = (int)model->text_kv_state.position;
+    model->token_transition_generation =
+        model->text_kv_state.transition_generation;
     return g4_text_state_aligned(model) ? 0 : -1;
 }
 
@@ -5289,17 +5366,19 @@ static int init_text_verify(SaltGemma4Text *model) {
     model->text_descriptor.norm_epsilon = G4_EPS;
     model->text_descriptor.embedding_scale = G4_EMBED_SCALE;
     model->text_kv_state.position = (uint32_t)model->position;
-    maximum_candidates = SALT_GEMMA4_TEXT_TARGET_MAX_CANDIDATES;
-    if (g4_compact_hmm_gpu_program(model) && model->prefill_capacity > 0 &&
+    maximum_candidates = model->target_policy.target_rows;
+    if (maximum_candidates < SALT_GEMMA4_TEXT_NFQ_MAX_CANDIDATES)
+        maximum_candidates = SALT_GEMMA4_TEXT_NFQ_MAX_CANDIDATES;
+    if ((g4_compact_hmm_gpu_program(model) ||
+         g4_registered_cuda_gpu_program(model)) &&
+        model->prefill_capacity > 0 &&
         (uint32_t)model->prefill_capacity > maximum_candidates)
         maximum_candidates = (uint32_t)model->prefill_capacity;
 /* SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1 */
-    if (model->full_gpu_intent && g4_target_gpu_program(model) &&
-        !salt_gpu_cuda_present() && !salt_gpu_rocm_present() &&
-        model->gpu_weight_addressability == SALT_GPU_WEIGHT_ADDRESS_BOUNDED_WINDOW &&
-        model->target_policy.target_rows > 0u &&
-        model->target_policy.target_rows < maximum_candidates)
-        maximum_candidates = model->target_policy.target_rows;
+    /* Metal PREFILL uses the model-owned phase scratch and KV ring path,
+     * not this generic TARGET executor. Keep its established TARGET capacity
+     * independent of PREFILL B; the compact GPU PREFILL path above still
+     * sizes its executor for the phase that actually consumes it. */
 /* SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1 */
     if (maximum_candidates > (uint32_t)model->max_context)
         maximum_candidates = (uint32_t)model->max_context;
@@ -6663,6 +6742,7 @@ static int g4_gpu_attention_transform_rows(
         !queries || !keys || !values)
         return -1;
     if (!model->gpu_attention_enabled || layer->shared_position != 0 ||
+        (layer->kv_ring && !salt_gpu_cuda_present() && !salt_gpu_rocm_present()) ||
         model->use_ondemand_rope_proof)
         return 1;
     cosines = layer->full_attention
@@ -6707,7 +6787,8 @@ static int g4_gpu_attention_body_rows(
         query_count != (size_t)batch * (size_t)layer->q_dim ||
         !queries || !outputs)
         return -1;
-    if (!model->gpu_attention_enabled || layer->shared_position != 0)
+    if (!model->gpu_attention_enabled || layer->shared_position != 0 ||
+        (layer->kv_ring && !salt_gpu_cuda_present() && !salt_gpu_rocm_present()))
         return 1;
     if (!model->kv_arena || !model->kv_shared.contents ||
         !g4_shared_output_ref(model, queries, query_count,
@@ -7085,6 +7166,7 @@ typedef struct {
     float *values;
     float *attention_outputs;
     float *branches;
+    int gpu_transformed;
 } G4PrefillAttentionBatch;
 
 static int g4_prefill_attention_batch_prepare(
@@ -7166,7 +7248,7 @@ static int g4_prefill_attention_batch_project(
 }
 
 static int g4_prefill_attention_batch_transform(
-        const G4PrefillAttentionBatch *operation) {
+        G4PrefillAttentionBatch *operation) {
     SaltGemma4Text *model = operation->model;
     G4Layer *layer = operation->layer;
     const SaltAttentionDesc *plan = operation->plan;
@@ -7180,6 +7262,7 @@ static int g4_prefill_attention_batch_transform(
         return -1;
     }
     transformed = transform_rc == 0;
+    operation->gpu_transformed = transformed;
     if (!transformed)
         for (int token = 0; token < operation->batch; token++) {
             int position = operation->start + token;
@@ -7265,6 +7348,9 @@ static int g4_prefill_attention_batch_commit(
     G4Layer *layer = operation->layer;
     size_t row_bytes = (size_t)layer->kv_dim * sizeof(float);
     if (!layer->kv_ring) return 0;
+    /* GPU transform has already published the normalized/RoPE K/V into the
+     * canonical shared ring. Staging keys/values still hold raw projections. */
+    if (operation->gpu_transformed && salt_gpu_cuda_present()) return 0;
     for (int token = 0; token < operation->batch; token++) {
         int position = operation->start + token;
         float *key = g4_private_key_row(layer, position);
@@ -8088,7 +8174,8 @@ static int routed_experts(SaltGemma4Text *model, int layer_index,
 }
 
 static int feed_forward(SaltGemma4Text *model, G4Layer *layer,
-                        int layer_index, const float *residual, float *output) {
+                        int layer_index, const float *residual, float *output,
+                        int ordinary_decode) {
     int profile = model && model->decode_detail.enabled;
     double mark = profile ? g4_now_s() : 0.0;
     int rc;
@@ -8125,8 +8212,16 @@ static int feed_forward(SaltGemma4Text *model, G4Layer *layer,
     if (salt_gemma4_router_input(model->norm_a, residual,
             layer->router_scale.values, G4_HIDDEN, G4_EPS) != 0)
         return step_fail("router-input", layer_index, model->position);
-    if (q_matvec_operation(model, &layer->router,
-            model->norm_a, model->router_logits) != 0)
+    /* The small ordinary Metal router uses the existing exact CPU workers.
+     * Batch/PREFILL, proof callers and other backends retain their dispatch. */
+    rc = ordinary_decode && model->full_gpu_intent &&
+            !salt_gpu_cuda_present() && !salt_gpu_rocm_present() &&
+            layer->router.bits == 8
+        ? g4_q8_pool_batch(model, &layer->router, 1,
+            model->norm_a, model->router_logits)
+        : q_matvec_operation(model, &layer->router,
+            model->norm_a, model->router_logits);
+    if (rc != 0)
         return step_fail("router-projection", layer_index, model->position);
     int selected[G4_TOPK];
     float weights[G4_TOPK];
@@ -9576,12 +9671,12 @@ static int g4_text_executor_ready(const SaltGemma4Text *model);
 /* SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1 */
 
 static int g4_pageable_gpu_prefill_selected(const SaltGemma4Text *model) {
-/* SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1 */
-    if (model && model->full_gpu_intent && g4_target_gpu_program(model) &&
-        model->text_gpu.ready && !salt_gpu_cuda_present() &&
-        !salt_gpu_rocm_present() &&
-        model->gpu_weight_addressability == SALT_GPU_WEIGHT_ADDRESS_BOUNDED_WINDOW)
+    if (g4_registered_cuda_gpu_program(model) && model->text_gpu.ready)
         return 1;
+/* SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1 */
+    /* Metal PREFILL uses the retained phase-specific batch operators.
+     * The compiled TARGET program remains available for TARGET, not as the
+     * ordinary PREFILL realization. Keep later ring/shared-state handling. */
     if (model && model->full_gpu_intent && g4_target_gpu_program(model) &&
         model->text_gpu.ready && salt_gpu_rocm_present() &&
         model->gpu_device_residency && model->gpu_residency.ready &&
@@ -9740,8 +9835,18 @@ static int g4_pageable_gpu_prefill(
             backend->backend_template_reuses == 0u ||
             backend->backend_dynamic_patches == 0u ||
             backend->backend_selected_jobs != (uint32_t)batch * G4_TOPK ||
+/* SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1 */
+            (backend->backend_graph_count == 0u
+                ? (backend->backend_graph_launches != 0u ||
+                   backend->backend_graph_parameter_patches != 0u)
+                : backend->backend_graph_launches == 0u) ||
+#if 0
+/* SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1 */
             backend->backend_graph_count != 0u ||
             backend->backend_graph_launches != 0u ||
+/* SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1 */
+#endif
+/* SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1 */
             backend->backend_physical_kernel_nodes == 0u ||
             backend->backend_host_kernel_launch_calls == 0u ||
             backend->initial_transfer_bytes !=
@@ -10208,7 +10313,7 @@ static int g4_text_target_nfq_execute(
         const float *parent_logits, SaltTextVerifyResult *result) {
     const SaltTextTargetPolicy *policy;
     SaltAreaNfqPlan plan;
-    uint32_t route_ids[SALT_GEMMA4_TEXT_TARGET_MAX_CANDIDATES];
+    uint32_t route_ids[SALT_GEMMA4_TEXT_NFQ_MAX_CANDIDATES];
     uint64_t generation, width;
     uint32_t processed = 0, retired = 0, scheduler_workers;
     uint32_t sequence_tiles, route_count;
@@ -10237,7 +10342,7 @@ static int g4_text_target_nfq_execute(
             (!g4_target_gpu_program(model) || !model->text_gpu.backend_ops ||
              !model->text_gpu.backend_ops->begin_frontier)) ||
         width < scheduler_workers || width % scheduler_workers != 0u ||
-        width > SALT_GEMMA4_TEXT_TARGET_MAX_CANDIDATES)
+        width > SALT_GEMMA4_TEXT_NFQ_MAX_CANDIDATES)
         return 1;
     generation = model->text_kv_state.transition_generation + 1u;
     for (uint32_t route = 0; route < route_count; route++) {
@@ -10257,9 +10362,9 @@ static int g4_text_target_nfq_execute(
     };
     if (salt_area_nfq_bind(&model->target_nfq,
             model->target_nfq_routes,
-            SALT_GEMMA4_TEXT_TARGET_MAX_CANDIDATES,
+            SALT_GEMMA4_TEXT_NFQ_MAX_CANDIDATES,
             model->target_nfq_items,
-            SALT_GEMMA4_TEXT_TARGET_MAX_CANDIDATES * 8u) != 0 ||
+            SALT_GEMMA4_TEXT_NFQ_MAX_CANDIDATES * 8u) != 0 ||
         salt_area_nfq_start(&model->target_nfq, &plan,
             generation, generation - 1u, (uint32_t)model->position,
             route_ids, route_count) != 0)
@@ -10321,7 +10426,7 @@ static int g4_text_target_nfq_execute(
         const float *parent_logits, SaltTextVerifyResult *result) {
     const SaltTextTargetPolicy *policy;
     SaltTextTargetNfqBlock block;
-    uint32_t route_ids[SALT_GEMMA4_TEXT_TARGET_MAX_CANDIDATES];
+    uint32_t route_ids[SALT_GEMMA4_TEXT_NFQ_MAX_CANDIDATES];
     uint32_t scheduler_workers, route_width;
     int rc;
     if (!model || !route_token_ids || !parent_logits || !result)
@@ -10344,9 +10449,9 @@ static int g4_text_target_nfq_execute(
         return -1;
     if (salt_area_nfq_bind(&model->target_nfq,
             model->target_nfq_routes,
-            SALT_GEMMA4_TEXT_TARGET_MAX_CANDIDATES,
+            SALT_GEMMA4_TEXT_NFQ_MAX_CANDIDATES,
             model->target_nfq_items,
-            SALT_GEMMA4_TEXT_TARGET_MAX_CANDIDATES * 8u) != 0)
+            SALT_GEMMA4_TEXT_NFQ_MAX_CANDIDATES * 8u) != 0)
         return -1;
     memset(&block, 0, sizeof block);
     block.route.transition_generation =
@@ -10363,9 +10468,9 @@ static int g4_text_target_nfq_execute(
     };
     block.matrix = &model->target_nfq;
     block.nodes = model->target_nfq_nodes;
-    block.node_capacity = SALT_GEMMA4_TEXT_TARGET_MAX_CANDIDATES;
+    block.node_capacity = SALT_GEMMA4_TEXT_NFQ_MAX_CANDIDATES;
     block.route_ids = route_ids;
-    block.route_capacity = SALT_GEMMA4_TEXT_TARGET_MAX_CANDIDATES;
+    block.route_capacity = SALT_GEMMA4_TEXT_NFQ_MAX_CANDIDATES;
     block.ready_items = model->target_nfq_ready;
     block.ready_capacity = 32u;
     rc = salt_text_verify_nfq_execute(
@@ -10405,11 +10510,11 @@ static int g4_text_target_wfq_prepare(
         SaltGemma4Text *model, uint64_t generation, uint32_t route_count) {
     SaltAreaFrontier *frontier = g4_text_target_area_frontier(model);
     SaltAreaWfqPlan plan;
-    uint32_t seeds[SALT_GEMMA4_TEXT_TARGET_MAX_CANDIDATES];
+    uint32_t seeds[SALT_GEMMA4_TEXT_NFQ_MAX_CANDIDATES];
     if (!model || !frontier || !frontier->tasks || generation == 0 ||
         route_count == 0 ||
         route_count > (uint32_t)model->target_area_active_workers ||
-        route_count > SALT_GEMMA4_TEXT_TARGET_MAX_CANDIDATES ||
+        route_count > SALT_GEMMA4_TEXT_NFQ_MAX_CANDIDATES ||
         salt_area_frontier_reset(frontier, generation) != 0)
         return -1;
     for (uint32_t branch = 0; branch < route_count; branch++) {
@@ -10438,11 +10543,11 @@ static int g4_text_target_wfq_prepare(
     plan.queue_length = 2u;
     return salt_area_wfq_bind(
             &model->target_wfq, model->target_wfq_branches,
-            SALT_GEMMA4_TEXT_TARGET_MAX_CANDIDATES,
+            SALT_GEMMA4_TEXT_NFQ_MAX_CANDIDATES,
             model->target_wfq_items,
-            SALT_GEMMA4_TEXT_TARGET_MAX_CANDIDATES,
+            SALT_GEMMA4_TEXT_NFQ_MAX_CANDIDATES,
             model->target_wfq_results,
-            SALT_GEMMA4_TEXT_TARGET_MAX_CANDIDATES,
+            SALT_GEMMA4_TEXT_NFQ_MAX_CANDIDATES,
             frontier->tasks, frontier->capacity) != 0
         ? -1 : salt_area_wfq_start(
             &model->target_wfq, &plan, generation, seeds, route_count);
@@ -10518,10 +10623,19 @@ int salt_gemma4_text_target_route(
         return -1;
 #endif
 /* SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1 */
+/* SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1 */
+    /* A selected causal trajectory belongs to the portable linear verifier.
+     * Worker width must not redirect X rows into model-owned NFQ bookkeeping.
+     * Keep the explicit multi-route frontier control separate. */
+    if (policy->route_count > 1u) {
+/* SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1 */
     nfq_rc = g4_text_target_nfq_execute(
         model, route_token_ids, (uint32_t)candidate_count,
         parent_logits, result);
     if (nfq_rc <= 0) return nfq_rc;
+/* SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1 */
+    }
+/* SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1 */
     generation = model->text_kv_state.transition_generation + 1u;
     if (policy->route_count <=
             (uint32_t)model->target_area_active_workers) {
@@ -10754,9 +10868,164 @@ int salt_gemma4_text_is_stop_token(int token) {
     return token == 1 || token == 50 || token == 106;
 }
 
+static int g4_materialized_argmax(const float *logits) {
+    int best = -1;
+    float best_value = -INFINITY;
+    if (!logits) return -1;
+    for (int token = 0; token < G4_VOCAB; token++) {
+        float value = logits[token];
+        if (!isfinite(value)) return -1;
+        if (best < 0 || value > best_value) {
+            best = token;
+            best_value = value;
+        }
+    }
+    return best;
+}
+
+/* One authoritative known-row materializer for B=1 and B=j.  The common
+ * startup-compiled text program owns compute, canonical destinations, resource
+ * leases, KV publication, and the single completion boundary. */
+static int g4_materialize_known_span(
+        SaltGemma4Text *model, const int32_t *tokens, uint32_t count,
+        SaltTextVerifyResult *result) {
+    SaltTextExecuteAllResult executed;
+    const float *boundary;
+    uint64_t generation;
+    int pending, execute_status;
+    if (result) memset(result, 0, sizeof *result);
+    if (!model || !tokens || count == 0u || count > INT_MAX || !result ||
+        !model->text_program.ready || !g4_text_executor_ready(model) ||
+        !g4_text_state_aligned(model) ||
+        count > model->text_program.maximum_candidates ||
+        (uint32_t)model->position >
+            model->text_program.maximum_context - count ||
+        model->text_kv_state.transition_generation == UINT64_MAX ||
+        model->prefill_decode_lookahead.status == SALT_TEXT_LOOKAHEAD_READY)
+        return -1;
+    for (uint32_t row = 0u; row < count; row++)
+        if (tokens[row] < 0 || tokens[row] >= G4_VOCAB)
+            return -1;
+    /* Ordinary CPU and recipe-selected Metal B1 use the retained token program,
+     * not an X=1 target
+     * program.  NFQ has already selected the root; this changes only its
+     * physical materialization.  head_logits is startup-owned storage. */
+    if (count == 1u && (!model->full_gpu_intent ||
+            (!salt_gpu_cuda_present() && !salt_gpu_rocm_present() &&
+             !model->fine_token_enabled))) {
+        uint32_t source = (uint32_t)model->position;
+        generation = model->text_kv_state.transition_generation + 1u;
+        if (salt_gemma4_text_step(model, tokens[0], model->head_logits) != 0 ||
+            model->text_kv_state.position != source + 1u ||
+            model->text_kv_state.transition_generation != generation ||
+            model->token_transition_generation != generation)
+            return -1;
+        pending = g4_materialized_argmax(model->head_logits);
+        if (pending < 0) return -1;
+        result->status = SALT_TEXT_VERIFY_COMMITTED;
+        result->accepted_count = 1u;
+        result->committed_count = 1u;
+        result->produced_count = 2u;
+        result->pending_token_id = pending;
+        result->result_position = model->text_kv_state.position;
+        result->transition_generation = generation;
+        result->pending_logits = model->head_logits;
+        result->pending_logits_count = G4_VOCAB;
+        result->backend.engine_submissions =
+            model->token_backend_last.caller_submissions;
+        result->backend.completion_fences =
+            model->token_backend_last.completion_fences;
+        result->backend.internal_dependency_barriers =
+            model->token_backend_last.internal_dependency_barriers;
+        result->backend.intermediate_host_publications =
+            model->token_backend_last.intermediate_host_publications;
+        return 0;
+    }
+    memset(&model->target_projection, 0, sizeof model->target_projection);
+    generation = model->text_kv_state.transition_generation + 1u;
+    memset(&executed, 0, sizeof executed);
+    execute_status = count == 1u ||
+            model->text_executor.ops->submit_authoritative_output
+        ? salt_text_execute_prefill(&model->text_program,
+            &model->text_executor, generation,
+            (uint32_t)model->position, tokens, count, 1u, &executed)
+        : salt_text_execute_all(&model->text_program,
+            &model->text_executor, generation,
+            (uint32_t)model->position, tokens, count, &executed);
+    if (execute_status != 0 ||
+        executed.status != SALT_TEXT_VERIFY_COMMITTED ||
+        executed.committed_count != count ||
+        executed.result_position != (uint32_t)model->position + count ||
+        executed.transition_generation != generation ||
+        !executed.view.canonical_base ||
+        executed.view.canonical_bytes < model->text_program.layout.total_bytes ||
+        executed.backend.engine_submissions != 1u ||
+        executed.backend.completion_fences != 1u ||
+        executed.backend.intermediate_host_publications != 0u)
+        return -1;
+    boundary = (const float *)(const void *)(executed.view.canonical_base +
+        model->text_program.layout.position_logits) +
+        (size_t)(count - 1u) * G4_VOCAB;
+    pending = g4_materialized_argmax(boundary);
+    if (pending < 0 || g4_text_state_sync_from_kv(model) != 0 ||
+        model->position != (int)executed.result_position)
+        return -1;
+    model->token_transition_generation = executed.transition_generation;
+    result->status = SALT_TEXT_VERIFY_COMMITTED;
+    result->accepted_count = count;
+    result->committed_count = count;
+    result->produced_count = count + 1u;
+    result->pending_token_id = pending;
+    result->result_position = executed.result_position;
+    result->transition_generation = executed.transition_generation;
+    result->winning_node_index = count - 1u;
+    result->winning_node_id = count - 1u;
+    result->pending_logits = boundary;
+    result->pending_logits_count = G4_VOCAB;
+    result->backend = executed.backend;
+    memset(&model->token_backend_last, 0, sizeof model->token_backend_last);
+    model->token_backend_last.caller_submissions =
+        executed.backend.engine_submissions;
+    model->token_backend_last.cells_completed =
+        model->text_program.dispatch.cell_count;
+    model->token_backend_last.internal_dependency_barriers =
+        executed.backend.internal_dependency_barriers;
+    model->token_backend_last.completion_fences =
+        executed.backend.completion_fences;
+    model->token_backend_last.intermediate_host_publications =
+        executed.backend.intermediate_host_publications;
+    model->token_backend_last.final_publications = 1u;
+    model->token_backend_last.tentative_write_bytes =
+        executed.backend.final_kv_publish_bytes;
+    if (getenv("SALT_WATERFALL"))
+        fprintf(stderr,
+            "GEMMA4_KNOWN_MATERIALIZER source=%u B=%u result=%u "
+            "submissions=%u fences=%u intermediate_publish=%u "
+            "logits_rows=%u kv_publish_bytes=%llu\n",
+            executed.result_position - count, count, executed.result_position,
+            executed.backend.engine_submissions,
+            executed.backend.completion_fences,
+            executed.backend.intermediate_host_publications,
+            count == 1u || model->text_executor.ops->submit_authoritative_output
+                ? 1u : count,
+            (unsigned long long)executed.backend.final_kv_publish_bytes);
+    return 0;
+}
+
 int salt_gemma4_text_consume_known(
         SaltGemma4Text *model, int token, float *logits) {
-    return salt_gemma4_text_step(model, token, logits);
+    SaltTextVerifyResult materialized;
+    int32_t known = token;
+    if (model && (!model->full_gpu_intent ||
+            (!salt_gpu_cuda_present() && !salt_gpu_rocm_present() &&
+             !model->fine_token_enabled)))
+        return salt_gemma4_text_step(model, token, logits);
+    if (g4_materialize_known_span(model, &known, 1u, &materialized) != 0)
+        return -1;
+    if (logits)
+        memcpy(logits, materialized.pending_logits,
+               (size_t)G4_VOCAB * sizeof(float));
+    return 0;
 }
 
 #if 0 /* Reference-only rollout; production never proposes with model steps. */
@@ -10855,13 +11124,13 @@ static int g4_scheduler_nfq_search(
         SaltTextVerifyResult *result) {
     SaltGemma4Text *model = (SaltGemma4Text *)opaque;
     SaltTextTargetNfqBlock block;
-    uint32_t route_ids[SALT_GEMMA4_TEXT_TARGET_MAX_CANDIDATES];
+    uint32_t route_ids[SALT_GEMMA4_TEXT_NFQ_MAX_CANDIDATES];
     if (!model || !route || !result ||
         salt_area_nfq_bind(&model->target_nfq,
             model->target_nfq_routes,
-            SALT_GEMMA4_TEXT_TARGET_MAX_CANDIDATES,
+            SALT_GEMMA4_TEXT_NFQ_MAX_CANDIDATES,
             model->target_nfq_items,
-            SALT_GEMMA4_TEXT_TARGET_MAX_CANDIDATES * 8u) != 0)
+            SALT_GEMMA4_TEXT_NFQ_MAX_CANDIDATES * 8u) != 0)
         return -1;
     memset(&block, 0, sizeof block);
     block.route = *route;
@@ -10872,7 +11141,7 @@ static int g4_scheduler_nfq_search(
     };
     block.matrix = &model->target_nfq;
     block.route_ids = route_ids;
-    block.route_capacity = SALT_GEMMA4_TEXT_TARGET_MAX_CANDIDATES;
+    block.route_capacity = SALT_GEMMA4_TEXT_NFQ_MAX_CANDIDATES;
     block.ready_items = model->target_nfq_ready;
     block.ready_capacity = 32u;
     return salt_text_verify_nfq_execute(
@@ -10886,6 +11155,7 @@ static int g4_scheduler_select_proposal(
     SaltGemma4Text *model = (SaltGemma4Text *)opaque;
     SaltTextTargetRouteBlock route;
     SaltTextTokenEpochRequest request;
+    int rc;
     if (!model || !controller || !tokens || !parent || !result ||
         !model->target_policy.ready || !g4_text_state_aligned(model) ||
         count != model->target_policy.candidate_count *
@@ -10907,7 +11177,20 @@ static int g4_scheduler_select_proposal(
     request.exact_lookup_commit = g4_target_generate_exact_miss;
     request.cold_search = g4_scheduler_nfq_search;
     request.cold_context = model;
-    return salt_text_token_epoch_execute(controller, &request, result);
+    rc = salt_text_token_epoch_execute(controller, &request, result);
+    if (rc == 0 && getenv("SALT_WATERFALL"))
+        fprintf(stderr, "GEMMA4_NFQ_SELECTION source=%u n=%u f=%u q=%u "
+            "queued=%u checked=%u cancelled=%u winner=%u token=%d "
+            "model_submissions=%u committed=%u\n",
+            route.source_position, route.sequence_tiles, route.route_count,
+            model->target_policy.queue_length,
+            result->target.backend.production_frontier_tasks_queued,
+            result->target.backend.production_frontier_tasks_executed,
+            result->target.backend.production_frontier_queued_cancellations,
+            result->target.winning_node_index, result->target.pending_token_id,
+            result->target.backend.engine_submissions,
+            result->target.committed_count);
+    return rc;
 }
 
 static int g4_scheduler_target(
@@ -10922,6 +11205,37 @@ static int g4_scheduler_target(
         model, controller, tokens, (int)count,
         parent, g4_target_generate_exact_miss, NULL, result);
 }
+
+#if 0 /* Isolated control; retain for comparison, not normal dispatch. */
+/* Normal history/projection candidates are proposals, not exact transition
+ * evidence.  Horizontal NFQ has proved only the parent-selected root, so this
+ * provider fails closed to B1.  A future authenticated edge provider may widen
+ * B without changing the materializer. */
+static int g4_scheduler_prove_prefix(
+        void *opaque, const int32_t *tokens, uint32_t count,
+        uint64_t parent_generation, uint32_t parent_position,
+        uint32_t *checked_count, uint32_t *proven_count) {
+    SaltGemma4Text *model = (SaltGemma4Text *)opaque;
+    if (checked_count) *checked_count = 0u;
+    if (proven_count) *proven_count = 0u;
+    if (!model || !tokens || count == 0u || !checked_count || !proven_count ||
+        tokens[0] < 0 || tokens[0] >= G4_VOCAB ||
+        model->text_kv_state.transition_generation != parent_generation ||
+        model->text_kv_state.position != parent_position ||
+        model->position < 0 || (uint32_t)model->position != parent_position)
+        return -1;
+    *proven_count = 1u;
+    *checked_count = count == 1u ? 1u : 2u;
+    return 0;
+}
+
+static int g4_scheduler_materialize_known(
+        void *opaque, const int32_t *tokens, uint32_t count,
+        SaltTextVerifyResult *result) {
+    return g4_materialize_known_span(
+        (SaltGemma4Text *)opaque, tokens, count, result);
+}
+#endif
 
 static uint64_t g4_scheduler_clock(void *opaque) {
     (void)opaque;
@@ -10942,6 +11256,13 @@ int salt_gemma4_text_scheduler_binding(
 
     binding->select_proposal = g4_scheduler_select_proposal;
     binding->target = g4_scheduler_target;
+    /* Isolation candidate: preserve the known-prefix implementation above,
+     * but let the existing target verifier evaluate tentative proposals. */
+    binding->prove_prefix = NULL;
+    binding->materialize_known = NULL;
+    binding->target_sublane_matrix = &model->target_nfq;
+    binding->target_sublane_ready_items = model->target_nfq_ready;
+    binding->target_sublane_ready_capacity = 32u;
     *controller = &model->scheduler_controller;
     return 0;
 }
@@ -11081,7 +11402,7 @@ static int g4_image_prefill_node(void *opaque, uint32_t node) {
                 model->position = token;
                 if (feed_forward(model, layer, layer_index,
                         run->next + (size_t)token * G4_HIDDEN,
-                        run->current + (size_t)token * G4_HIDDEN) != 0) {
+                        run->current + (size_t)token * G4_HIDDEN, 0) != 0) {
                     release_layer_residency(layer);
                     return step_fail("image-prefill-feed-forward-proof",
                                      layer_index, token);
@@ -11326,23 +11647,8 @@ static int g4_token_begin(
         context->expert_fallback_before = context->model->expert_pool_fallbacks;
         context->cpu_soa_ready = 1;
     }
-    if (!context->model->full_gpu_intent) {
-        const char *graph = getenv("SALT_TOKEN_CPU_GRAPH");
-        int graph_enabled = 0;
-        if (graph) {
-            if (strcmp(graph, "0") != 0 && strcmp(graph, "1") != 0)
-                return -1;
-            graph_enabled = strcmp(graph, "1") == 0;
-        }
-        if (graph_enabled && context->cpu_flow_active)
-            return -1;
-        if (graph_enabled) {
-            if (!context->model->compute_pool_ready ||
-                salt_attn_pool_graph_begin(&context->model->compute_pool) != 0)
-                return -1;
-            context->cpu_graph_active = 1;
-        }
-    }
+    /* Ordinary CPU B1 has a fixed physical path.  Experimental retained
+     * graphs belong to the separate batch executor, not token admission. */
     if (context->profile) context->total_start = g4_now_s();
     return 0;
 }
@@ -11389,7 +11695,7 @@ static SaltTextTokenCellResult g4_token_cell(
         context->failure_stage = "feed-forward";
         context->failure_layer = cell->layer;
         rc = feed_forward(model, &model->layers[cell->layer], cell->layer,
-            model->after_attention, context->next);
+            model->after_attention, context->next, 1);
         window_rc = g4_trunk_layer_window_end(model);
         if (window_rc != 0 && rc == 0) {
             context->failure_stage = "layer-window-release";
@@ -11680,7 +11986,7 @@ int salt_gemma4_text_step(SaltGemma4Text *model, int token, float *logits) {
         !model->token_program.ready ||
         model->token_transition_generation == UINT64_MAX)
         return step_fail("position", -1, model->position);
-    if (model->fine_token_enabled) {
+    if (model->full_gpu_intent && model->decode_gpu_only) {
         SaltTextExecuteAllResult fine;
         int32_t input_token = token;
         uint64_t generation;
@@ -11746,7 +12052,9 @@ int salt_gemma4_text_step(SaltGemma4Text *model, int token, float *logits) {
                 (unsigned long long)fine.backend.final_kv_publish_bytes);
         return 0;
     }
-    flow_env = getenv("SALT_TOKEN_CPU_FLOW");
+    /* CPU B1 cannot be redirected by optimization flags.  Preserve the
+     * existing GPU admission behavior without enabling CPU fallback. */
+    flow_env = model->full_gpu_intent ? getenv("SALT_TOKEN_CPU_FLOW") : NULL;
     if (flow_env && strcmp(flow_env, "0") != 0 &&
         strcmp(flow_env, "1") != 0)
         return step_fail("cpu-flow-config", -1, model->position);

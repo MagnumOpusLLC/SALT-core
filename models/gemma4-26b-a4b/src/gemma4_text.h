@@ -12,7 +12,8 @@
 typedef struct SaltGemma4Text SaltGemma4Text;
 
 enum {
-    SALT_GEMMA4_TEXT_TARGET_MAX_CANDIDATES = 128
+    SALT_GEMMA4_TEXT_NFQ_MAX_CANDIDATES = 128,
+    SALT_GEMMA4_TEXT_TARGET_MAX_CANDIDATES = 356
 };
 
 typedef struct SaltGemma4MemoryStats {

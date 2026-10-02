@@ -87,6 +87,10 @@ static id<MTLComputePipelineState> _text_combine_pso;
 static id<MTLComputePipelineState> _text_rms_rows_pso;
 static id<MTLComputePipelineState> _text_residual_rows_pso;
 static id<MTLComputePipelineState> _text_router_rows_pso;
+static id<MTLComputePipelineState> _text_combine_multi_pso;
+static id<MTLComputePipelineState> _text_rms_multi_pso;
+static id<MTLComputePipelineState> _text_residual_multi_pso;
+static id<MTLComputePipelineState> _text_router_multi_pso;
 static id<MTLComputePipelineState> _text_topk_rows_pso;
 static id<MTLComputePipelineState> _text_softcap_pso;
 static id<MTLComputePipelineState> _text_transform_view_pso;
@@ -130,6 +134,8 @@ static int metal_ops_prepare(void) {
         _text_embedding_pso && _text_route_maps_pso &&
         _text_routed_gather_pso && _text_expert_reduce_pso &&
         _text_combine_pso &&
+        _text_combine_multi_pso && _text_rms_multi_pso &&
+        _text_residual_multi_pso && _text_router_multi_pso &&
         _text_rms_rows_pso && _text_residual_rows_pso &&
         _text_router_rows_pso && _text_topk_rows_pso && _text_softcap_pso &&
         _text_transform_view_pso && _text_attention_view_pso)
@@ -156,6 +162,10 @@ static int metal_ops_prepare(void) {
             {"text_rmsnorm_rows", &_text_rms_rows_pso},
             {"text_residual_rows", &_text_residual_rows_pso},
             {"text_router_input_rows", &_text_router_rows_pso},
+            {"text_parallel_combine_multirows", &_text_combine_multi_pso},
+            {"text_rmsnorm_multirows", &_text_rms_multi_pso},
+            {"text_residual_multirows", &_text_residual_multi_pso},
+            {"text_router_input_multirows", &_text_router_multi_pso},
             {"text_topk_rows", &_text_topk_rows_pso},
             {"text_softcap", &_text_softcap_pso},
             {"attention_transform_view", &_text_transform_view_pso},
@@ -3256,12 +3266,10 @@ int salt_gpu_q4_moe_chain_selected(const SaltGpuMoeExpert *experts, int count,
                                    float *gate_scratch, float *up_scratch,
                                    size_t scratch_float_capacity) {
     id<MTLBuffer> views[128] = {nil};
-    uint8_t transient_views[128] = {0};
     id<MTLBuffer> input_buffer, output_buffer, gate_buffer, up_buffer;
     size_t input_offset, output_offset, gate_offset, up_offset;
     uint64_t total_rows = 0;
     int max_group = 0, rc = -1;
-    long page_l;
     int detail = getenv("SALT_GPU_MOE_MS_DETAIL") != NULL;
     struct timespec detail_start, detail_prepared, detail_encoded;
     struct timespec detail_committed, detail_waited;
@@ -3270,7 +3278,7 @@ int salt_gpu_q4_moe_chain_selected(const SaltGpuMoeExpert *experts, int count,
     if (!experts || count < 1 || count > 128 || hidden < 1 || routed < 1 ||
         (hidden & 31) != 0 || (routed & 31) != 0 || !inputs || !outputs ||
         !gate_scratch || !up_scratch || batch_pipeline_prepare() != 0 ||
-        metal_ops_prepare() != 0 || (page_l = sysconf(_SC_PAGESIZE)) <= 0)
+        metal_ops_prepare() != 0 || !_wave_selected_args)
         return -1;
     if (detail) {
         detail_id = ++detail_sequence;
@@ -3338,8 +3346,9 @@ int salt_gpu_q4_moe_chain_selected(const SaltGpuMoeExpert *experts, int count,
                 if (starts[part] + sizes[part] > hi)
                     hi = starts[part] + sizes[part];
             }
-            uintptr_t aligned = lo - lo % (uintptr_t)page_l;
-            if (hi <= aligned || hi - aligned > NSUIntegerMax) goto done;
+            uintptr_t aligned;
+            /* Consume the cache's persistent seat. This operation neither
+             * creates resource views nor rebuilds a selection-indexed map. */
             if (entry->resource_slot >= 0) {
                 if (!_selected_cache_resources ||
                     entry->resource_slot >= _selected_cache_capacity ||
@@ -3361,14 +3370,8 @@ int salt_gpu_q4_moe_chain_selected(const SaltGpuMoeExpert *experts, int count,
                 views[i] = resource->map;
                 aligned = resource_lo;
             } else {
-                views[i] = [_dev newBufferWithBytesNoCopy:(void *)aligned
-                    length:(NSUInteger)(hi - aligned)
-                    options:MTLResourceStorageModeShared deallocator:nil];
-                if (!views[i] || [views[i] contents] != (void *)aligned)
-                    goto done;
-                transient_views[i] = 1;
+                goto done;
             }
-            [_selected_arg_encoder setBuffer:views[i] offset:0 atIndex:(NSUInteger)i];
             uint64_t xoff = input_offset / sizeof(float) + row_prefix * hidden;
             uint64_t goff = gate_offset / sizeof(float) + row_prefix * routed;
             uint64_t uoff = up_offset / sizeof(float) + row_prefix * routed;
@@ -3378,7 +3381,7 @@ int salt_gpu_q4_moe_chain_selected(const SaltGpuMoeExpert *experts, int count,
                 {(uintptr_t)entry->gate_biases - aligned,
                  (uint64_t)routed, (uint64_t)hidden,
                  (uint64_t)(uint32_t)entry->group},
-                {(uint64_t)(uint32_t)i, 0, 0, 0},
+                {(uint64_t)(uint32_t)entry->resource_slot, 0, 0, 0},
             };
             desc[2 * i + 1] = (SelectedDesc) {
                 {(uintptr_t)entry->up_vals - aligned,
@@ -3386,7 +3389,7 @@ int salt_gpu_q4_moe_chain_selected(const SaltGpuMoeExpert *experts, int count,
                 {(uintptr_t)entry->up_biases - aligned,
                  (uint64_t)routed, (uint64_t)hidden,
                  (uint64_t)(uint32_t)entry->group},
-                {(uint64_t)(uint32_t)i, 0, 0, 0},
+                {(uint64_t)(uint32_t)entry->resource_slot, 0, 0, 0},
             };
             row_prefix += (uint32_t)entry->group;
         }
@@ -3404,7 +3407,7 @@ int salt_gpu_q4_moe_chain_selected(const SaltGpuMoeExpert *experts, int count,
                 {(uintptr_t)entry->down_biases - aligned,
                  (uint64_t)hidden, (uint64_t)routed,
                  (uint64_t)(uint32_t)entry->group},
-                {(uint64_t)(uint32_t)i, 0, 0, 0},
+                {(uint64_t)(uint32_t)entry->resource_slot, 0, 0, 0},
             };
             row_prefix += (uint32_t)entry->group;
         }
@@ -3416,7 +3419,7 @@ int salt_gpu_q4_moe_chain_selected(const SaltGpuMoeExpert *experts, int count,
             if (!cb || !enc) goto done;
             for (int i = 0; i < count; i++)
                 [enc useResource:views[i] usage:MTLResourceUsageRead];
-            if (metal_selected_encode(enc, _selected_args,
+            if (metal_selected_encode(enc, _wave_selected_args,
                     input_buffer, gate_buffer, 0,
                     2 * count, routed, max_group) != 0) {
                 [enc endEncoding];
@@ -3431,7 +3434,7 @@ int salt_gpu_q4_moe_chain_selected(const SaltGpuMoeExpert *experts, int count,
             [enc dispatchThreads:MTLSizeMake(elements, 1, 1)
                  threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-            if (metal_selected_encode(enc, _selected_args,
+            if (metal_selected_encode(enc, _wave_selected_args,
                     gate_buffer, output_buffer,
                     METAL_SELECTED_DESC_DOWN_OFFSET,
                     count, hidden, max_group) != 0) {
@@ -3476,10 +3479,7 @@ int salt_gpu_q4_moe_chain_selected(const SaltGpuMoeExpert *experts, int count,
         _batch_stats.direct_output_jobs += 3u * total_rows;
         rc = 0;
 done:
-        for (int i = 0; i < count; i++) {
-            [_selected_arg_encoder setBuffer:nil offset:0 atIndex:(NSUInteger)i];
-            if (transient_views[i]) metal_release(views[i]);
-        }
+        ; /* Borrowed seats remain bound until cache-owned retirement. */
     }
     return rc;
 }
@@ -3584,6 +3584,10 @@ static int salt_gpu_free_impl(void) {
     metal_release(_text_rms_rows_pso); _text_rms_rows_pso = nil;
     metal_release(_text_residual_rows_pso); _text_residual_rows_pso = nil;
     metal_release(_text_router_rows_pso); _text_router_rows_pso = nil;
+    metal_release(_text_combine_multi_pso); _text_combine_multi_pso = nil;
+    metal_release(_text_rms_multi_pso); _text_rms_multi_pso = nil;
+    metal_release(_text_residual_multi_pso); _text_residual_multi_pso = nil;
+    metal_release(_text_router_multi_pso); _text_router_multi_pso = nil;
     metal_release(_text_topk_rows_pso); _text_topk_rows_pso = nil;
     metal_release(_text_softcap_pso); _text_softcap_pso = nil;
     metal_release(_text_transform_view_pso); _text_transform_view_pso = nil;
@@ -4396,6 +4400,7 @@ static int metal_text_prepare(
         void *command, size_t command_bytes) {
     MetalTextProgramState *state = (MetalTextProgramState *)backend_state;
     size_t meta_cursor = 0, required_meta_floats = 0;
+    size_t required_task_jobs = 0;
     id<MTLBuffer> resized_meta = nil;
     if (!program || !plan || plan->program != program ||
         plan->execution_class != SALT_TEXT_EXECUTION_GPU_ONLY ||
@@ -4409,6 +4414,13 @@ static int metal_text_prepare(
         const SaltAttentionDesc *attention;
         size_t layer_meta;
         if (!source || !source->plan) return -1;
+        if (source->plan->top_k_experts < 1 ||
+            program->maximum_candidates > UINT32_MAX /
+                (uint32_t)source->plan->top_k_experts)
+            return -1;
+        size_t task_jobs = (size_t)program->maximum_candidates *
+            (uint32_t)source->plan->top_k_experts;
+        if (task_jobs > required_task_jobs) required_task_jobs = task_jobs;
         attention = &source->plan->attention;
         if (attention->head_dim < 2 || attention->rope_dim < 2 ||
             attention->rope_dim > attention->head_dim ||
@@ -4435,6 +4447,19 @@ static int metal_text_prepare(
         if (!resized_meta) return -1;
         [_op_meta release];
         _op_meta = resized_meta;
+    }
+    /* The selected task metadata belongs to startup, just like _op_meta.
+     * Its old fixed B128 extent must not cap the independent PREFILL phase. */
+    if (!_selected_task_map || required_task_jobs > UINT32_MAX / 2u ||
+        required_task_jobs > SIZE_MAX / (3u * sizeof(MetalSelectedTask)))
+        return -1;
+    size_t task_bytes = required_task_jobs * 3u * sizeof(MetalSelectedTask);
+    if (task_bytes > (size_t)[_selected_task_map length]) {
+        id<MTLBuffer> resized_tasks = [_dev newBufferWithLength:task_bytes
+            options:MTLResourceStorageModeShared];
+        if (!resized_tasks) return -1;
+        [_selected_task_map release];
+        _selected_task_map = resized_tasks;
     }
     memset(state, 0, sizeof *state);
     memset(command, 0, sizeof(MetalTextProgramCommand));
@@ -4664,6 +4689,9 @@ static int metal_text_begin(void *backend_state, void *command_state,
         source_position, input_token_ids, input_count, input_count - 1u);
 }
 
+static int metal_text_live_b1_validate(MetalTextProgramState *state,
+                                      MetalTextProgramCommand *command);
+
 static int metal_text_begin_authoritative(
         void *backend_state, void *command_state,
         uint64_t generation, uint32_t source_position,
@@ -4674,7 +4702,7 @@ static int metal_text_begin_authoritative(
             source_position, input_token_ids, input_count) != 0 || !command)
         return -1;
     command->authoritative = 1u;
-    return 0;
+    return metal_text_live_b1_validate(backend_state, command);
 }
 
 static int metal_text_begin_authoritative_output(
@@ -4691,7 +4719,7 @@ static int metal_text_begin_authoritative_output(
         return -1;
     command->authoritative = 1u;
     command->authoritative_output_rows = output_rows;
-    return 0;
+    return metal_text_live_b1_validate(backend_state, command);
 }
 
 static int metal_text_begin_frontier(
@@ -4762,7 +4790,30 @@ static int metal_text_encode_projection(
     canonical = (id<MTLBuffer>)state->canonical.backend;
     encoder = [command->command computeCommandEncoder];
     if (!encoder) return -1;
-    if (ref->encoding == SALT_TENSOR_ENCODING_AFFINE_Q4) {
+    if (ref->encoding == SALT_TENSOR_ENCODING_AFFINE_Q4 &&
+        _weight_stationary_min_b > 0u && batch >= _weight_stationary_min_b &&
+        (ref->cols & 31u) == 0u) {
+        /* Reuse the qualified PREFILL kernel on the current canonical views.
+         * TARGET may use this same lowering; it never sets PREFILL capacity. */
+        BatchDesc4 descriptors[2] = {
+            {ref->value_offset, ref->scale_offset,
+             input_offset / sizeof(float), output_offset / sizeof(float)},
+            {ref->bias_offset, ref->rows, ref->cols, batch},
+        };
+        [encoder setComputePipelineState:_bweight_pso];
+        [encoder setBuffer:ref->value offset:0 atIndex:0];
+        [encoder setBuffer:ref->scale offset:0 atIndex:1];
+        [encoder setBuffer:ref->bias offset:0 atIndex:2];
+        [encoder setBuffer:canonical offset:0 atIndex:3];
+        [encoder setBuffer:canonical offset:0 atIndex:4];
+        [encoder setBytes:descriptors length:sizeof descriptors atIndex:5];
+        [encoder setThreadgroupMemoryLength:512u * sizeof(float) atIndex:0];
+        [encoder dispatchThreadgroups:
+            MTLSizeMake(((NSUInteger)ref->rows + 7u) / 8u,
+                        ((NSUInteger)batch + 7u) / 8u, 1)
+             threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+        physical_dispatches = 1u;
+    } else if (ref->encoding == SALT_TENSOR_ENCODING_AFFINE_Q4) {
         BatchDesc4 descriptors[2u * METAL_TEXT_MAX_CANDIDATES];
         uint32_t first = 0u;
         if (ref->rows > UINT32_MAX / batch) {
@@ -5031,6 +5082,53 @@ static int metal_text_kv_rows(
     return 0;
 }
 
+/* Resolve the authoritative next seat through the existing shared allocation.
+ * No allocation, alternate address table, or copy/publish pass is involved. */
+static int metal_text_live_b1_row(const SaltTextKvRowsDesc *rows,
+        const SaltAttentionDesc *attention, uint32_t width, uint32_t position,
+        id<MTLBuffer> *buffer, size_t *offset) {
+    id<MTLBuffer> shared;
+    size_t shared_offset;
+    uint32_t shared_rows, shared_stride, row;
+    if (metal_text_kv_rows(rows, width, buffer, offset, &shared,
+            &shared_offset, &shared_rows, &shared_stride) != 0 ||
+        position < shared_rows || position < rows->private_position_base)
+        return -1;
+    row = position - rows->private_position_base;
+    if (rows->private_mode == SALT_TEXT_KV_PRIVATE_RING) {
+        /* An overwritten row must be outside this token's causal window. */
+        if (row >= rows->private_row_capacity &&
+            (attention->kind == SALT_ATTN_FULL || attention->window <= 0 ||
+             rows->private_row_capacity < (uint32_t)attention->window))
+            return -1;
+        row %= rows->private_row_capacity;
+    } else if (row >= rows->private_row_capacity) {
+        return -1;
+    }
+    *offset += (size_t)row * width * sizeof(float);
+    return 0;
+}
+
+static int metal_text_live_b1_validate(MetalTextProgramState *state,
+                                      MetalTextProgramCommand *command) {
+    if (command->input_count != 1u) return 0;
+    for (uint32_t layer = 0; layer < state->layer_count; layer++) {
+        const SaltTextCompiledLayer *compiled = &state->program->layers[layer];
+        const SaltTextKvLayerDesc *kv = state->layers[layer].kv;
+        const SaltAttentionDesc *attention = &compiled->descriptor->plan->attention;
+        id<MTLBuffer> buffer;
+        size_t offset;
+        if (!kv || metal_text_live_b1_row(&kv->keys, attention,
+                compiled->kv_width, command->source_position,
+                &buffer, &offset) != 0 ||
+            metal_text_live_b1_row(&kv->values, attention,
+                compiled->kv_width, command->source_position,
+                &buffer, &offset) != 0)
+            return -1;
+    }
+    return 0;
+}
+
 static int metal_text_encode_attention_transform(
         MetalTextProgramState *state, MetalTextProgramCommand *command,
         uint32_t layer_index) {
@@ -5078,6 +5176,17 @@ static int metal_text_encode_attention_transform(
         [blit endEncoding];
         command->stats.backend_physical_kernel_nodes++;
     }
+    id<MTLBuffer> key_output = canonical, value_output = canonical;
+    size_t key_offset = compiled->tentative_key_offset;
+    size_t value_offset = compiled->tentative_value_offset;
+    if (command->authoritative && command->input_count == 1u &&
+        (metal_text_live_b1_row(&refs->kv->keys, attention,
+             compiled->kv_width, command->source_position,
+             &key_output, &key_offset) != 0 ||
+         metal_text_live_b1_row(&refs->kv->values, attention,
+             compiled->kv_width, command->source_position,
+             &value_output, &value_offset) != 0))
+        return -1;
     encoder = [command->command computeCommandEncoder];
     if (!encoder) return -1;
     [encoder setComputePipelineState:_text_transform_view_pso];
@@ -5086,8 +5195,8 @@ static int metal_text_encode_attention_transform(
     [encoder setBuffer:canonical offset:layout->values atIndex:2];
     [encoder setBuffer:_op_meta
                 offset:refs->meta_float_offset * sizeof(float) atIndex:3];
-    [encoder setBuffer:canonical offset:compiled->tentative_key_offset atIndex:4];
-    [encoder setBuffer:canonical offset:compiled->tentative_value_offset atIndex:5];
+    [encoder setBuffer:key_output offset:key_offset atIndex:4];
+    [encoder setBuffer:value_output offset:value_offset atIndex:5];
     [encoder setBuffer:_op_status offset:0 atIndex:6];
     [encoder setBytes:&args length:sizeof args atIndex:7];
     [encoder setThreadgroupMemoryLength:sizeof(float) atIndex:0];
@@ -5156,10 +5265,20 @@ static int metal_text_encode_attention_body(
     [encoder setBuffer:private_v offset:private_vo atIndex:2];
     [encoder setBuffer:shared_k offset:shared_ko atIndex:3];
     [encoder setBuffer:shared_v offset:shared_vo atIndex:4];
-    [encoder setBuffer:(id<MTLBuffer>)state->canonical.backend
-                offset:compiled->tentative_key_offset atIndex:5];
-    [encoder setBuffer:(id<MTLBuffer>)state->canonical.backend
-                offset:compiled->tentative_value_offset atIndex:6];
+    id<MTLBuffer> current_k = (id<MTLBuffer>)state->canonical.backend;
+    id<MTLBuffer> current_v = current_k;
+    size_t current_ko = compiled->tentative_key_offset;
+    size_t current_vo = compiled->tentative_value_offset;
+    if (command->authoritative && command->input_count == 1u &&
+        (metal_text_live_b1_row(&kv->keys, attention, compiled->kv_width,
+             command->source_position, &current_k, &current_ko) != 0 ||
+         metal_text_live_b1_row(&kv->values, attention, compiled->kv_width,
+             command->source_position, &current_v, &current_vo) != 0)) {
+        [encoder endEncoding];
+        return -1;
+    }
+    [encoder setBuffer:current_k offset:current_ko atIndex:5];
+    [encoder setBuffer:current_v offset:current_vo atIndex:6];
     [encoder setBuffer:(id<MTLBuffer>)state->canonical.backend
                 offset:layout->attention_output atIndex:7];
     [encoder setBuffer:_op_status offset:0 atIndex:8];
@@ -5336,6 +5455,9 @@ static int metal_text_encode_expert_chain(
     id<MTLComputeCommandEncoder> encoder;
     uint64_t row_prefix = 0;
     uint32_t gate_up_tasks = 0, down_tasks = 0;
+    size_t down_capacity = (size_t)[_selected_task_map length] /
+        (3u * sizeof(MetalSelectedTask));
+    size_t gate_up_capacity = 2u * down_capacity;
     uint32_t max_group = 0;
     if (!state || !command || !command->command ||
         command->phase != METAL_TEXT_RECORDING_EXPERT ||
@@ -5404,13 +5526,14 @@ static int metal_text_encode_expert_chain(
             {slot, 0u, 0u, 0u},
         };
         for (uint32_t token = 0; token < group; token++) {
-            if (gate_up_tasks > METAL_SELECTED_GATE_UP_TASK_CAPACITY - 2u ||
-                down_tasks >= METAL_SELECTED_DOWN_TASK_CAPACITY)
+            if (gate_up_capacity < 2u ||
+                gate_up_tasks > gate_up_capacity - 2u ||
+                down_tasks >= down_capacity)
                 return -1;
             tasks[gate_up_tasks++] = (MetalSelectedTask) {2u * index, token};
             tasks[gate_up_tasks++] =
                 (MetalSelectedTask) {2u * index + 1u, token};
-            tasks[METAL_SELECTED_GATE_UP_TASK_CAPACITY + down_tasks++] =
+            tasks[gate_up_capacity + down_tasks++] =
                 (MetalSelectedTask) {index, token};
         }
         row_prefix += group;
@@ -5470,7 +5593,7 @@ static int metal_text_encode_expert_chain(
             (id<MTLBuffer>)state->canonical.backend,
             METAL_SELECTED_DESC_DOWN_OFFSET,
             (int)command->request_count, state->program->hidden,
-            (NSUInteger)METAL_SELECTED_GATE_UP_TASK_CAPACITY *
+            (NSUInteger)gate_up_capacity *
                 sizeof(MetalSelectedTask), down_tasks) != 0) {
         [encoder endEncoding];
         return -1;
@@ -5552,6 +5675,17 @@ static int metal_text_encode_rows(
     args.aux = aux;
     args.eps = eps;
     args.scalar = scalar;
+    int parallel_b1 = command->authoritative && command->input_count == 1u &&
+        rows == 1u && (pipeline == _text_rms_rows_pso ||
+                      pipeline == _text_residual_rows_pso ||
+                      pipeline == _text_router_rows_pso);
+    if (!parallel_b1) {
+        if (pipeline == _text_rms_rows_pso) pipeline = _text_rms_multi_pso;
+        else if (pipeline == _text_residual_rows_pso)
+            pipeline = _text_residual_multi_pso;
+        else if (pipeline == _text_router_rows_pso)
+            pipeline = _text_router_multi_pso;
+    }
     encoder = [command->command computeCommandEncoder];
     if (!encoder) return -1;
     [encoder setComputePipelineState:pipeline];
@@ -5562,8 +5696,15 @@ static int metal_text_encode_rows(
                 offset:weight ? weight->value_offset : 0 atIndex:1];
     [encoder setBuffer:_op_status offset:0 atIndex:2];
     [encoder setBytes:&args length:sizeof args atIndex:3];
-    [encoder dispatchThreads:MTLSizeMake(rows, 1, 1)
-         threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+    if (parallel_b1) {
+        NSUInteger threads = MIN((NSUInteger)128,
+                                 pipeline.maxTotalThreadsPerThreadgroup);
+        [encoder dispatchThreadgroups:MTLSizeMake(rows, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+    } else {
+        [encoder dispatchThreads:MTLSizeMake(rows, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+    }
     [encoder endEncoding];
     command->stats.backend_physical_kernel_nodes++;
     return 0;
@@ -5644,7 +5785,9 @@ static int metal_text_encode_combine(
     args.scalar = scalar;
     encoder = [command->command computeCommandEncoder];
     if (!encoder) return -1;
-    [encoder setComputePipelineState:_text_combine_pso];
+    int parallel_b1 = command->authoritative && command->input_count == 1u;
+    [encoder setComputePipelineState:parallel_b1 ? _text_combine_pso
+                                                : _text_combine_multi_pso];
     [encoder setBuffer:(id<MTLBuffer>)state->canonical.backend
                 offset:0 atIndex:0];
     [encoder setBuffer:refs->post_ffn_norm_1.value
@@ -5655,8 +5798,15 @@ static int metal_text_encode_combine(
                 offset:refs->post_ffn_norm.value_offset atIndex:3];
     [encoder setBuffer:_op_status offset:0 atIndex:4];
     [encoder setBytes:&args length:sizeof args atIndex:5];
-    [encoder dispatchThreads:MTLSizeMake(command->input_count, 1, 1)
-         threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+    if (parallel_b1) {
+        NSUInteger threads = MIN((NSUInteger)128,
+                                 _text_combine_pso.maxTotalThreadsPerThreadgroup);
+        [encoder dispatchThreadgroups:MTLSizeMake(command->input_count, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+    } else {
+        [encoder dispatchThreads:MTLSizeMake(command->input_count, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+    }
     [encoder endEncoding];
     command->stats.backend_physical_kernel_nodes++;
     return 0;
@@ -5915,6 +6065,8 @@ static int metal_text_finish(
         sizeof(float);
     view->canonical_base = (unsigned char *)state->canonical.contents;
     view->canonical_bytes = state->canonical_bytes;
+    view->backend_published_kv =
+        command->authoritative && command->input_count == 1u;
     *stats = command->stats;
     if (command->profile_enabled) {
         fprintf(stderr,

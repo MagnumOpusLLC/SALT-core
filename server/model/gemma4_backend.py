@@ -213,6 +213,9 @@ RETAINED_NATIVE_DIAGNOSTIC_PREFIXES = (
     b"GEMMA4_GPU_RESIDENCY_DESTROY ",
     b"GEMMA4_PREFILL_GPU_PROGRAM ",
     b"GEMMA4_SERVER_NFQ ",
+    b"GEMMA4_NFQ_SELECTION ",
+    b"GEMMA4_SERVER_POLICY ",
+    b"GEMMA4_SERVER_X_TARGET ",
     b"GEMMA4_SERVER_SAMPLED ",
     b"GEMMA4_SERVER_SAMPLER ",
     b"GEMMA4_SERVER_DPR_PREFILL_V1 ",
@@ -4142,6 +4145,14 @@ class Gemma4Backend:
         }
         engine_config = dict(GEMMA_ENGINE_CONFIG)
 # SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+        decode_mode = os.environ.get("GEMMA4_DECODE_MODE")
+        if decode_mode is not None:
+            if decode_mode not in ("recipe", "mixed", "full-gpu"):
+                raise BackendError("GEMMA4_DECODE_MODE must be recipe, mixed, or full-gpu")
+            if (decode_mode != "recipe" and engine_config.get(
+                    "SALT_GEMMA_PLATFORM_RECIPE") not in ("mac-metal", "spark-hmm", "spark")):
+                raise BackendError("Gemma decode override is limited to mac-metal, spark-hmm, and spark")
+            engine_config["SALT_GEMMA_DECODE_MODE"] = decode_mode
         stderr_mode = os.environ.get("SALT_SERVER_STDERR", "summary")
         if stderr_mode not in ("summary", "diagnostic", "waterfall"):
             raise BackendError(
@@ -5661,6 +5672,13 @@ def _gemma_prefill_chunk_setting(value: int | None) -> int:
 
 
 def _gemma_kv_layout_setting() -> str:
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+    # Live KV geometry is model-owned on every backend. Native startup now
+    # preserves the sliding rings even for registered GPU attention; its
+    # capacity handshake must not be forecast as the legacy absolute layout.
+    return "hybrid"
+    # The historical selector below is retained only by the frozen projection.
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
     if GEMMA_ENGINE_CONFIG.get("SALT_GEMMA_COMPUTE_NODE") != "full":
         return "hybrid"
     if GEMMA_ENGINE_CONFIG.get("SALT_GEMMA_GPU_KV_RING") == "1":

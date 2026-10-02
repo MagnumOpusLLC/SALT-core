@@ -18,6 +18,7 @@ static uint64_t rd_le64(const uint8_t *p) {
 }
 
 int salt_st_open(SaltSt *st, const char *path) {
+    JDoc *doc = NULL;
     memset(st, 0, sizeof *st);
     st->fd = open(path, O_RDONLY);
     if (st->fd < 0) {
@@ -26,32 +27,32 @@ int salt_st_open(SaltSt *st, const char *path) {
     }
     uint8_t lenb[8];
     ssize_t got = pread(st->fd, lenb, 8, 0);
-    if (got != 8) { fprintf(stderr, "st: short header length\n"); return -1; }
+    if (got != 8) { fprintf(stderr, "st: short header length\n"); goto fail; }
     uint64_t raw_hlen = rd_le64(lenb);
     if (raw_hlen == 0 || raw_hlen > (1U << 28)) {
         fprintf(stderr, "st: implausible header length %llu\n",
                 (unsigned long long)raw_hlen);
-        return -1;
+        goto fail;
     }
     int64_t hlen = (int64_t)raw_hlen;
     st->hdr = (char *)malloc((size_t)hlen + 1);
-    if (!st->hdr) return -1;
+    if (!st->hdr) goto fail;
     got = pread(st->fd, st->hdr, (size_t)hlen, 8);
     if (got != hlen) {
         fprintf(stderr, "st: short header read\n");
-        return -1;
+        goto fail;
     }
     st->hdr[hlen] = 0;
     st->hdr_len = 8 + hlen;
 
-    JDoc *doc = json_parse(st->hdr, (size_t)hlen);
+    doc = json_parse(st->hdr, (size_t)hlen);
     if (!doc) {
         fprintf(stderr, "st: safetensors header is not parseable JSON\n");
-        return -1;
+        goto fail;
     }
     /* payload starts at 8 + hlen; data_offsets are relative to it */
     st->t = (SaltTensor *)calloc((size_t)doc->nroot, sizeof(SaltTensor));
-    if (!st->t) return -1;
+    if (!st->t) goto fail;
     st->n = doc->nroot;
     for (int i = 0; i < doc->nroot; i++) {
         const JEntry *e = &doc->root[i];
@@ -69,6 +70,12 @@ int salt_st_open(SaltSt *st, const char *path) {
     }
     json_free(doc);
     return 0;
+
+fail:
+    json_free(doc);
+    salt_st_close(st);
+    st->fd = -1;
+    return -1;
 }
 
 void salt_st_close(SaltSt *st) {

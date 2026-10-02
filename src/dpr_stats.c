@@ -337,11 +337,11 @@ int salt_dpr_stats_walk_nomogram(
         SaltDprStopTokenFn stop_token, void *stop_opaque,
         uint32_t max_tokens, int32_t *candidate_token_ids,
         size_t *edge_indices, uint32_t *candidate_count) {
-    uint8_t node[32], visited[SALT_DPR_MAX_HORIZON][32];
+    uint8_t node[32], visited[SALT_DPR_MAX_WALK_HORIZON][32];
     uint32_t count = 0;
     if (!store || !stats || !retained || !start_node_sha256 ||
         !candidate_token_ids || !candidate_count || max_tokens == 0 ||
-        max_tokens > SALT_DPR_MAX_HORIZON)
+        max_tokens > SALT_DPR_MAX_WALK_HORIZON)
         return -1;
     memcpy(node, start_node_sha256, 32);
     while (count < max_tokens) {
@@ -375,14 +375,14 @@ int salt_dpr_stats_walk_nomogram_coverage(
         int32_t required_first_token, uint32_t max_tokens,
         int32_t *candidate_token_ids, size_t *edge_indices,
         uint32_t *candidate_count, uint32_t *root_window_count) {
-    uint8_t node[32], visited[SALT_DPR_MAX_HORIZON][32];
+    uint8_t node[32], visited[SALT_DPR_MAX_WALK_HORIZON][32];
     size_t masked[SALT_DPR_MAX_HORIZON];
     uint8_t masked_values[SALT_DPR_MAX_HORIZON];
     uint32_t count = 0, roots = 0;
     if (!store || !stats || !retained || !start_node_sha256 ||
         required_first_token < 0 || required_first_token >= vocab_size ||
         !candidate_token_ids || !candidate_count || !root_window_count ||
-        max_tokens == 0 || max_tokens > SALT_DPR_MAX_HORIZON)
+        max_tokens == 0 || max_tokens > SALT_DPR_MAX_WALK_HORIZON)
         return -1;
     memcpy(node, start_node_sha256, 32);
     while (count < max_tokens) {

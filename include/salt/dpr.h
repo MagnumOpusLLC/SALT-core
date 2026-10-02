@@ -6,10 +6,11 @@
 
 #define SALT_DPR_EDGE_VERSION 2u
 #define SALT_DPR_MAX_HORIZON 64u
+#define SALT_DPR_MAX_WALK_HORIZON 356u
 #define SALT_DPR_MENTOR_FAMILY_VERSION 1u
 #define SALT_DPR_SELECTOR_CANDIDATE_VERSION 1u
 #define SALT_DPR_COMPUTE_INTENT_VERSION 1u
-#define SALT_DPR_TRANSITION_PROPOSAL_VERSION 1u
+#define SALT_DPR_TRANSITION_PROPOSAL_VERSION 4u
 #define SALT_DPR_ATTENTION_PLAN_VERSION 1u
 #define SALT_DPR_MAX_RELEVANCE_ITEMS 64u
 
@@ -173,7 +174,7 @@ typedef struct SaltDprComputeIntent {
 typedef struct SaltDprTransitionProposal {
     uint32_t schema_version;
     uint32_t candidate_count;
-    int32_t candidate_token_ids[SALT_DPR_MAX_HORIZON];
+    int32_t candidate_token_ids[SALT_DPR_MAX_WALK_HORIZON];
     uint8_t source_node_sha256[32];
     uint8_t state_compatibility_sha256[32];
     uint8_t proposal_sha256[32];

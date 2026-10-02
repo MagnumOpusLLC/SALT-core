@@ -11,13 +11,18 @@ This is **not a complete formal verification of SALT's implementation**. A prove
 abstract model, a source-correspondence argument, and concrete cross-platform
 KV/state bit identity are separate evidence classes.
 
-Exported runtime source baseline: `d3a2037f404d520998ac2d3b2d182ca58f529c82`
-(**2026-09-21 19:50:34 −04:00**). The supplemental loader proof was copied from
+The first nine proof models retain their historical runtime source baseline
+`d3a2037f404d520998ac2d3b2d182ca58f529c82`
+(**2026-09-21 19:50:34 −04:00**). The exported runtime source is now
+`ce0363260a488c96b951b4d826a188e1014575d4`
+(**2026-10-02 10:58:17 −04:00**). The supplemental loader proof was copied from
 `beab7291b7dd7ae11bb7d21ea0735e83ad7c0fa0`
-(**2026-10-02 10:49:29 −04:00**) and manually maps three loader paths in later
-private source `9f5c1e0b26059e79f557e4c5a5994579e4634aec`
-(**2026-10-02 08:25:11 −04:00**). These later bytes are **not** the exported
-runtime baseline. The manifest pins the proof bytes separately.
+(**2026-10-02 10:49:29 −04:00**) and manually maps three loader paths in
+`9f5c1e0b26059e79f557e4c5a5994579e4634aec`
+(**2026-10-02 08:25:11 −04:00**); those three C files are byte-identical in
+the exported runtime. The manifest pins both runtime and proof sources
+separately. The other nine proofs were **not** requalified against the new
+runtime source.
 
 ## Included modules
 
@@ -88,8 +93,8 @@ tool hashes, and the separate earlier nine-model results.
    [KV Cache and Persistent Agent State Statement](COGNITIVE-STATE-RISK.md)
    remains applicable.
 7. The loader proof is a hand-written, single-invocation abstraction mapped to
-   **later private source**, not a formal refinement of the exported runtime
-   baseline. An OS-success premise cannot establish that `munmap` succeeded in
+   three now-exported source files, not a source-extracted refinement of the
+   complete runtime. An OS-success premise cannot establish that `munmap` succeeded in
    any real request or that a failed call released its mapping. Rosarium has no
    provenance-bearing `origin.path`, so no full source seal follows.
 

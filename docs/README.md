@@ -38,8 +38,10 @@ including demand-paged KV, reset/spill, continuation, SSE, real-use behavior,
 and the explicit arbitrary-prompt TARGET boundary.
 The current server path accepts the qualified Gemma source-role readiness marker
 during package authentication. Prior HMM and decode work orders remain archived under
-[`archive/workorders/2026-09-08/`](archive/workorders/2026-09-08/). The latest
-formal publication remains `8838dca` (PR #54). The general DPR engine is
+[`archive/workorders/2026-09-08/`](archive/workorders/2026-09-08/). The scoped
+formal proof bundle and its source pins are indexed in
+[`FORMAL-PROOFS.md`](FORMAL-PROOFS.md); earlier formal publication `8838dca`
+(PR #54) remains historical. The general DPR engine is
 **READY**; Qwen and Gemma are `runtime_ready=true`. Gemma's frozen default-runtime release matrix is
 [`../models/gemma4-26b-a4b/qualification/runtime-ready-2026-09-02/README.md`](../models/gemma4-26b-a4b/qualification/runtime-ready-2026-09-02/README.md).
 Model recipes and controls are authoritative in

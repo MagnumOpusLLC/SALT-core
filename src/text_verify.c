@@ -177,6 +177,10 @@ int salt_text_target_policy_compile_environment(
         text_target_policy_u32(
             "SALT_TARGET_WARM_X", 1u, maximum_candidates,
             &built.warm_target_rows) != 0 ||
+        (getenv("SALT_DPR_INDEPENDENT_DRAFT") &&
+         text_target_policy_u32(
+             "SALT_DPR_INDEPENDENT_DRAFT", 0u, 1u,
+             &built.dpr_independent_draft) != 0) ||
         text_target_policy_u32(
             "SALT_TARGET_GPU_PROGRAM", 0u, 1u,
             &gpu_program) != 0)
@@ -219,20 +223,29 @@ int salt_text_target_policy_effective_x(
 int salt_text_target_policy_active_shape(
         const SaltTextTargetPolicy *policy, uint32_t candidate_count,
         uint32_t *active_sequence_tiles, uint32_t *active_route_count) {
-    uint32_t sequence_tiles;
+    uint32_t sequence_tiles, route_count;
     if (!policy || !policy->ready || !active_sequence_tiles ||
         !active_route_count || policy->sequence_tiles == 0 ||
         policy->route_count == 0 || policy->candidate_count == 0 ||
         candidate_count == 0 ||
         (uint64_t)candidate_count >
-            (uint64_t)policy->target_rows * policy->route_count ||
-        candidate_count % policy->route_count != 0)
+            (uint64_t)policy->target_rows * policy->route_count)
         return -1;
-    sequence_tiles = candidate_count / policy->route_count;
+    /* Proposal selection reduces any configured F-lane surface to one exact
+     * winning causal trajectory before TARGET.  A selected trajectory therefore
+     * enters as active F1 even when the startup policy admits more lanes. */
+    if (candidate_count <= policy->target_rows) {
+        sequence_tiles = candidate_count;
+        route_count = 1u;
+    } else {
+        if (candidate_count % policy->route_count != 0u) return -1;
+        sequence_tiles = candidate_count / policy->route_count;
+        route_count = policy->route_count;
+    }
     if (sequence_tiles == 0 || sequence_tiles > policy->target_rows)
         return -1;
     *active_sequence_tiles = sequence_tiles;
-    *active_route_count = policy->route_count;
+    *active_route_count = route_count;
     return 0;
 }
 
@@ -244,7 +257,7 @@ int salt_text_verify_program_bind_target_policy(
         policy->sequence_tiles == 0 || policy->target_rows == 0 ||
         policy->route_count == 0 ||
         policy->queue_length == 0 || policy->kv_warmup_rows == 0 ||
-        policy->warm_target_rows == 0 ||
+        policy->warm_target_rows == 0 || policy->dpr_independent_draft > 1u ||
         (policy->execution_class != SALT_TEXT_EXECUTION_CPU_ONLY &&
          policy->execution_class != SALT_TEXT_EXECUTION_GPU_ONLY))
         return -1;
@@ -1490,6 +1503,22 @@ static int commit_tentative_prefix(const SaltTextVerifyProgram *program,
     if (!program || !view || !published_bytes || view->reserved != 0u ||
         view->backend_published_kv > 1u)
         return -1;
+    /* Device/live-seat publication is authoritative. Host materialization is
+     * an explicit consumer operation, not a per-commit mirror or row walk. */
+    *published_bytes = 0;
+    if (view->backend_published_kv) {
+        /* Logical publication is not host-copy traffic. Count the accepted
+         * extent from compiled geometry without visiting or copying KV rows. */
+        for (uint32_t layer = 0; layer < program->layer_count; layer++) {
+            uint64_t row_bytes =
+                (uint64_t)program->layers[layer].kv_width * sizeof(float) * 2u;
+            if (row_bytes && accepted > (UINT64_MAX - bytes) / row_bytes)
+                return -1;
+            bytes += row_bytes * accepted;
+        }
+        *published_bytes = bytes;
+        return 0;
+    }
     for (uint32_t layer = 0; layer < program->layer_count; layer++) {
         const SaltTextCompiledLayer *compiled = &program->layers[layer];
         const SaltTextKvLayerDesc *kv = compiled->descriptor->kv;
@@ -2732,25 +2761,272 @@ int salt_text_token_epoch_execute(
     return 0;
 }
 
+static uint32_t target_sublane_active_workers(
+        uint32_t candidate_count, uint32_t worker_budget) {
+    uint32_t workers = worker_budget;
+    if (workers > candidate_count) workers = candidate_count;
+    while (workers > 1u && candidate_count % workers != 0u) workers--;
+    return workers;
+}
+
+/* Proof chooses only the authoritative payload extent B; it never performs
+ * neural work or mutates state.  The chosen known-token prefix is then executed
+ * once through the model's existing authoritative materializer.  B=1 and B=j
+ * are therefore the same mechanism with different extents. */
+static int target_proof_materialize_execute(
+        const SaltTextGenerationBinding *binding,
+        const int32_t *candidate_token_ids, uint32_t candidate_count,
+        SaltTextGenerated *generated) {
+    const SaltTextVerifyProgram *program;
+    SaltTextVerifyResult materialized;
+    uint64_t parent_generation;
+    uint32_t parent_position, checked = 0u, proven = 0u;
+    if (!binding || !(program = binding->program) || !program->kv_state ||
+        !binding->prove_prefix || !binding->materialize_known ||
+        !candidate_token_ids || candidate_count == 0u || !generated)
+        return -1;
+    parent_generation = program->kv_state->transition_generation;
+    parent_position = program->kv_state->position;
+    if (binding->prove_prefix(binding->context, candidate_token_ids,
+            candidate_count, parent_generation, parent_position,
+            &checked, &proven) != 0 ||
+        program->kv_state->transition_generation != parent_generation ||
+        program->kv_state->position != parent_position || checked == 0u ||
+        checked > candidate_count || proven == 0u || proven > checked ||
+        proven > candidate_count ||
+        (proven < candidate_count && checked <= proven))
+        return -1;
+    memset(&materialized, 0, sizeof materialized);
+    if (binding->materialize_known(binding->context, candidate_token_ids,
+            proven, &materialized) != 0 ||
+        materialized.status != SALT_TEXT_VERIFY_COMMITTED ||
+        materialized.accepted_count != proven ||
+        materialized.committed_count != proven ||
+        materialized.produced_count != proven + 1u ||
+        materialized.result_position != parent_position + proven ||
+        materialized.transition_generation != parent_generation + 1u ||
+        program->kv_state->position != parent_position + proven ||
+        program->kv_state->transition_generation != parent_generation + 1u ||
+        materialized.winning_node_index + 1u != proven ||
+        materialized.winning_node_id + 1u != proven ||
+        !materialized.pending_logits ||
+        materialized.pending_logits_count != program->vocabulary ||
+        materialized.backend.engine_submissions != 1u ||
+        materialized.backend.completion_fences != 1u ||
+        materialized.backend.intermediate_host_publications != 0u)
+        return -1;
+    generated->target = materialized;
+    generated->epoch_path = SALT_TEXT_TOKEN_PATH_COLD_SEARCH;
+    generated->proof_checked_rows = checked;
+    generated->proven_prefix_rows = proven;
+    generated->first_unproven = proven < candidate_count
+        ? proven : candidate_count;
+    generated->materialized_rows = proven;
+    generated->target_model_rows = proven;
+    generated->target_sublane_cancelled_rows = candidate_count - proven;
+    return 0;
+}
+
+/* Reuse the resolved horizontal NFQ storage as a vertical Wa x Y lifetime
+ * board.  Round q submits the existing contiguous causal slab
+ * [q*Wa,(q+1)*Wa).  A first partial slab globally terminates every later q
+ * seat; target completion order never selects or commits. */
+static int target_sublane_execute(
+        SaltTextTokenEpochController *controller,
+        const SaltTextGenerationBinding *binding,
+        const int32_t *candidate_token_ids, uint32_t candidate_count,
+        const float *parent_logits, SaltTextGenerated *generated) {
+    SaltAreaNfqMatrix *matrix;
+    SaltAreaNfqPlan plan;
+    SaltTextVerifyBackendStats backend;
+    SaltTextTokenEpochResult final;
+    const SaltTextVerifyProgram *program;
+    const float *parent = parent_logits;
+    uint32_t route_id = 0u, accepted = 0u, model_rows = 0u;
+    uint32_t workers, depth, rounds = 0u;
+    uint64_t epoch_generation, parent_generation;
+    int resolved = 0;
+    if (!controller || !binding || !(program = binding->program) ||
+        !program->kv_state || !binding->policy || !binding->target ||
+        !candidate_token_ids || candidate_count == 0u || !parent_logits ||
+        !generated || !(matrix = binding->target_sublane_matrix) ||
+        !binding->target_sublane_ready_items ||
+        binding->target_sublane_ready_capacity == 0u ||
+        binding->policy->worker_budget == 0u ||
+        binding->policy->worker_budget > 32u || matrix->ready ||
+        !matrix->routes || !matrix->items)
+        return -1;
+    workers = target_sublane_active_workers(
+        candidate_count, binding->policy->worker_budget);
+    if (workers == 0u || workers > binding->target_sublane_ready_capacity ||
+        candidate_count % workers != 0u)
+        return -1;
+    depth = candidate_count / workers;
+    if (depth == 0u || depth > SALT_TEXT_NFQ_MAX_QUEUE)
+        return -1;
+    generated->target_sublane_workers = workers;
+    generated->target_sublane_depth = depth;
+    parent_generation = program->kv_state->transition_generation;
+    epoch_generation = parent_generation;
+    if (epoch_generation < matrix->epoch_generation)
+        epoch_generation = matrix->epoch_generation;
+    if (epoch_generation == UINT64_MAX) return -1;
+    epoch_generation++;
+    memset(&plan, 0, sizeof plan);
+    plan.workers = workers;
+    plan.sequence_tiles = workers;
+    plan.route_count = 1u;
+    plan.queue_length = depth;
+    if (salt_area_nfq_start(matrix, &plan, epoch_generation,
+            parent_generation, program->kv_state->position,
+            &route_id, 1u) != 0)
+        return -1;
+    memset(&backend, 0, sizeof backend);
+    memset(&final, 0, sizeof final);
+    for (uint32_t round = 0u; round < depth; round++) {
+        SaltTextTokenEpochResult step;
+        uint32_t ready_count = 0u, seen = 0u;
+        uint32_t source_position = program->kv_state->position;
+        if (salt_area_nfq_take_ready(matrix,
+                epoch_generation, parent_generation,
+                binding->target_sublane_ready_items,
+                binding->target_sublane_ready_capacity, &ready_count) != 0 ||
+            ready_count != workers)
+            goto fail;
+        for (uint32_t ready = 0u; ready < ready_count; ready++) {
+            uint32_t index = binding->target_sublane_ready_items[ready];
+            const SaltAreaNfqItem *item;
+            if (index >= matrix->item_count ||
+                !(item = &matrix->items[index]) ||
+                item->route_slot != 0u || item->sequence_index >= workers ||
+                item->queue_index != round || item->owner_worker >= workers ||
+                item->state != SALT_AREA_WFQ_ITEM_RUNNING ||
+                (seen & ((uint32_t)1u << item->sequence_index)) != 0u)
+                goto fail;
+            seen |= (uint32_t)1u << item->sequence_index;
+        }
+        if (seen != (workers == 32u ? UINT32_MAX :
+                (((uint32_t)1u << workers) - 1u)))
+            goto fail;
+        memset(&step, 0, sizeof step);
+        if (binding->target(binding->context, controller,
+                candidate_token_ids + (size_t)round * workers,
+                workers, parent, &step) != 0 ||
+            step.path != SALT_TEXT_TOKEN_PATH_COLD_SEARCH ||
+            step.target.status != SALT_TEXT_VERIFY_COMMITTED ||
+            step.target.accepted_count > workers ||
+            step.target.committed_count != step.target.accepted_count ||
+            step.target.produced_count != step.target.accepted_count + 1u ||
+            step.target.result_position !=
+                source_position + step.target.accepted_count ||
+            !step.target.pending_logits ||
+            step.target.pending_logits_count != program->vocabulary ||
+            step.target.backend.intermediate_host_publications != 0u)
+            goto fail;
+        if (step.target.accepted_count == 0u) {
+            if (step.target.backend.engine_submissions != 0u ||
+                step.target.backend.completion_fences != 0u ||
+                step.target.projection_rows != 0u)
+                goto fail;
+        } else if (step.target.backend.engine_submissions != 1u ||
+                   step.target.backend.completion_fences != 1u ||
+                   !step.target.projection_logits ||
+                   step.target.projection_rows != workers ||
+                   step.target.winning_node_index + 1u !=
+                       step.target.accepted_count) {
+            goto fail;
+        }
+        if (add_backend_stats(&backend, &step.target.backend) != 0 ||
+            UINT32_MAX - model_rows < step.target.projection_rows ||
+            UINT32_MAX - accepted < step.target.accepted_count)
+            goto fail;
+        model_rows += step.target.projection_rows;
+        accepted += step.target.accepted_count;
+        rounds++;
+        generated->target_sublane_rounds = rounds;
+        final = step;
+        if (step.target.accepted_count < workers) {
+            uint32_t retired = 0u;
+            if (step.target.accepted_count == 0u) {
+                if (salt_area_nfq_cancel(matrix, epoch_generation,
+                        parent_generation, &retired) != 0)
+                    goto fail;
+            } else if (salt_area_nfq_resolve(matrix, epoch_generation,
+                    parent_generation, 0u,
+                    step.target.accepted_count - 1u, round, &retired) != 0) {
+                goto fail;
+            }
+            resolved = 1;
+            break;
+        }
+        for (uint32_t ready = 0u; ready < ready_count; ready++) {
+            uint32_t retired = 0u;
+            if (salt_area_nfq_complete(matrix, epoch_generation,
+                    parent_generation,
+                    binding->target_sublane_ready_items[ready],
+                    SALT_AREA_WFQ_CONTINUE, &retired) != 0 || retired != 0u)
+                goto fail;
+        }
+        if (round + 1u == depth) {
+            uint32_t retired = 0u;
+            if (salt_area_nfq_resolve(matrix, epoch_generation,
+                    parent_generation, 0u, workers - 1u, round,
+                    &retired) != 0)
+                goto fail;
+            resolved = 1;
+            break;
+        }
+        parent = step.target.pending_logits;
+    }
+    if (!resolved || matrix->ready || !matrix->resolved || accepted == 0u ||
+        final.target.status != SALT_TEXT_VERIFY_COMMITTED)
+        return -1;
+    final.target.accepted_count = accepted;
+    final.target.committed_count = accepted;
+    final.target.produced_count = accepted + 1u;
+    final.target.result_position =
+        program->kv_state->position;
+    final.target.winning_node_index = accepted - 1u;
+    final.target.winning_node_id = accepted - 1u;
+    final.target.backend = backend;
+    generated->target = final.target;
+    generated->epoch_path = (uint32_t)final.path;
+    generated->target_model_rows = model_rows;
+    generated->target_sublane_rounds = rounds;
+    generated->target_sublane_cancelled_rows =
+        candidate_count - model_rows;
+    return 0;
+fail:
+    if (matrix->ready && !matrix->resolved) {
+        uint32_t ignored = 0u;
+        (void)salt_area_nfq_cancel(
+            matrix, epoch_generation, parent_generation, &ignored);
+    }
+    return -1;
+}
+
 int salt_text_generate_candidates(
         SaltTextTokenEpochController *controller,
         const SaltTextGenerationBinding *binding, float *logits,
         uint32_t maximum_tokens, float *scratch_logits,
         uint64_t (*now_ns)(void *), void *clock_context,
         SaltTextGenerated *result) {
-    SaltTextTokenEpochResult epoch;
+    SaltTextTokenEpochController selection_controller;
+    SaltTextTokenEpochResult selection, epoch;
     const SaltTextTargetPolicy *policy;
     const SaltTextVerifyProgram *program;
     const SaltTextProjectionWindow *previous;
+    int32_t nfq_ids[SALT_TEXT_NFQ_MAX_CHECKS];
     int32_t root = -1;
-    uint32_t x, f, n = 1u, width, position, reused = 0u, matched = 0u;
-    uint64_t started, ended;
-    int rc;
+    uint32_t x, f, n = 1u, checks, position;
+    uint32_t reused = 0u, matched = 0u, winning_trajectory = UINT32_MAX;
+    uint64_t started, ended, checks64, parent_generation;
+    int rc, selected_root;
     if (result) memset(result, 0, sizeof *result);
     if (!controller || !binding || !(program = binding->program) ||
         !program->ready || !program->kv_state ||
         !(policy = binding->policy) || !policy->ready ||
-        !(previous = binding->projection) || !binding->target ||
+        !(previous = binding->projection) || !binding->select_proposal ||
         !binding->is_stop || !logits || !scratch_logits || !result ||
         !now_ns || maximum_tokens == 0u)
         return -1;
@@ -2758,21 +3034,66 @@ int salt_text_generate_candidates(
     if (position >= program->maximum_context) return -1;
     /* X is the causal X-TARGET depth of one attempt. N/F/Q never enter here:
      * this generator builds one trajectory per F lane, not NFQ checks. */
-    x = policy->target_rows;
+    x = binding->target ? policy->target_rows : 1u;
     f = policy->route_count;
     if (x == 0u || f == 0u || x > UINT32_MAX / f ||
         x * f > program->maximum_candidates ||
         x * f > SALT_TEXT_NFQ_MAX_CHECKS)
         return -1;
+    checks64 = (uint64_t)policy->candidate_count * policy->queue_length;
+    if (policy->candidate_count == 0u || policy->queue_length == 0u ||
+        checks64 == 0u || checks64 > SALT_TEXT_NFQ_MAX_CHECKS ||
+        checks64 > program->vocabulary)
+        return -1;
+    checks = (uint32_t)checks64;
     if (x > maximum_tokens) x = maximum_tokens;
     if (x > program->maximum_context - position)
         x = program->maximum_context - position;
-    /* One remaining seat is an ordinary transition; nothing to amortize. */
-    if (x < 2u) return 1;
     started = now_ns(clock_context);
     if (verify_greedy_token(logits, program->vocabulary, &root) != 0)
         return -1;
-    if (binding->is_stop(binding->context, root)) return 1;
+    /* NFQ is an independent cheap parent-root selection. Execute it before
+     * X-only exits, including X disabled, X1, stop and no causal trajectory.
+     * The existing selector must leave authoritative KV/state untouched. */
+    if (projection_ranked_ids(logits, program->vocabulary,
+            checks, nfq_ids) != 0)
+        return -1;
+    memcpy(scratch_logits, logits,
+           (size_t)program->vocabulary * sizeof(float));
+    parent_generation = program->kv_state->transition_generation;
+    memset(&selection_controller, 0, sizeof selection_controller);
+    memset(&selection, 0, sizeof selection);
+    if (salt_text_token_epoch_init(&selection_controller) != 0 ||
+        binding->select_proposal(binding->context, &selection_controller,
+            nfq_ids, checks, scratch_logits, &selection) != 0 ||
+        selection.path != SALT_TEXT_TOKEN_PATH_COLD_SEARCH ||
+        selection.target.status != SALT_TEXT_VERIFY_COMMITTED ||
+        selection.target.accepted_count != 0u ||
+        selection.target.committed_count != 0u ||
+        selection.target.produced_count != 1u ||
+        selection.target.result_position != position ||
+        selection.target.transition_generation != parent_generation + 1u ||
+        selection.target.winning_node_index >= checks ||
+        selection.target.pending_token_id < 0 ||
+        (uint32_t)selection.target.pending_token_id >= program->vocabulary ||
+        selection.target.pending_logits != scratch_logits ||
+        selection.target.pending_logits_count != program->vocabulary ||
+        selection.target.backend.engine_submissions != 0u ||
+        selection.target.backend.completion_fences != 0u ||
+        selection.target.backend.intermediate_host_publications != 0u ||
+        program->kv_state->position != position ||
+        program->kv_state->transition_generation != parent_generation)
+        return -1;
+    selected_root = selection.target.pending_token_id;
+    if (nfq_ids[selection.target.winning_node_index] != selected_root)
+        return -1;
+    result->candidate_count = checks;
+    if (!binding->target || x < 2u || binding->is_stop(binding->context, root)) {
+        ended = now_ns(clock_context);
+        if (!started || ended < started || selected_root != root) return -1;
+        result->proposal_ns = ended - started;
+        return 1;
+    }
     /* Source 1, parent cache route: committed history. One lane only; a
      * greedy target can accept no other root, so extra lanes are waste. */
     if (f == 1u && (controller->schedule_history_count ||
@@ -2819,7 +3140,7 @@ int salt_text_generate_candidates(
      * transition; this generator never manufactures ranks or model steps. */
     if (n < 2u) {
         ended = now_ns(clock_context);
-        if (!started || ended < started) return -1;
+        if (!started || ended < started || selected_root != root) return -1;
         result->proposal_ns = ended - started;
         return 1;
     }
@@ -2834,44 +3155,87 @@ int salt_text_generate_candidates(
                 break;
             }
     if (n < 2u) return 1;
-    width = n * f;
     result->proposal_count = n;
-    result->route_token_count = width;
-    result->candidate_count = width;
-    memcpy(scratch_logits, logits,
-           (size_t)program->vocabulary * sizeof(float));
+    /* Map the NFQ-selected root to one causal trajectory. Losing roots never
+     * enter model execution; X remains an independently admitted consumer. */
+    for (uint32_t trajectory = 0u; trajectory < f; trajectory++) {
+        if (result->candidate_token_ids[trajectory * n] != selected_root)
+            continue;
+        if (winning_trajectory != UINT32_MAX) return -1;
+        winning_trajectory = trajectory;
+    }
+    if (winning_trajectory == UINT32_MAX) {
+        ended = now_ns(clock_context);
+        if (!started || ended < started) return -1;
+        result->proposal_ns = ended - started;
+        return 1;
+    }
+    if (winning_trajectory != 0u)
+        memmove(result->candidate_token_ids,
+            result->candidate_token_ids + winning_trajectory * n,
+            (size_t)n * sizeof *result->candidate_token_ids);
+    /* A vertical board uses every allocated lane in each submitted slab.  A
+     * stop or short proposal can leave a ragged suffix; defer that suffix to
+     * the next authoritative boundary instead of creating phantom seats or a
+     * one-lane board whose Q lifetime exceeds the fixed NFQ matrix. */
+    if (binding->target_sublane_matrix && policy->worker_budget != 0u &&
+        n > policy->worker_budget) {
+        uint32_t remainder = n % policy->worker_budget;
+        if (remainder != 0u) n -= remainder;
+        if (n < 2u) return 1;
+        result->proposal_count = n;
+        if (result->projection_reused_rows >= n)
+            result->projection_reused_rows = n - 1u;
+    }
+    result->route_token_count = n;
+    result->candidate_count = checks;
     ended = now_ns(clock_context);
     if (!started || ended < started) return -1;
     result->proposal_ns = ended - started;
-    /* One batched causal X-TARGET over the proposed rows: the validity vector
-     * and first-false reduction live inside the executor. */
-    memset(&epoch, 0, sizeof epoch);
-    if (binding->target(binding->context, controller,
-            result->candidate_token_ids, width, scratch_logits, &epoch) != 0 ||
-        epoch.path != SALT_TEXT_TOKEN_PATH_COLD_SEARCH ||
-        epoch.target.status != SALT_TEXT_VERIFY_COMMITTED ||
-        epoch.target.accepted_count == 0u ||
-        epoch.target.accepted_count > n ||
-        epoch.target.committed_count != epoch.target.accepted_count ||
-        epoch.target.produced_count != epoch.target.accepted_count + 1u ||
-        !epoch.target.pending_logits ||
-        epoch.target.pending_logits_count != program->vocabulary ||
-        epoch.target.result_position != position + epoch.target.accepted_count)
-        return -1;
-    if (epoch.target.winning_node_index >= width ||
-        epoch.target.winning_node_index / n >= f ||
-        epoch.target.winning_node_index % n + 1u !=
-            epoch.target.accepted_count)
-        return -1;
-    memmove(result->candidate_token_ids,
-        result->candidate_token_ids +
-            (epoch.target.winning_node_index / n) * n,
-        (size_t)epoch.target.accepted_count *
-            sizeof *result->candidate_token_ids);
-    result->epoch_path = (uint32_t)epoch.path;
-    result->target = epoch.target;
+    /* Exact authority chooses B, then one common materializer executes B known
+     * rows.  The preserved model-backed sublane scheduler remains available as
+     * a control when no proof/materializer pair is bound. */
+    if (binding->prove_prefix || binding->materialize_known) {
+        if (!binding->prove_prefix || !binding->materialize_known ||
+            target_proof_materialize_execute(binding,
+                result->candidate_token_ids, n, result) != 0)
+            return -1;
+    } else if (binding->target_sublane_matrix) {
+        if (target_sublane_execute(controller, binding,
+                result->candidate_token_ids, n, scratch_logits, result) != 0)
+            return -1;
+    } else {
+        memset(&epoch, 0, sizeof epoch);
+        if (binding->target(binding->context, controller,
+                result->candidate_token_ids, n, scratch_logits, &epoch) != 0 ||
+            epoch.path != SALT_TEXT_TOKEN_PATH_COLD_SEARCH ||
+            epoch.target.status != SALT_TEXT_VERIFY_COMMITTED ||
+            epoch.target.accepted_count == 0u ||
+            epoch.target.accepted_count > n ||
+            epoch.target.committed_count != epoch.target.accepted_count ||
+            epoch.target.produced_count != epoch.target.accepted_count + 1u ||
+            epoch.target.backend.engine_submissions != 1u ||
+            epoch.target.backend.completion_fences != 1u ||
+            epoch.target.backend.intermediate_host_publications != 0u ||
+            !epoch.target.projection_logits ||
+            epoch.target.projection_rows != n ||
+            !epoch.target.pending_logits ||
+            epoch.target.pending_logits_count != program->vocabulary ||
+            epoch.target.result_position != position + epoch.target.accepted_count)
+            return -1;
+        if (epoch.target.winning_node_index >= n ||
+            epoch.target.winning_node_index + 1u !=
+                epoch.target.accepted_count)
+            return -1;
+        result->epoch_path = (uint32_t)epoch.path;
+        result->target = epoch.target;
+        result->target_model_rows = epoch.target.projection_rows;
+        result->target_sublane_workers = n;
+        result->target_sublane_depth = 1u;
+        result->target_sublane_rounds = 1u;
+    }
     /* The retained boundary: target logits at j-1 select the next root. */
-    memmove(logits, epoch.target.pending_logits,
+    memmove(logits, result->target.pending_logits,
            (size_t)program->vocabulary * sizeof(float));
     return 0;
 }
@@ -2951,7 +3315,7 @@ static int schedule_normal(SaltTextTokenEpochController *controller,
     uint32_t effective_x;
     uint64_t begin, end;
     int rc;
-    if (q->sampler.abi != SALT_SAMPLER_GREEDY_V1)
+    if (!b->generation.select_proposal || q->sampler.abi != SALT_SAMPLER_GREEDY_V1)
         return schedule_native(controller, q, r);
     /* Parent cache route views: committed prompt/session tokens, then the
      * outputs this run has already committed. Borrowed, never copied. */
@@ -2959,7 +3323,8 @@ static int schedule_normal(SaltTextTokenEpochController *controller,
     controller->schedule_history_count = q->history_ids ? q->history_count : 0u;
     controller->schedule_output_ids = q->output_ids;
     controller->schedule_output_count = r->output_count;
-    if (salt_text_target_policy_effective_x(
+    effective_x = 1u;
+    if (b->generation.target && salt_text_target_policy_effective_x(
             b->generation.policy, controller->schedule_prior_kv_rows, remaining,
             &effective_x) != 0)
         return -1;
@@ -3274,7 +3639,10 @@ static int schedule_dpr_cycle(SaltTextTokenEpochController *controller,
         }
         return 0;
     }
-    if (salt_text_target_policy_effective_x(
+    if (b->generation.policy->dpr_independent_draft) {
+        effective_x = b->generation.policy->target_rows;
+        if (effective_x > remaining) effective_x = remaining;
+    } else if (salt_text_target_policy_effective_x(
             b->generation.policy, controller->schedule_prior_kv_rows, remaining,
             &effective_x) != 0)
         return -1;
@@ -3289,7 +3657,7 @@ static int schedule_dpr_cycle(SaltTextTokenEpochController *controller,
     if (b->observe && b->observe(b->context, &s, NULL,
             SALT_TEXT_SCHEDULE_OBSERVE_SOURCE) != 0) return -1;
     if (rc > 0) {
-        if (!s.count || s.count > SALT_DPR_MAX_HORIZON ||
+        if (!s.count || s.count > SALT_DPR_MAX_WALK_HORIZON ||
             s.count >= b->generation.program->maximum_context ||
             s.count + 1u > remaining ||
             source > b->generation.program->maximum_context - s.count - 1u)
@@ -3390,12 +3758,14 @@ int salt_text_scheduler_bind(SaltTextTokenEpochController *controller,
     if (!controller || !b || !b->generation.program ||
         !b->generation.program->ready || !b->generation.program->kv_state ||
         b->generation.program->vocabulary > INT_MAX || !b->generation.policy ||
-        !b->generation.projection || !b->generation.target ||
-        !b->generation.select_proposal || !b->generation.is_stop ||
+        !b->generation.projection ||
+        (b->generation.target && !b->generation.select_proposal) ||
+        !b->generation.is_stop ||
         !b->stats || !b->now_ns || !b->step_known || !b->emit_token || !b->publish)
         return -1;
     if (b->dpr && b->dpr->mode != SALT_DPR_OFF &&
-        (!b->dpr->store || !b->dpr->stats || !b->dpr->retained || !b->dpr->runtime ||
+        (!b->generation.target || !b->dpr->store || !b->dpr->stats ||
+         !b->dpr->retained || !b->dpr->runtime ||
          !b->dpr->qa_key || !b->node_identity || !b->kv_required || !b->load_exact ||
          !b->advance_chain || !b->prepare_attention || !b->release_attention))
         return -1;
@@ -3630,12 +4000,14 @@ static int text_execute_authoritative(
         transition_generation <= program->kv_state->transition_generation ||
         !input_token_ids || input_count == 0 || output_rows > input_count ||
         input_count > program->maximum_candidates ||
+        input_count > program->maximum_context ||
         (output_rows != input_count &&
          !executor->ops->submit_authoritative_output) ||
         source_position != program->kv_state->position ||
         source_position > program->maximum_context - input_count ||
         program->dispatch.engine_command_count != 1u ||
-        execution_kv_range_valid(program, source_position, input_count) != 0) {
+        (program->proof_state &&
+         execution_kv_range_valid(program, source_position, input_count) != 0)) {
         if (result) result->status = SALT_TEXT_VERIFY_INVALID;
         return -1;
     }

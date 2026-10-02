@@ -1659,7 +1659,7 @@ int salt_dpr_mentor_walk_nomogram(
         uint32_t max_tokens, int32_t *candidate_token_ids,
         size_t *edge_indices, size_t *binding_indices,
         uint32_t *candidate_count) {
-    uint8_t node[32], visited[SALT_DPR_MAX_HORIZON][32];
+    uint8_t node[32], visited[SALT_DPR_MAX_WALK_HORIZON][32];
     uint32_t count = 0;
     if (!binding_store || !binding_store->bindings ||
         !binding_store->next_indices || !binding_store->buckets ||
@@ -1668,7 +1668,7 @@ int salt_dpr_mentor_walk_nomogram(
         !edge_store->edges || !retained || !start_node_sha256 ||
         digest_is_zero(start_node_sha256) || !serial_ns_per_token ||
         !minimum_samples || vocab_size <= 0 || max_context == 0 ||
-        max_tokens == 0 || max_tokens > SALT_DPR_MAX_HORIZON ||
+        max_tokens == 0 || max_tokens > SALT_DPR_MAX_WALK_HORIZON ||
         !candidate_token_ids || !candidate_count ||
         binding_store->bucket_count == 0 ||
         (mode != SALT_DPR_PERSIST && mode != SALT_DPR_DYNAMIC))
@@ -1888,11 +1888,11 @@ int salt_dpr_store_walk_nomogram(const SaltDprStore *store,
                                int32_t *candidate_token_ids,
                                size_t *edge_indices,
                                uint32_t *candidate_count) {
-    uint8_t node[32], visited[SALT_DPR_MAX_HORIZON][32];
+    uint8_t node[32], visited[SALT_DPR_MAX_WALK_HORIZON][32];
     uint32_t count = 0;
     if (!store || !start_node_sha256 || !candidate_token_ids ||
         !candidate_count || max_tokens == 0 ||
-        max_tokens > SALT_DPR_MAX_HORIZON)
+        max_tokens > SALT_DPR_MAX_WALK_HORIZON)
         return -1;
     memcpy(node, start_node_sha256, 32);
     while (count < max_tokens) {

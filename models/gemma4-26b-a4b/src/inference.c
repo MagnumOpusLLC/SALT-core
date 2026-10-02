@@ -44,7 +44,7 @@
 #define G4_JOURNAL_CAPACITY 256
 #define G4_RESPONSE_TOKEN_BYTES 64u
 #define G4_RESPONSE_OVERHEAD 1024u
-#define G4_DPR_MAX_HORIZON 64
+#define G4_DPR_MAX_HORIZON SALT_DPR_MAX_WALK_HORIZON
 #define G4_DPR_CANDIDATE_BYTES (G4_DPR_MAX_HORIZON * 12)
 #define G4_DPR_EDGE_CAPACITY 4096u
 #define G4_DPR_BUCKET_COUNT 8192u
@@ -297,12 +297,13 @@ static int parse_u64_positive(const char *value, uint64_t *out) {
     return 0;
 }
 
-static int parse_dpr_horizon_env(const char *name, uint32_t *out) {
+static int parse_dpr_horizon_env(const char *name, uint32_t maximum,
+                                 uint32_t *out) {
     uint64_t parsed = 0;
     const char *value;
     if (!name || !out || !(value = getenv(name)) ||
         parse_u64_positive(value, &parsed) != 0 ||
-        parsed > SALT_DPR_MAX_HORIZON)
+        parsed > maximum)
         return -1;
     *out = (uint32_t)parsed;
     return 0;
@@ -1254,7 +1255,7 @@ static uint64_t scheduler_clock(void *opaque) {
 
 static int scheduler_step(void *opaque, int32_t token, float *logits) {
     G4SchedulerAdapter *a = (G4SchedulerAdapter *)opaque;
-    return salt_gemma4_text_consume_known(a->model, token, logits);
+    return salt_gemma4_text_step(a->model, token, logits);
 }
 
 static int scheduler_emit(void *opaque, uint32_t count, int32_t token, int stop) {
@@ -1417,13 +1418,18 @@ static int scheduler_observe_target(void *opaque, const SaltTextGenerated *g,
     fprintf(stderr, "GEMMA4_SERVER_POLICY nfq_n=%u nfq_f=%u nfq_q=%u target_x=%u\n",
         p->sequence_tiles, p->route_count, p->queue_length, p->target_rows);
     fprintf(stderr, "GEMMA4_SERVER_X_TARGET source=%u active_x=%u "
+        "allocated_w=%u active_w=%u sublane_y=%u rounds=%u "
         "queued=%u executed=%u cancelled=%u accepted=%u "
         "committed=%u submissions=%u fences=%u intermediate_publish=%u "
         "cpu_phases=%u cpu_serial_spans=%u proposal_ms=%.3f target_ms=%.3f "
         "target_candidate_rows=%u target_candidate_ids=%u target_model_rows=%u "
-        "projection_reused_rows=%u proposal_model_steps=0 "
+        "proof_checked_rows=%u proven_prefix_rows=%u first_unproven=%u "
+        "materialized_rows=%u state_reuse_rows=%u "
+        "sublane_cancelled_rows=%u projection_reused_rows=%u proposal_model_steps=0 "
         "proposal_source=%u history_match=%u\n",
         t->result_position - t->committed_count, g->proposal_count,
+        p->worker_budget, g->target_sublane_workers,
+        g->target_sublane_depth, g->target_sublane_rounds,
         t->backend.production_frontier_tasks_queued,
         t->backend.production_frontier_tasks_executed,
         t->backend.production_frontier_queued_cancellations,
@@ -1433,7 +1439,11 @@ static int scheduler_observe_target(void *opaque, const SaltTextGenerated *g,
         (double)g->proposal_ns / 1000000.0,
         (double)(elapsed - g->proposal_ns) / 1000000.0,
         g->route_token_count, g->candidate_count,
-        t->projection_rows, g->projection_reused_rows,
+        g->target_model_rows, g->proof_checked_rows,
+        g->proven_prefix_rows, g->first_unproven,
+        g->materialized_rows, g->state_reuse_rows,
+        g->target_sublane_cancelled_rows,
+        g->projection_reused_rows,
         g->proposal_source, g->history_matched_length);
     return 0;
 }
@@ -1758,6 +1768,9 @@ static int serve_loop(SaltGemma4Text *text_model,
         salt_gemma4_text_scheduler_binding(text_model,
             &scheduler.bindings.generation, &scheduler.controller) != 0)
         goto done;
+    /* NFQ selection and native X-TARGET continuation are independent of DPR.
+     * Keep the model binding; the configured X and existing proposal admission
+     * decide TARGET versus the dedicated native token path. */
     scheduler.bindings.context = &scheduler;
     scheduler.bindings.dpr = &scheduler.dpr;
     scheduler.bindings.stats = &g_dpr_waterfall;
@@ -2320,7 +2333,7 @@ static int serve_loop(SaltGemma4Text *text_model,
         scheduler.dpr.mode = g_dpr_mode;
         memcpy(scheduler.qa_key, dpr_qa_key, sizeof scheduler.qa_key);
         scheduler.request.sampler = (SaltSamplerConfig) {
-            g_sampler_abi, g_sampler_temperature_bits, g_sampler_seed, g_sampler_top_k
+            g_sampler_abi, g_sampler_temperature, g_sampler_seed, g_sampler_top_k
         };
         scheduler.request.logits = logits;
         scheduler.request.scratch_logits = proposal_logits;
@@ -2577,8 +2590,10 @@ int salt_gemma4_inference_main(int argc, char **argv) {
         }
     }
     if (g_dpr_mode != SALT_DPR_OFF &&
-        (parse_dpr_horizon_env("SALT_DPR_DRAFT_N", &g_dpr_draft_n) != 0 ||
-         parse_dpr_horizon_env("SALT_DPR_PREFILL_N", &g_dpr_prefill_n) != 0 ||
+        (parse_dpr_horizon_env("SALT_DPR_DRAFT_N",
+             SALT_DPR_MAX_WALK_HORIZON, &g_dpr_draft_n) != 0 ||
+         parse_dpr_horizon_env("SALT_DPR_PREFILL_N",
+             SALT_DPR_MAX_HORIZON, &g_dpr_prefill_n) != 0 ||
          parse_dpr_qa_bits_env(&g_dpr_qa_bucket_bits) != 0))
         goto bad_args;
     if (!serve_v2 || !stream_events || context < 3 ||

@@ -1216,6 +1216,12 @@ def main():
         try:
             return serve_from_args(ARGS)
         except (BackendError, RequestError, OSError) as exc:
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+            cause = exc.__cause__
+            if isinstance(cause, OSError):
+                print(f"[gemma4-serve] startup OS error errno={cause.errno} "
+                      f"message={cause.strerror}", file=sys.stderr, flush=True)
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
             print(f"[gemma4-serve] setup failed: {exc}",
                   file=sys.stderr, flush=True)
             return 2

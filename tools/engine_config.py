@@ -205,13 +205,14 @@ def validate_gemma_target_route_config(cfg):
     f = int(f_text)
     q = int(q_text)
     w = int(w_text)
+    x_limit = 356 if cfg.get("SALT_GEMMA_PLATFORM_RECIPE") == "rocm" else 128
     if str(n) != n_text or str(x) != x_text or str(f) != f_text or str(q) != q_text or \
             str(w) != w_text:
         raise ValueError("NFQ N/F/Q, TARGET X, and W must use canonical decimal form")
     if n < 1 or n > 128:
         raise ValueError("SALT_TARGET_ROUTE_N outside 1..128")
-    if x < 1 or x > 128:
-        raise ValueError("SALT_TARGET_X outside 1..128")
+    if x < 1 or x > x_limit:
+        raise ValueError(f"SALT_TARGET_X outside 1..{x_limit}")
     if f < 1 or f > 8:
         raise ValueError("SALT_TARGET_ROUTE_F outside 1..8")
     if q < 1 or q > 8:
@@ -220,8 +221,8 @@ def validate_gemma_target_route_config(cfg):
         raise ValueError("SALT_TARGET_AREA_WORKERS outside 1..20")
     if n * f > 128:
         raise ValueError("target route N*F exceeds 128-node capacity")
-    if x * f > 128:
-        raise ValueError("TARGET X*F exceeds 128-row capacity")
+    if x * f > x_limit:
+        raise ValueError(f"TARGET X*F exceeds {x_limit}-row capacity")
     if n * f < w or n * f % w:
         raise ValueError("target route N*F must equal an integral multiple of W")
     return {"configured": True, "n": n, "x": x, "f": f, "q": q,

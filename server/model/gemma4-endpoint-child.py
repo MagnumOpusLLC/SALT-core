@@ -232,9 +232,9 @@ def main() -> int:
     dpr_draft_n = os.environ.get("GEMMA4_DPR_DRAFT_N")
     if dpr_draft_n is not None:
         if re.fullmatch(r"[1-9][0-9]*", dpr_draft_n) is None or not (
-            1 <= int(dpr_draft_n) <= 64
+            1 <= int(dpr_draft_n) <= 356
         ):
-            raise SystemExit("GEMMA4_DPR_DRAFT_N must be in [1, 64]")
+            raise SystemExit("GEMMA4_DPR_DRAFT_N must be in [1, 356]")
         gemma4_backend.GEMMA_ENGINE_CONFIG["SALT_DPR_DRAFT_N"] = dpr_draft_n
         print(
             f"[gemma4-endpoint-child] DPR draft N={dpr_draft_n}",

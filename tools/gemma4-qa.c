@@ -4,6 +4,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "gemma4_text.h"
+#include "gemma4_operation.h"
 #include "salt/attn.h"
 #include "salt/simd.h"
 #include "salt/gpu.h"
@@ -311,11 +312,11 @@ typedef struct {
     double end;
 } DecodeResult;
 
-static int generate(SaltGemma4Text *model, float *logits,
+static int generate(SaltGemma4Text *model, float *logits, float *proposal_logits,
                     int *output_ids, int generation_cap,
                     const char *phase, DecodeResult *result) {
     int next;
-    if (!model || !logits || !output_ids || generation_cap < 1 ||
+    if (!model || !logits || !proposal_logits || !output_ids || generation_cap < 1 ||
         !phase || !result)
         return -1;
     memset(result, 0, sizeof *result);
@@ -327,6 +328,12 @@ static int generate(SaltGemma4Text *model, float *logits,
         return -1;
     }
     while (result->output_count < generation_cap) {
+        SaltGemma4TargetGenerateResult selection;
+        /* Production cheap NFQ selection; X=1 admits no TARGET model work. */
+        if (salt_gemma4_text_target_generate(model, logits, 1,
+                proposal_logits, &selection) != 1 ||
+            selection.candidate_count == 0u || selection.target_model_rows != 0u)
+            return -1;
         if (result->first_token_ready < 0.0)
             result->first_token_ready = now_seconds();
         output_ids[result->output_count++] = next;
@@ -445,7 +452,7 @@ int main(int argc, char **argv) {
     const char *route_observe_path = NULL;
     SaltGemma4Text *model = NULL;
     int *prompt_ids = NULL, *output_ids = NULL, *warm_output_ids = NULL;
-    float *logits = NULL, *prefill_logits = NULL;
+    float *logits = NULL, *prefill_logits = NULL, *proposal_logits = NULL;
     int *dpr_draft_ids = NULL, *dpr_serial_ids = NULL;
     int *target_seed_ids = NULL;
     void *dpr_final_snapshot = NULL, *dpr_serial_snapshot = NULL;
@@ -728,7 +735,7 @@ int main(int argc, char **argv) {
     }
     if (!load_only &&
         (prefill_gpu_experts || target_gpu_experts || target_gpu_program) &&
-        (dpr_proof == 0 || dpr_reference_ids_text != NULL)) {
+        dpr_proof != 0 && dpr_reference_ids_text != NULL) {
         fputs("gemma4 qa runner: GPU expert engagement requires a normal "
               "decode transaction\n", stderr);
         goto done;
@@ -762,6 +769,8 @@ int main(int argc, char **argv) {
     output_ids = (int *)malloc((size_t)generation_cap * sizeof *output_ids);
     logits = (float *)malloc(
         (size_t)salt_gemma4_text_vocab_size(model) * sizeof *logits);
+    proposal_logits = (float *)malloc(
+        (size_t)salt_gemma4_text_vocab_size(model) * sizeof *proposal_logits);
     response_capacity = generation_cap * 64 + 1024;
     response = (char *)malloc((size_t)response_capacity);
     if (compare_kv_warm) {
@@ -792,7 +801,7 @@ int main(int argc, char **argv) {
         route_observer.items = route_items;
         route_observer.capacity = capacity;
     }
-    if (!prompt_ids || !output_ids || !logits || !response) {
+    if (!prompt_ids || !output_ids || !logits || !proposal_logits || !response) {
         fputs("gemma4 qa runner: allocation failed\n", stderr);
         goto done;
     }
@@ -1608,7 +1617,7 @@ int main(int argc, char **argv) {
     }
 
     cold_decode_start = now_seconds();
-    if (generate(model, logits, output_ids, generation_cap,
+    if (generate(model, logits, proposal_logits, output_ids, generation_cap,
                  "cold", &cold) != 0)
         goto done;
     if (route_observer_active) {
@@ -1700,7 +1709,7 @@ finalize_cold:
         memcpy(logits, prefill_logits,
                (size_t)salt_gemma4_text_vocab_size(model) * sizeof *logits);
         logit_restore_end = now_seconds();
-        if (generate(model, logits, warm_output_ids, generation_cap,
+        if (generate(model, logits, proposal_logits, warm_output_ids, generation_cap,
                      "warm", &warm) != 0)
             goto done;
         if (gpu_stats_snapshot(&gpu_after_warm) != 0) {
@@ -2062,6 +2071,7 @@ done:
     free(prefill_logits);
     free(warm_output_ids);
     free(response);
+    free(proposal_logits);
     free(logits);
     free(output_ids);
     free(prompt_ids);

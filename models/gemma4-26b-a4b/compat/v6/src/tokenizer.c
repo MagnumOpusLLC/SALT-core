@@ -322,7 +322,7 @@ int salt_tokenizer_load(SaltTokenizer *t, const char *path) {
     t->vcap = vcap;
     t->vkeys = (char **)calloc((size_t)vcap, sizeof(char *));
     t->vids = (int *)calloc((size_t)vcap, sizeof(int));
-    if (!t->vkeys || !t->vids) goto fail;
+    if (!t->vkeys || !t->vids) { json_free(doc); free(buf); return -1; }
 
     for (int i = 0; i < nv; i++) {
         const JEntry *e = &vocab->child[i];
@@ -331,7 +331,7 @@ int salt_tokenizer_load(SaltTokenizer *t, const char *path) {
         if (id < 0 || id >= nv) continue;
         size_t token_len = 0;
         char *token = json_unescape(e->key, kl, &token_len);
-        if (!token) goto fail;
+        if (!token) { json_free(doc); free(buf); return -1; }
         if (t->vocab[id]) { free(t->vocab[id]); }
         t->vocab[id] = token;
         vocab_insert(t, token, token_len, id);
@@ -344,7 +344,7 @@ int salt_tokenizer_load(SaltTokenizer *t, const char *path) {
     t->pkeys = (uint64_t *)calloc((size_t)pcap, sizeof(uint64_t));
     t->pranks = (int32_t *)malloc((size_t)pcap * sizeof(int32_t));
     t->pmerged = (int32_t *)malloc((size_t)pcap * sizeof(int32_t));
-    if (!t->pkeys || !t->pranks || !t->pmerged) goto fail;
+    if (!t->pkeys || !t->pranks || !t->pmerged) { json_free(doc); free(buf); return -1; }
 
     for (int i = 0; i < nm; i++) {
         const JEntry *m = &merges->child[i];
@@ -359,7 +359,7 @@ int salt_tokenizer_load(SaltTokenizer *t, const char *path) {
             size_t sl = 0;
             merge_string = json_unescape(m->str,
                 (size_t)(m->str_end - m->str), &sl);
-            if (!merge_string) goto fail;
+            if (!merge_string) { json_free(doc); free(buf); return -1; }
             char *sp = (char *)memchr(merge_string, ' ', sl);
             if (!sp) { free(merge_string); continue; }
             *sp = 0;
@@ -373,7 +373,7 @@ int salt_tokenizer_load(SaltTokenizer *t, const char *path) {
             right = json_unescape(r->str, (size_t)(r->str_end - r->str), &rl);
             if (!left || !right) {
                 free(left); free(right);
-                goto fail;
+                json_free(doc); free(buf); return -1;
             }
             ls = left; rs = right;
         } else {
@@ -388,7 +388,7 @@ int salt_tokenizer_load(SaltTokenizer *t, const char *path) {
         char *both = (char *)malloc(ll + rl + 1);
         if (!both) {
             free(merge_string); free(left); free(right);
-            goto fail;
+            json_free(doc); free(buf); return -1;
         }
         memcpy(both, ls, ll);
         memcpy(both + ll, rs, rl);
@@ -448,12 +448,6 @@ int salt_tokenizer_load(SaltTokenizer *t, const char *path) {
     json_free(doc);
     free(buf);
     return 0;
-
-fail:
-    json_free(doc);
-    free(buf);
-    salt_tokenizer_free(t);
-    return -1;
 }
 
 int salt_tokenizer_load_fd(SaltTokenizer *t, int fd) {

@@ -166,6 +166,8 @@ enum {
     /* Existing startup-owned NFQ storage admits at most eight local Q checks
      * for every target row. This is an ABI capacity, not an N*F*Q policy cap. */
     SALT_TEXT_NFQ_MAX_QUEUE = 8u,
+    /* Independent of the longer composed DPR walk: retain the existing
+     * 512-check NFQ storage and admission contract. */
     SALT_TEXT_NFQ_MAX_CHECKS = SALT_DPR_MAX_HORIZON * SALT_TEXT_NFQ_MAX_QUEUE
 };
 
@@ -191,6 +193,9 @@ typedef struct SaltTextTargetPolicy {
      * min(target_rows, warm_target_rows) until a later policy promotes them. */
     uint32_t kv_warmup_rows;
     uint32_t warm_target_rows;
+    /* Opt-in: an authenticated DPR draft uses the configured target-row cap
+     * instead of the ordinary pre-request KV warmup cap. Misses are unchanged. */
+    uint32_t dpr_independent_draft;
     int ready;
 } SaltTextTargetPolicy;
 
@@ -375,6 +380,8 @@ typedef struct SaltTextVerifyProgram {
     SaltTextDispatchPlan dispatch;
     size_t tentative_kv_bytes;
     int ready;
+    /* Request-scoped observational validation; zero after program compile. */
+    int proof_state;
 } SaltTextVerifyProgram;
 
 int salt_text_target_policy_compile_environment(
@@ -849,20 +856,61 @@ typedef struct SaltTextGenerationBinding {
     int (*target)(void *context, SaltTextTokenEpochController *controller,
                   const int32_t *tokens, uint32_t count,
                   const float *parent, SaltTextTokenEpochResult *result);
+
+    /* Exact authority chooses only the active known-token extent B.  It must
+     * not run model arithmetic or mutate KV/state.  materialize_known executes
+     * that complete extent once through the existing authoritative program.
+     * A provider with no exact chained evidence returns proven_count=1: the
+     * parent-selected root remains valid B1, while proposal suffixes remain
+     * untrusted. */
+    int (*prove_prefix)(void *context, const int32_t *tokens, uint32_t count,
+                        uint64_t parent_generation, uint32_t parent_position,
+                        uint32_t *checked_count, uint32_t *proven_count);
+    int (*materialize_known)(void *context, const int32_t *tokens,
+                             uint32_t count, SaltTextVerifyResult *result);
+
+    /* Borrowed views of the same startup-owned NFQ matrix used by horizontal
+     * proposal selection.  After that board resolves, portable C may rebind
+     * these seats as the vertical Wa x Y TARGET lifetime board.  This creates
+     * no second scheduler, arena, queue, or candidate authority. */
+    SaltAreaNfqMatrix *target_sublane_matrix;
+    uint32_t *target_sublane_ready_items;
+    uint32_t target_sublane_ready_capacity;
 } SaltTextGenerationBinding;
 
 typedef struct SaltTextGenerated {
-    /* Proposal checks in canonical NFQ order. After selection, entry zero
-     * carries the winner; these IDs are not a causal target-block sequence. */
+    /* After cheap NFQ root selection, entries [0, proposal_count) are the one
+     * selected causal X trajectory. Losing roots never enter this array's
+     * TARGET-visible prefix. */
     int32_t candidate_token_ids[SALT_TEXT_NFQ_MAX_CHECKS];
+    /* Causal rows in the selected trajectory and rows submitted to TARGET. */
     uint32_t proposal_count;
     uint32_t route_token_count;
-    /* Proposal-check count N*F*Q; route_token_count remains N*F. */
+    /* Cheap candidate[0] check count N*F*Q. */
     uint32_t candidate_count;
     uint32_t projection_reused_rows;
     /* SALT_TEXT_PROPOSAL_SOURCE_*; history match length when HISTORY. */
     uint32_t proposal_source;
     uint32_t history_matched_length;
+
+    /* Proof is metadata-only; materialization is the sole neural execution.
+     * first_unproven equals proven_prefix_rows, or proposal_count on a full
+     * proof. State reuse is reported separately and performs no materializer
+     * submission. */
+    uint32_t proof_checked_rows;
+    uint32_t proven_prefix_rows;
+    uint32_t first_unproven;
+    uint32_t materialized_rows;
+    uint32_t state_reuse_rows;
+
+    /* Two-lane TARGET realization. target_model_rows counts every row actually
+     * submitted to the model; proposal_count remains the admitted vertical X.
+     * Wa workers retain one lane for sublane_depth Y rounds. */
+    uint32_t target_model_rows;
+    uint32_t target_sublane_workers;
+    uint32_t target_sublane_depth;
+    uint32_t target_sublane_rounds;
+    uint32_t target_sublane_cancelled_rows;
 
     uint64_t proposal_ns;
     uint32_t epoch_path;
@@ -907,9 +955,9 @@ typedef struct SaltTextScheduleDpr {
 typedef struct SaltTextScheduleSelection {
     SaltDprEdgeKind kind;
     const SaltDprStoredEdge *stored;
-    int32_t tokens[SALT_DPR_MAX_HORIZON];
-    size_t indices[SALT_DPR_MAX_HORIZON];
-    size_t binding_indices[SALT_DPR_MAX_HORIZON];
+    int32_t tokens[SALT_DPR_MAX_WALK_HORIZON];
+    size_t indices[SALT_DPR_MAX_WALK_HORIZON];
+    size_t binding_indices[SALT_DPR_MAX_WALK_HORIZON];
     uint32_t count, coverage_roots;
     uint32_t source_position;
     int32_t target_token;

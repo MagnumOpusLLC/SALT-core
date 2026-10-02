@@ -157,7 +157,17 @@ def main() -> None:
         })
         assert module._gemma_kv_layout_setting() == "hybrid"
         module.GEMMA_ENGINE_CONFIG["SALT_TEXT_FINE_TOKEN"] = "0"
-        assert module._gemma_kv_layout_setting() == "absolute"
+        assert module._gemma_kv_layout_setting() == "hybrid"
+        # Registered GPU attention must admit the same bounded native seats.
+        module.GEMMA_ENGINE_CONFIG.update({
+            "SALT_GPU_BOUNDED_WEIGHTS": "0",
+            "SALT_GEMMA_GPU_KV_RING": "0",
+            "SALT_GPU_WEIGHT_ADDRESSABILITY": "bounded-window",
+        })
+        assert module._gemma_kv_layout_setting() == "hybrid"
+        assert module.gemma4_kv_capacity_bytes(
+            12288, module._gemma_kv_layout_setting(),
+        ) == 922_746_880
     finally:
         module.GEMMA_ENGINE_CONFIG.clear()
         module.GEMMA_ENGINE_CONFIG.update(old_engine_config)

@@ -2522,8 +2522,13 @@ __global__ static void hip_text_expert_q4(
         const int32_t *selected, const int32_t *grouped_to_canonical,
         uint32_t jobs, uint32_t topk, uint32_t experts_per_layer,
         const float *input,
-        float *output, uint32_t expected_rows, uint32_t expected_cols,
+        float *output, float *paired_output,
+        uint32_t expected_rows, uint32_t expected_cols,
         int *status) {
+    if (blockIdx.z != 0u) {
+        phase += (uint32_t)blockIdx.z;
+        output = paired_output;
+    }
     uint32_t grouped = (uint32_t)blockIdx.y;
     int lane = (int)threadIdx.x & 31;
     int warp = (int)threadIdx.x >> 5;
@@ -7069,22 +7074,27 @@ static int hip_text_direct_q4_descriptor(
 }
 
 static int hip_text_launch_q4_pair(HipTextProgramState *state,
-        uint32_t descriptor_base, uint32_t batch, uint32_t max_rows) {
+        uint32_t descriptor_base, uint32_t batch, uint32_t max_rows,
+        uint32_t descriptor_count) {
     if (!state || !state->host_selected_desc ||
         !state->device_selected_desc ||
+        (descriptor_count != 2u &&
+         (descriptor_count != 3u || batch != 1u)) ||
         descriptor_base > state->selected_job_capacity *
-            HIP_TEXT_EXPERT_PROJECTIONS - 2u ||
+            HIP_TEXT_EXPERT_PROJECTIONS - descriptor_count ||
         batch == 0 || max_rows == 0 ||
         hip_success(hipMemcpyAsync(state->device_selected_desc + descriptor_base,
             state->host_selected_desc + descriptor_base,
-            2u * sizeof(HipBatchDesc),
+            descriptor_count * sizeof(HipBatchDesc),
             hipMemcpyHostToDevice, state->stream),
             "hipMemcpy text Q4 pair descriptors") != 0)
         return -1;
     if (batch == 1u) {
-        hip_q4_heterogeneous_warp<<<dim3((max_rows + 3u) / 4u, 1u, 2u),
+        hip_q4_heterogeneous_warp<<<dim3((max_rows + 3u) / 4u, 1u,
+            descriptor_count),
             128, 0, state->stream>>>(
-            state->device_selected_desc + descriptor_base, 2,
+            state->device_selected_desc + descriptor_base,
+            (int)descriptor_count,
             (const float *)state->device_canonical,
             (float *)state->device_canonical,
             hip_selected_device_resources,
@@ -7244,7 +7254,9 @@ static int hip_text_requirements(
         program->layout.maximum_topk > program->layout.maximum_experts ||
         hip_u64_mul(program->maximum_candidates,
             program->layout.maximum_topk, &selected_jobs) != 0 ||
-        selected_jobs > SALT_TEXT_GPU_MAX_RESOURCE_REQUESTS)
+        /* Selected row/expert jobs use the existing HIP descriptor capacity;
+         * unique expert resources retain their separate bound above. */
+        selected_jobs > HIP_MAX_BATCH_JOBS)
         return -1;
     memset(requirements, 0, sizeof *requirements);
     requirements->backend_state_bytes = sizeof(HipTextProgramState);
@@ -7914,13 +7926,29 @@ static int hip_text_encode_cell(
         if (cmd->qk_wave_pending) {
             uint32_t max_rows = refs->q.rows > refs->k.rows
                 ? refs->q.rows : refs->k.rows;
+            uint32_t group = input_count == 1u &&
+                !attention->shared_kv_projection &&
+                refs->v.encoding == SALT_TENSOR_ENCODING_AFFINE_Q4 ? 3u : 2u;
+            if (group == 3u) {
+                if (cmd->next_cell + 1u >= program->dispatch.cell_count ||
+                    program->dispatch.cells[cmd->next_cell + 1u].kind !=
+                        SALT_TEXT_CELL_VALUE_PROJECTION ||
+                    program->dispatch.cells[cmd->next_cell + 1u].layer !=
+                        cell->layer ||
+                    hip_text_direct_q4_descriptor(state, &refs->v, input_count,
+                        layout->normalized,
+                        program->dispatch.cells[cmd->next_cell + 1u].destination_offset,
+                        &state->host_selected_desc[2]) != 0)
+                    return -1;
+                if (refs->v.rows > max_rows) max_rows = refs->v.rows;
+            }
             if (hip_text_direct_q4_descriptor(state, &refs->k, input_count,
                     layout->normalized, cell->destination_offset,
                     &state->host_selected_desc[1]) != 0 ||
                 hip_text_launch_q4_pair(state, 0u,
-                    input_count, max_rows) != 0)
+                    input_count, max_rows, group) != 0)
                 return -1;
-            cmd->qk_wave_pending = 0u;
+            cmd->qk_wave_pending = group == 3u ? 2u : 0u;
         } else if (hip_text_project(state, &refs->k,
                 hip_text_f32(state, layout->normalized), destination,
                 input_count) != 0) {
@@ -7929,8 +7957,12 @@ static int hip_text_encode_cell(
         cmd->stats.projection_dispatches++;
         break;
     case SALT_TEXT_CELL_VALUE_PROJECTION:
-        if (cmd->qk_wave_pending) return -1;
-        if (attention->shared_kv_projection) {
+        if (cmd->qk_wave_pending == 2u) {
+            cmd->qk_wave_pending = 0u;
+            physical_launches = 0u;
+        } else if (cmd->qk_wave_pending) {
+            return -1;
+        } else if (attention->shared_kv_projection) {
             physical_launches = 0u;
         } else if (
             hip_text_project(state, &refs->v,
@@ -8023,7 +8055,7 @@ static int hip_text_encode_cell(
             refs->dense_up.encoding == SALT_TENSOR_ENCODING_AFFINE_Q4) {
             if (hip_text_direct_q4_descriptor(state, &refs->dense_gate,
                     input_count, layout->normalized, cell->destination_offset,
-                    &state->host_selected_desc[2]) != 0)
+                    &state->host_selected_desc[input_count == 1u ? 3u : 2u]) != 0)
                 return -1;
             cmd->dense_wave_pending = 1u;
             physical_launches = 0u;
@@ -8040,9 +8072,9 @@ static int hip_text_encode_cell(
                 ? refs->dense_gate.rows : refs->dense_up.rows;
             if (hip_text_direct_q4_descriptor(state, &refs->dense_up,
                     input_count, layout->normalized, cell->destination_offset,
-                    &state->host_selected_desc[3]) != 0 ||
-                hip_text_launch_q4_pair(state, 2u,
-                    input_count, max_rows) != 0)
+                    &state->host_selected_desc[input_count == 1u ? 4u : 3u]) != 0 ||
+                hip_text_launch_q4_pair(state, input_count == 1u ? 3u : 2u,
+                    input_count, max_rows, 2u) != 0)
                 return -1;
             cmd->dense_wave_pending = 0u;
         } else if (hip_text_project(state, &refs->dense_up,
@@ -8125,16 +8157,39 @@ static int hip_text_encode_cell(
             cmd->selected_descriptor_count != cmd->resource_request_count ||
             cmd->selected_max_occupancy == 0)
             return -1;
-        hip_selected_read_submitted();
-        if (!hip_text_selected_wave_enabled ||
+        if (input_count == 1u && phase < 2u) {
+            if (cmd->next_cell < phase) return -1;
+            uint32_t gate_cell = cmd->next_cell - phase;
+            if (gate_cell + 1u >= program->dispatch.cell_count ||
+                program->dispatch.cells[gate_cell].kind !=
+                    SALT_TEXT_CELL_EXPERT_GATE ||
+                program->dispatch.cells[gate_cell + 1u].kind !=
+                    SALT_TEXT_CELL_EXPERT_UP ||
+                program->dispatch.cells[gate_cell].layer != cell->layer ||
+                program->dispatch.cells[gate_cell + 1u].layer != cell->layer)
+                return -1;
+            if (phase == 0u) {
+                hip_selected_read_submitted();
+                hip_text_expert_q4<<<dim3((rows + 3u) / 4u, jobs, 2u), 128,
+                    0, state->stream>>>(state->device_experts, cell->layer, phase,
+                    hip_text_i32(state, layout->selected_experts),
+                    hip_text_i32(state, layout->grouped_to_canonical), jobs, topk,
+                    state->experts_per_layer, input, destination,
+                    hip_text_f32(state,
+                        program->dispatch.cells[gate_cell + 1u].destination_offset),
+                    rows, cols, status);
+            } else physical_launches = 0u;
+        } else if (!hip_text_selected_wave_enabled ||
             cmd->selected_max_occupancy == 1u) {
+            hip_selected_read_submitted();
             hip_text_expert_q4<<<dim3((rows + 3u) / 4u, jobs, 1u), 128,
                 0, state->stream>>>(state->device_experts, cell->layer, phase,
                 hip_text_i32(state, layout->selected_experts),
                 hip_text_i32(state, layout->grouped_to_canonical), jobs, topk,
                 state->experts_per_layer,
-                input, destination, rows, cols, status);
+                input, destination, NULL, rows, cols, status);
         } else {
+            hip_selected_read_submitted();
             unsigned int threads, groups;
             if (hip_selected_warp_geometry((int)cmd->selected_max_occupancy,
                     &threads, &groups) != 0)
@@ -8764,17 +8819,26 @@ static void hip_text_record_completed_paths(
                 refs->q.encoding == SALT_TENSOR_ENCODING_AFFINE_Q4 &&
                 refs->k.encoding == SALT_TENSOR_ENCODING_AFFINE_Q4) {
                 path = HIP_PATH_TEXT_Q4;
-                jobs *= UINT64_C(2);
+                uint64_t group = cmd->input_count == 1u &&
+                    !state->program->layers[cell->layer].descriptor->plan->
+                        attention.shared_kv_projection &&
+                    refs->v.encoding == SALT_TENSOR_ENCODING_AFFINE_Q4 ? 3u : 2u;
+                jobs *= group;
                 rows = (uint64_t)cmd->input_count *
-                    (refs->q.rows + refs->k.rows);
+                    (refs->q.rows + refs->k.rows +
+                     (group == 3u ? refs->v.rows : 0u));
             } else {
                 projection = refs ? &refs->k : NULL;
             }
             break;
         case SALT_TEXT_CELL_VALUE_PROJECTION:
-            if (cell->layer < state->program->layer_count &&
+            if ((cmd->input_count == 1u && hip_text_pair_enabled && refs &&
+                 refs->q.encoding == SALT_TENSOR_ENCODING_AFFINE_Q4 &&
+                 refs->k.encoding == SALT_TENSOR_ENCODING_AFFINE_Q4 &&
+                 refs->v.encoding == SALT_TENSOR_ENCODING_AFFINE_Q4) ||
+                (cell->layer < state->program->layer_count &&
                 state->program->layers[cell->layer].descriptor->plan->attention.
-                    shared_kv_projection)
+                    shared_kv_projection))
                 launches = UINT64_C(0);
             else
                 projection = refs ? &refs->v : NULL;
@@ -8852,6 +8916,10 @@ static void hip_text_record_completed_paths(
         case SALT_TEXT_CELL_EXPERT_DOWN:
             path = HIP_PATH_TEXT_EXPERT_Q4;
             jobs *= cell_template->topk;
+            if (cmd->input_count == 1u) {
+                if (cell->kind == SALT_TEXT_CELL_EXPERT_GATE) jobs *= 2u;
+                if (cell->kind == SALT_TEXT_CELL_EXPERT_UP) launches = 0u;
+            }
             rows = jobs * (cell->kind == SALT_TEXT_CELL_EXPERT_DOWN
                 ? cell_template->hidden : cell_template->routed);
             break;

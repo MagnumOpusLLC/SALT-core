@@ -27,7 +27,7 @@ SPEC.loader.exec_module(projection_module)
 
 PRODUCTION_MANIFEST = Path("models/gemma4-26b-a4b/kv-cache-compat.json")
 PRODUCTION_PROJECTION = Path("models/gemma4-26b-a4b/kv-cache-compat-projection.json")
-EXPECTED_PRODUCTION = "37d01a21550352fb3c5f57fbdafe56988ccfba853a2bd360d3a939b598a28cf6"
+EXPECTED_PRODUCTION = "d7e323dde7a7d336cd56c9879199c0ec7da99e243536afb0e5e776aaa31c88e6"
 BEGIN = b"# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1\n"
 END = b"# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1\n"
 
@@ -220,11 +220,14 @@ def production_contract() -> None:
     assert PRODUCTION_MANIFEST.as_posix() in dependencies
     assert PRODUCTION_PROJECTION.as_posix() in dependencies
     assert "models/gemma4-26b-a4b/compat/v6/Makefile" in dependencies
+    assert "models/gemma4-26b-a4b/compat/v6/src/tokenizer.c" in dependencies
+    assert dict(authority.file_sha256)["src/tokenizer.c"] == \
+        "112a85f42cb752e16424abeb3bd6fd82b31b3fda20571e67af99e5af72f3c310"
     assert dict(authority.file_sha256)["Makefile"] == \
         "f34e7285395963b84600379f3a3a1065c3f1d5d38dc8d04c2f7776b07fb8e212"
     assert dict(authority.file_sha256)[
         "models/gemma4-26b-a4b/gemma4_text.c"
-    ] == "c0036542baa759298ece16ba85448c2dd63459e15653b2d1414f53dcc9913ea7"
+    ] == "2276829cd1e01df341577ea3e1b0227e2c54b171174ea3c74098d2543c3b6952"
     assert dict(authority.file_sha256)["server/gemma4_compat.py"] == \
         "a903d9a6b88d0f592da176fcc7bd0bfdf4c57edb3d4ccd1088de7532096436c2"
     assert "src/sampling.c" in dependencies

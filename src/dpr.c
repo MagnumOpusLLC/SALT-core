@@ -493,7 +493,7 @@ int salt_dpr_candidate_sha256(const int32_t *candidate_token_ids,
     SaltSha256 hasher;
     uint8_t count[4], token[4];
     if (!candidate_token_ids || candidate_count == 0 ||
-        candidate_count > SALT_DPR_MAX_HORIZON || !out)
+        candidate_count > SALT_DPR_MAX_WALK_HORIZON || !out)
         return -1;
     le32_store(count, candidate_count);
     salt_sha256_init(&hasher);
@@ -514,7 +514,9 @@ static int compute_intent_validate(const SaltDprComputeIntent *intent) {
         intent->schema_version != SALT_DPR_COMPUTE_INTENT_VERSION ||
         intent->kind < SALT_DPR_OPERATION_PREFILL ||
         intent->kind > SALT_DPR_OPERATION_REPAIR ||
-        intent->horizon == 0 || intent->horizon > SALT_DPR_MAX_HORIZON ||
+        intent->horizon == 0 ||
+        intent->horizon > (intent->kind == SALT_DPR_OPERATION_DRAFT_VERIFY
+            ? SALT_DPR_MAX_WALK_HORIZON : SALT_DPR_MAX_HORIZON) ||
         intent->candidate_count > intent->horizon ||
         digest_is_zero(intent->target_node_sha256) ||
         digest_is_zero(intent->state_compatibility_sha256) ||

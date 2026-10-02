@@ -13,15 +13,15 @@
       "logical_path": "models/gemma4-26b-a4b/gemma4_text.c",
       "snapshot_path": "models/gemma4-26b-a4b/compat/v6/models/gemma4-26b-a4b/gemma4_text.c",
       "snapshot_sha256": "2276829cd1e01df341577ea3e1b0227e2c54b171174ea3c74098d2543c3b6952",
-      "live_projection": "strip-physical-build-blocks-v1",
-      "physical_blocks_sha256": "5be7ea76211a01006f0d03766583803f36e5ed1c60b167db99d9cb964aedf66e"
+      "live_projection": "pin-live-source-v1",
+      "live_sha256": "6e486b795c8c16d43bcd60b7a981c88e5287dd3b95b8a3bc633e1071e281b0f4"
     },
     {
       "logical_path": "models/gemma4-26b-a4b/server.c",
       "snapshot_path": "models/gemma4-26b-a4b/compat/v6/models/gemma4-26b-a4b/server.c",
       "snapshot_sha256": "2a725507b84562a9bd0bbde21b7c7f1a2aff61be585fb54df10f0924344cfd83",
       "live_projection": "pin-live-source-v1",
-      "live_sha256": "cd2d2d723e79f1af7f9e98f74c45cd0a220998745f10824c74df99822898d9f1"
+      "live_sha256": "2154c12ed4e6bd6eb205f6da4901d15085943d6959bab67e35690ba2397a1870"
     },
     {
       "logical_path": "models/gemma4-26b-a4b/server.config",
@@ -42,7 +42,7 @@
       "snapshot_path": "models/gemma4-26b-a4b/compat/v6/server/gemma4_backend.py",
       "snapshot_sha256": "361facedbc836412b3423eee3fea0261aeec01fdec3dc0ba061c7961ceaa7562",
       "live_projection": "strip-physical-build-blocks-v1",
-      "physical_blocks_sha256": "2fb6e8bd042bd53284d21025279157495ef7360d0fb9a314434db1482d06b015"
+      "physical_blocks_sha256": "7b9a4d4ddf140148f2bb2bc93fe604593125e9b9b8c1cf326eabe579e023a5f1"
     },
     {
       "logical_path": "server/gemma4_compat.py",
@@ -56,7 +56,14 @@
       "snapshot_path": "models/gemma4-26b-a4b/compat/v6/server/serve.py",
       "snapshot_sha256": "2cafc3835c8a9f8f1006223262751ea00b79a981d66a88350ebc1e70508b7c8e",
       "live_projection": "strip-physical-build-blocks-v1",
-      "physical_blocks_sha256": "654d0b9df8591dec4c3816736bf8080093658b748b1de98a133e0661fc7d304c"
+      "physical_blocks_sha256": "01242c4ab1dcd6e4445133ad9662c26518524c6ab6b05557443c093e0292a70c"
+    },
+    {
+      "logical_path": "src/tokenizer.c",
+      "snapshot_path": "models/gemma4-26b-a4b/compat/v6/src/tokenizer.c",
+      "snapshot_sha256": "112a85f42cb752e16424abeb3bd6fd82b31b3fda20571e67af99e5af72f3c310",
+      "live_projection": "pin-live-source-v1",
+      "live_sha256": "44c6d75d264759d8ed2e743ae392f42ef50804f9a201333c5dd69751ab9766aa"
     },
     {
       "logical_path": "tools/gemma4-mentor-state.py",

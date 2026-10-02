@@ -188,6 +188,21 @@ def test_gemma_target_route_policy():
         "configured": True, "n": 32, "x": 16, "f": 2, "q": 8,
         "nodes": 64, "candidate_count": 64,
     }
+    rocm = dict(valid, SALT_GEMMA_PLATFORM_RECIPE="rocm",
+                SALT_TARGET_ROUTE_N="104", SALT_TARGET_X="356",
+                SALT_TARGET_ROUTE_F="1", SALT_TARGET_ROUTE_Q="4")
+    admitted = engine_config.validate_gemma_target_route_config(rocm)
+    assert admitted["n"] == 104 and admitted["x"] == 356 and \
+        admitted["candidate_count"] == 104
+    for invalid in (dict(rocm, SALT_TARGET_X="357"),
+                    dict(rocm, SALT_TARGET_ROUTE_N="129"),
+                    dict(rocm, SALT_GEMMA_PLATFORM_RECIPE="spark")):
+        try:
+            engine_config.validate_gemma_target_route_config(invalid)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"invalid platform target route admitted: {invalid}")
     for invalid in (
         {"SALT_TARGET_ROUTE_N": "32"},
         {"SALT_TARGET_ROUTE_F": "1"},
@@ -286,7 +301,7 @@ def test_gemma_platform_recipes():
             "1" if recipe in ("mac-metal", "spark", "spark-hmm") else "0"
         ), cfg
         assert cfg["SALT_TEXT_FINE_TOKEN"] == (
-            "1" if recipe == "spark-hmm" else "0"
+            "1" if recipe in ("spark-hmm", "rocm") else "0"
         ), cfg
         assert cfg["SALT_TARGET_CPU_GRAPH"] == "0", cfg
         assert cfg["SALT_PREFILL_DECODE_LOOKAHEAD"] == "0", cfg
@@ -304,6 +319,10 @@ def test_gemma_platform_recipes():
     mac = load_engine_config(
         str(ROOT / "engine.config"), model_dir=model_dir, recipe="mac",
     )
+    # Preserve CPU fetch workers while consuming mapped bytes in the existing
+    # expert workers; literal "0" would select device-fault-only initialization.
+    assert mac["SALT_FETCH_TOUCH_BYTES"] == "", mac
+    assert mac["SALT_FETCH_TOUCH"] == "0", mac
     cpu_structure = (
         "SALT_GEMMA_COMPUTE_NODE", "SALT_GPU_TRUNK",
         "SALT_GPU_BOUNDED_WEIGHTS", "SALT_TARGET_GPU_PROGRAM",
@@ -325,6 +344,7 @@ def test_gemma_platform_recipes():
     metal = load_engine_config(
         str(ROOT / "engine.config"), model_dir=model_dir, recipe="mac-metal",
     )
+    assert metal["SALT_FETCH_TOUCH_BYTES"] == "2230272", metal
     assert metal["SALT_GPU_TRUNK_LAYER_VIEW"] == "0", metal
     assert metal["SALT_GPU_TRUNK_SHARED_POOL"] == "1", metal
     assert metal["SALT_GEMMA_METAL_EXACT_CELLS"] == "0", metal
@@ -399,7 +419,7 @@ def test_gemma_platform_recipes():
     assert rocm["SALT_GEMMA_GPU_KV_RING"] == "1"
     assert rocm["SALT_DECODE_GPU_ATTENTION"] == "1"
     assert engine_config.validate_gemma_target_route_config(rocm) == {
-        "configured": True, "n": 104, "x": 16, "f": 1, "q": 4,
+        "configured": True, "n": 104, "x": 356, "f": 1, "q": 4,
         "nodes": 104, "candidate_count": 104,
     }
     for invalid in ("", "../spark", "spark/x", "SPARK", "missing"):

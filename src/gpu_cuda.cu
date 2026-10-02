@@ -45,6 +45,7 @@ typedef struct CudaSelectedResource {
     uint64_t logical_resource_id;
     const unsigned char *base;
     const unsigned char *payload;
+    const unsigned char *device_payload;
     size_t nbytes;
 } CudaSelectedResource;
 
@@ -74,6 +75,7 @@ typedef struct CudaBatchDesc {
     (CUDA_TEXT_LAYERS * CUDA_TEXT_EXPERTS * 3u)
 #define CUDA_TEXT_GRAPH_COUNT CUDA_TEXT_MAX_CANDIDATES
 #define CUDA_TEXT_GRAPH_MAX_NODES 1024u
+#define CUDA_TEXT_MAX_EXTENTS (CUDA_TEXT_LAYERS * 2u + 1u)
 #define CUDA_TEXT_STATE_MAGIC UINT64_C(0x4355545854505247)
 
 typedef struct CudaAttentionKvSync CudaAttentionKvSync;
@@ -141,6 +143,17 @@ typedef struct CudaTextGraphTemplate {
     SaltTextVerifyBackendStats stats;
 } CudaTextGraphTemplate;
 
+typedef struct CudaTextExtentGraph {
+    cudaGraph_t graph;
+    cudaGraphExec_t executable;
+    cudaGraphNode_t attention_node;
+    uint32_t first_cell;
+    uint32_t cell_count;
+    uint32_t kernel_nodes;
+    uint32_t attention_nodes;
+    SaltTextVerifyBackendStats stats;
+} CudaTextExtentGraph;
+
 typedef struct CudaTextProgramState {
     uint64_t magic;
     const SaltTextVerifyProgram *program;
@@ -155,6 +168,8 @@ typedef struct CudaTextProgramState {
     CudaTextTensorRef expert_refs[CUDA_TEXT_EXPERT_REFS];
     CudaTextCellTemplate templates[CUDA_TEXT_CELLS];
     CudaTextGraphTemplate graphs[CUDA_TEXT_GRAPH_COUNT];
+    CudaTextExtentGraph extent_graphs[CUDA_TEXT_GRAPH_COUNT]
+                                           [CUDA_TEXT_MAX_EXTENTS];
     int32_t *graph_tokens;
     uint32_t *graph_parent_rows;
     uint32_t *graph_depths;
@@ -166,6 +181,8 @@ typedef struct CudaTextProgramState {
     float *attention_score_workspace;
     size_t attention_score_workspace_floats;
     uint32_t graphs_ready;
+    uint32_t extent_graph_count;
+    uint32_t extent_graphs_ready;
     uint32_t capture_mode;
     uint32_t dynamic_experts;
     int ready;
@@ -214,6 +231,10 @@ static int *cuda_selected_logical_slots;
 static int cuda_selected_capacity;
 static int cuda_selected_logical_capacity;
 static int cuda_selected_retirement_fenced;
+/* One-shot proof that the text-program stream was synchronized immediately
+ * before its synchronous SaltCache acquire.  The existing retirement hook
+ * consumes this proof; it is not a second readiness state or address map. */
+static int cuda_text_resource_fence_credit;
 static float *cuda_x, *cuda_y;
 static float *cuda_attention_kv;
 static size_t cuda_attention_kv_nbytes;
@@ -221,6 +242,7 @@ static const void *cuda_attention_kv_host;
 static int *cuda_attention_status;
 struct CudaAttentionKvSync {
     size_t key_offset, value_offset;
+    size_t row_capacity;
     int kv_stride;
     int device_positions;
     int host_positions;
@@ -231,6 +253,7 @@ typedef struct CudaAttentionStage {
     const void *query_host;
     size_t query_offset, key_offset, value_offset;
     int start, batch, query_stride, kv_stride;
+    int deferred_publish;
     int valid;
 } CudaAttentionStage;
 static CudaAttentionStage cuda_attention_stage;
@@ -958,7 +981,8 @@ __device__ static float cuda_salt_rsqrtf(float x) {
 
 __global__ static void cuda_attention_transform_exact(
     int n_heads, int n_kv_heads, int head_dim, int rope_dim,
-    int start_position, int batch, int query_stride, int kv_stride, float eps,
+    int start_position, int batch, int query_stride, int kv_stride,
+    int row_capacity, int publish_cache, float eps,
     float *queries, float *keys, float *values,
     const float *q_weight, const float *k_weight,
     const float *cosines, const float *sines, int rope_pairs,
@@ -1033,13 +1057,15 @@ __global__ static void cuda_attention_transform_exact(
         }
     }
     __syncthreads();
-    if (kind == 1)
+    size_t destination = (size_t)(start_position + token) %
+        (size_t)row_capacity;
+    if (publish_cache && kind == 1)
         for (int i = (int)threadIdx.x; i < head_dim; i += (int)blockDim.x)
-            key_cache[(size_t)(start_position + token) * (size_t)kv_stride +
+            key_cache[destination * (size_t)kv_stride +
                 (size_t)head * (size_t)head_dim + (size_t)i] = row[i];
-    else if (kind == 2)
+    else if (publish_cache && kind == 2)
         for (int i = (int)threadIdx.x; i < head_dim; i += (int)blockDim.x)
-            value_cache[(size_t)(start_position + token) * (size_t)kv_stride +
+            value_cache[destination * (size_t)kv_stride +
                 (size_t)head * (size_t)head_dim + (size_t)i] = row[i];
 }
 
@@ -1047,11 +1073,16 @@ __global__ static void cuda_attention_exact(
     int full_attention, int n_heads, int n_kv_heads, int head_dim, int window,
     const float *queries, const float *keys, const float *values,
     int start_position, int batch, int query_stride, int kv_stride,
-    float *outputs, int *failure) {
-    extern __shared__ float scores[];
+    int row_capacity, const float *new_keys, const float *new_values,
+    int new_start_position, int new_count, float *outputs, int *failure,
+    float *global_scores, size_t score_stride, uint32_t task_first) {
+    extern __shared__ float shared_scores[];
+    __shared__ float maximum;
     __shared__ float denominator;
     __shared__ int score_count;
-    int task = (int)blockIdx.x;
+    float *scores = global_scores
+        ? global_scores + (size_t)blockIdx.x * score_stride : shared_scores;
+    int task = (int)(task_first + blockIdx.x);
     int token = task / n_heads;
     int head = task % n_heads;
     int groups = n_heads / n_kv_heads;
@@ -1062,24 +1093,41 @@ __global__ static void cuda_attention_exact(
     int count = position - first + 1;
     const float *query = queries + (size_t)token * (size_t)query_stride +
         (size_t)head * (size_t)head_dim;
-    if (threadIdx.x == 0) {
-        float maximum = -1.0f / 0.0f;
-        for (int i = 0, position_k = first; position_k <= position;
-             position_k++, i++) {
-            const float *key = keys +
-                (size_t)position_k * (size_t)kv_stride +
+    /* Independent QK matrix cells are GPU lanes; each dot retains the exact
+     * canonical increasing-dimension accumulation. */
+    for (int i = (int)threadIdx.x; i < count; i += (int)blockDim.x) {
+        int position_k = first + i;
+        size_t physical_position = (size_t)position_k %
+            (size_t)row_capacity;
+        const float *key = new_keys && position_k >= new_start_position &&
+                position_k < new_start_position + new_count
+            ? new_keys + (size_t)(position_k - new_start_position) *
+                (size_t)kv_stride + (size_t)kv_head * (size_t)head_dim
+            : keys + physical_position * (size_t)kv_stride +
                 (size_t)kv_head * (size_t)head_dim;
-            float score = 0.0f;
-            for (int d = 0; d < head_dim; d++)
-                score = __fadd_rn(score, __fmul_rn(query[d], key[d]));
-            scores[i] = score;
-            if (score > maximum) maximum = score;
-        }
-        float sum = 0.0f;
+        float score = 0.0f;
+        for (int d = 0; d < head_dim; d++)
+            score = __fadd_rn(score, __fmul_rn(query[d], key[d]));
+        scores[i] = score;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float peak = -1.0f / 0.0f;
         for (int i = 0; i < count; i++) {
-            scores[i] = cuda_salt_expf(__fadd_rn(scores[i], -maximum));
-            sum = __fadd_rn(sum, scores[i]);
+            float score = scores[i];
+            if (score > peak) peak = score;
         }
+        maximum = peak;
+    }
+    __syncthreads();
+    /* Exponentials are independent; denominator order stays increasing-i. */
+    for (int i = (int)threadIdx.x; i < count; i += (int)blockDim.x)
+        scores[i] = cuda_salt_expf(__fadd_rn(scores[i], -maximum));
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float sum = 0.0f;
+        for (int i = 0; i < count; i++)
+            sum = __fadd_rn(sum, scores[i]);
         denominator = sum;
         score_count = (!(sum > 0.0f) || !isfinite(sum)) ? -1 : count;
         if (score_count < 0) atomicExch(failure, 1);
@@ -1092,15 +1140,38 @@ __global__ static void cuda_attention_exact(
         float accumulator = 0.0f;
         for (int i = 0, position_v = first; i < score_count;
              i++, position_v++) {
-            const float *value = values +
-                (size_t)position_v * (size_t)kv_stride +
-                (size_t)kv_head * (size_t)head_dim;
+            size_t physical_position = (size_t)position_v %
+                (size_t)row_capacity;
+            const float *value = new_values && position_v >= new_start_position &&
+                    position_v < new_start_position + new_count
+                ? new_values + (size_t)(position_v - new_start_position) *
+                    (size_t)kv_stride + (size_t)kv_head * (size_t)head_dim
+                : values + physical_position * (size_t)kv_stride +
+                    (size_t)kv_head * (size_t)head_dim;
             float weight = __fdiv_rn(scores[i], denominator);
             accumulator = __fadd_rn(
                 accumulator, __fmul_rn(weight, value[d]));
         }
         output[d] = accumulator;
     }
+}
+
+/* Publish only after every causal query has consumed the retained history. */
+__global__ static void cuda_attention_publish_exact(
+        const float *keys, const float *values,
+        float *key_cache, float *value_cache,
+        int start_position, int batch, int kv_stride, int row_capacity,
+        const int *status) {
+    size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t count = (size_t)batch * (size_t)kv_stride;
+    if (index >= count || row_capacity < 1 || *status != 0) return;
+    size_t row = index / (size_t)kv_stride;
+    if (batch > row_capacity && row < (size_t)(batch - row_capacity)) return;
+    size_t column = index - row * (size_t)kv_stride;
+    size_t destination = (size_t)(start_position + (int)row) %
+        (size_t)row_capacity;
+    key_cache[destination * (size_t)kv_stride + column] = keys[index];
+    value_cache[destination * (size_t)kv_stride + column] = values[index];
 }
 
 __device__ static float cuda_salt_tanhf(float x) {
@@ -1514,6 +1585,7 @@ __global__ static void cuda_text_attention_body(
         return;
     }
     uint32_t source_position = *source_position_pointer;
+    __shared__ float maximum;
     __shared__ float denominator;
     __shared__ int score_count;
     __shared__ int scores_valid;
@@ -1559,21 +1631,30 @@ __global__ static void cuda_text_attention_body(
         if (!scores_valid) {
             score_count = -1;
         } else {
-            float maximum = -1.0f / 0.0f;
+            float peak = -1.0f / 0.0f;
             for (uint32_t index = 0; index < count; index++) {
                 float score = scores[index];
-                if (score > maximum) maximum = score;
+                if (score > peak) peak = score;
             }
-            float sum = 0.0f;
-            for (uint32_t index = 0; index < count; index++) {
-                scores[index] = cuda_salt_expf(
-                    __fadd_rn(scores[index], -maximum));
-                sum = __fadd_rn(sum, scores[index]);
-            }
-            denominator = sum;
-            score_count = (!(sum > 0.0f) || !isfinite(sum))
-                ? -1 : (int)count;
+            maximum = peak;
+            score_count = (int)count;
         }
+        if (score_count < 0) cuda_text_fail(status);
+    }
+    __syncthreads();
+    if (score_count < 0) return;
+    for (uint32_t index = threadIdx.x; index < count;
+         index += blockDim.x)
+        scores[index] = cuda_salt_expf(
+            __fadd_rn(scores[index], -maximum));
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float sum = 0.0f;
+        for (uint32_t index = 0; index < count; index++)
+            sum = __fadd_rn(sum, scores[index]);
+        denominator = sum;
+        score_count = (!(sum > 0.0f) || !isfinite(sum))
+            ? -1 : (int)count;
         if (score_count < 0) cuda_text_fail(status);
     }
     __syncthreads();
@@ -1887,6 +1968,7 @@ __global__ static void cuda_text_attention_reduce_global_exact(
         const float *committed_values, const float *tentative_values,
         uint32_t task_first, uint32_t task_count, uint32_t score_stride,
         float *scores, float *output, int *status) {
+    __shared__ float maximum;
     __shared__ float denominator;
     __shared__ int score_count;
     uint32_t local_task = (uint32_t)blockIdx.x;
@@ -1919,15 +2001,21 @@ __global__ static void cuda_text_attention_reduce_global_exact(
     }
     scores += (size_t)local_task * score_stride;
     if (threadIdx.x == 0) {
-        float maximum = -1.0f / 0.0f;
+        float peak = -1.0f / 0.0f;
+        for (uint32_t index = 0; index < count; index++)
+            if (scores[index] > peak) peak = scores[index];
+        maximum = peak;
+    }
+    __syncthreads();
+    for (uint32_t index = threadIdx.x; index < count;
+         index += blockDim.x)
+        scores[index] = cuda_salt_expf(
+            __fadd_rn(scores[index], -maximum));
+    __syncthreads();
+    if (threadIdx.x == 0) {
         float sum = 0.0f;
         for (uint32_t index = 0; index < count; index++)
-            if (scores[index] > maximum) maximum = scores[index];
-        for (uint32_t index = 0; index < count; index++) {
-            scores[index] = cuda_salt_expf(
-                __fadd_rn(scores[index], -maximum));
             sum = __fadd_rn(sum, scores[index]);
-        }
         denominator = sum;
         score_count = (!(sum > 0.0f) || !isfinite(sum))
             ? -1 : (int)count;
@@ -2156,8 +2244,15 @@ __global__ static void cuda_text_expert_q4(
         const CudaTextTensorRef *experts, uint32_t layer, uint32_t phase,
         const int32_t *selected, const int32_t *grouped_to_canonical,
         uint32_t jobs, uint32_t topk, const float *input,
-        float *output, uint32_t expected_rows, uint32_t expected_cols,
+        float *output, float *paired_up,
+        uint32_t expected_rows, uint32_t expected_cols,
         int *status) {
+    /* Both independent projections use the existing selected-resource table
+     * and canonical seats; their accumulators and reduction order are private. */
+    if (paired_up) {
+        phase = (uint32_t)blockIdx.z;
+        if (phase == 1u) output = paired_up;
+    }
     uint32_t grouped = (uint32_t)blockIdx.y;
     int lane = (int)threadIdx.x & 31;
     int warp = (int)threadIdx.x >> 5;
@@ -2504,15 +2599,20 @@ __global__ static void cuda_q4_heterogeneous_warp_batch(
 
 __global__ static void cuda_q4_heterogeneous_warp(
     const CudaBatchDesc *descriptors, int descriptor_count,
-    const float *x, float *y) {
+    const float *x, float *y, CudaBatchDesc first,
+    CudaBatchDesc second, CudaBatchDesc third) {
     int descriptor_index = (int)blockIdx.z;
     int lane = (int)threadIdx.x & 31;
     int warp = (int)threadIdx.x >> 5;
     int r = (int)blockIdx.x * 4 + warp;
     float acc = 0.0f;
     CudaBatchDesc descriptor = {0};
-    if (descriptor_index < descriptor_count)
-        descriptor = descriptors[descriptor_index];
+    if (descriptor_index < descriptor_count) {
+        if (descriptors) descriptor = descriptors[descriptor_index];
+        else if (descriptor_index == 0) descriptor = first;
+        else if (descriptor_index == 1) descriptor = second;
+        else if (descriptor_index == 2) descriptor = third;
+    }
     if (descriptor_index < descriptor_count && descriptor.batch == 1 &&
         r < descriptor.rows) {
         const float *input = x + descriptor.input_offset;
@@ -2744,6 +2844,7 @@ extern "C" int salt_gpu_init(void) {
     cuda_q4_hetero_completion_fences = 0;
     cuda_peak_window_bytes = 0;
     cuda_selected_retirement_fenced = 0;
+    cuda_text_resource_fence_credit = 0;
 
     cuda_tensor_count = 0;
     cuda_ready = 1;
@@ -2772,10 +2873,7 @@ extern "C" int salt_gpu_free(void) {
         failed = 1;
     if (cuda_y && cuda_success(cudaFree(cuda_y), "cudaFree output") != 0)
         failed = 1;
-    if (cuda_attention_kv &&
-        cuda_success(cudaFree(cuda_attention_kv),
-                     "cudaFree attention KV") != 0)
-        failed = 1;
+    /* Attention borrows the initialized shared KV seat; its owner frees it. */
     if (cuda_attention_status &&
         cuda_success(cudaFree(cuda_attention_status),
                      "cudaFree attention status") != 0)
@@ -2815,6 +2913,7 @@ extern "C" int salt_gpu_free(void) {
     cuda_selected_capacity = 0;
     cuda_selected_logical_capacity = 0;
     cuda_selected_retirement_fenced = 0;
+    cuda_text_resource_fence_credit = 0;
     if (cuda_nvfp4_event_d2h &&
         cuda_success(cudaEventDestroy(cuda_nvfp4_event_d2h),
                      "cudaEventDestroy NVFP4 D2H") != 0)
@@ -3763,7 +3862,8 @@ static int cuda_run_heterogeneous_q4(
         cuda_q4_heterogeneous_warp<<<
             dim3((unsigned int)((max_rows + 3) / 4), 1u,
                  (unsigned int)descriptor_count), 128>>>(
-            cuda_device_desc, descriptor_count, cuda_x, cuda_y);
+            cuda_device_desc, descriptor_count, cuda_x, cuda_y,
+            CudaBatchDesc{}, CudaBatchDesc{}, CudaBatchDesc{});
     else if (descriptor_count <= 3)
         cuda_q4_heterogeneous_warp_batch<<<
             dim3((unsigned int)max_rows, (unsigned int)max_warp_groups,
@@ -4038,9 +4138,8 @@ extern "C" int salt_gpu_shared_buffer_free(SaltGpuSharedBuffer *buffer) {
                      "cudaDeviceSynchronize shared free") != 0)
         return -1;
     if (buffer->contents == cuda_attention_kv_host) {
-        if (!cuda_attention_kv || buffer->nbytes != cuda_attention_kv_nbytes ||
-            cuda_success(cudaFree(cuda_attention_kv),
-                         "cudaFree attention KV shared owner") != 0)
+        if (buffer->backend != cuda_attention_kv ||
+            buffer->nbytes != cuda_attention_kv_nbytes)
             return -1;
         cuda_attention_kv = NULL;
         cuda_attention_kv_nbytes = 0;
@@ -4072,15 +4171,10 @@ extern "C" int salt_gpu_attention_prepare(const SaltGpuSharedBuffer *kv) {
         return -1;
     if (cuda_attention_kv)
         return cuda_attention_kv_host == kv->contents &&
+               cuda_attention_kv == kv->backend &&
                cuda_attention_kv_nbytes == kv->nbytes ? 0 : -1;
-    if (cuda_success(cudaMalloc((void **)&cuda_attention_kv, kv->nbytes),
-                     "cudaMalloc attention KV") != 0 ||
-        cuda_success(cudaMemset(cuda_attention_kv, 0, kv->nbytes),
-                     "cudaMemset attention KV") != 0) {
-        if (cuda_attention_kv) cudaFree(cuda_attention_kv);
-        cuda_attention_kv = NULL;
-        return -1;
-    }
+    /* Same canonical storage as CPU and compiled text execution. */
+    cuda_attention_kv = (float *)kv->backend;
     cuda_attention_kv_host = kv->contents;
     cuda_attention_kv_nbytes = kv->nbytes;
     cuda_attention_kv_sync_count = 0;
@@ -4091,11 +4185,21 @@ extern "C" int salt_gpu_attention_prepare(const SaltGpuSharedBuffer *kv) {
 
 static CudaAttentionKvSync *cuda_attention_sync_slot(
     size_t key_offset, size_t value_offset, int kv_stride) {
-    if (kv_stride < 1) return NULL;
+    size_t row_capacity;
+    if (kv_stride < 1 || value_offset <= key_offset ||
+        (value_offset - key_offset) % (size_t)kv_stride != 0)
+        return NULL;
+    row_capacity = (value_offset - key_offset) / (size_t)kv_stride;
+    if (row_capacity == 0 || row_capacity > (size_t)INT_MAX ||
+        value_offset > cuda_attention_kv_nbytes / sizeof(float) ||
+        value_offset - key_offset >
+            cuda_attention_kv_nbytes / sizeof(float) - value_offset)
+        return NULL;
     for (int i = 0; i < cuda_attention_kv_sync_count; i++)
         if (cuda_attention_kv_sync[i].key_offset == key_offset &&
             cuda_attention_kv_sync[i].value_offset == value_offset)
-            return cuda_attention_kv_sync[i].kv_stride == kv_stride
+            return cuda_attention_kv_sync[i].kv_stride == kv_stride &&
+                   cuda_attention_kv_sync[i].row_capacity == row_capacity
                 ? &cuda_attention_kv_sync[i] : NULL;
     if (cuda_attention_kv_sync_count >=
             (int)(sizeof cuda_attention_kv_sync /
@@ -4105,6 +4209,7 @@ static CudaAttentionKvSync *cuda_attention_sync_slot(
         &cuda_attention_kv_sync[cuda_attention_kv_sync_count++];
     sync->key_offset = key_offset;
     sync->value_offset = value_offset;
+    sync->row_capacity = row_capacity;
     sync->kv_stride = kv_stride;
     sync->device_positions = 0;
     sync->host_positions = 0;
@@ -4123,12 +4228,15 @@ static int cuda_attention_state_range(
         int position, size_t *offset_count) {
     size_t capacity, count;
     if (!kv || !sync || !offset_count || kv->contents != cuda_attention_kv_host ||
+        kv->backend != cuda_attention_kv ||
         kv->nbytes != cuda_attention_kv_nbytes || position < 0 ||
-        sync->kv_stride < 1 ||
-        (size_t)position > SIZE_MAX / (size_t)sync->kv_stride)
+        sync->kv_stride < 1 || sync->row_capacity == 0)
         return -1;
     capacity = kv->nbytes / sizeof(float);
-    count = (size_t)position * (size_t)sync->kv_stride;
+    count = (size_t)position < sync->row_capacity
+        ? (size_t)position : sync->row_capacity;
+    if (count > SIZE_MAX / (size_t)sync->kv_stride) return -1;
+    count *= (size_t)sync->kv_stride;
     if (sync->key_offset > capacity || count > capacity - sync->key_offset ||
         sync->value_offset > capacity || count > capacity - sync->value_offset)
         return -1;
@@ -4138,78 +4246,42 @@ static int cuda_attention_state_range(
 
 extern "C" int salt_gpu_attention_materialize(
         SaltGpuSharedBuffer *kv, int position, uint64_t *copied_bytes) {
-    uint64_t total = 0;
     if (copied_bytes) *copied_bytes = 0;
     if (!cuda_ready || !kv || !copied_bytes || position < 0 ||
-        cuda_attention_kv_sync_count < 1)
+        cuda_attention_kv_sync_count < 1 ||
+        cuda_success(cudaDeviceSynchronize(),
+                     "cudaDeviceSynchronize shared KV materialize") != 0)
         return -1;
     for (int i = 0; i < cuda_attention_kv_sync_count; i++) {
         CudaAttentionKvSync *sync = &cuda_attention_kv_sync[i];
-        size_t count, device_count, delta, start;
-        int device_position = position < sync->device_positions
-            ? position : sync->device_positions;
-        if (cuda_attention_state_range(kv, sync, position, &count) != 0 ||
-            (size_t)device_position > SIZE_MAX / (size_t)sync->kv_stride)
+        size_t count;
+        if (cuda_attention_state_range(kv, sync, position, &count) != 0)
             return -1;
-        device_count = (size_t)device_position * (size_t)sync->kv_stride;
-        if (sync->host_positions > device_position)
-            start = device_count;
-        else
-            start = (size_t)sync->host_positions * (size_t)sync->kv_stride;
-        delta = device_count - start;
-        if (delta &&
-            (cuda_success(cudaMemcpy(
-                (float *)kv->contents + sync->key_offset + start,
-                cuda_attention_kv + sync->key_offset + start,
-                delta * sizeof(float), cudaMemcpyDeviceToHost),
-                "cudaMemcpy materialize KV keys") != 0 ||
-             cuda_success(cudaMemcpy(
-                (float *)kv->contents + sync->value_offset + start,
-                cuda_attention_kv + sync->value_offset + start,
-                delta * sizeof(float), cudaMemcpyDeviceToHost),
-                "cudaMemcpy materialize KV values") != 0))
-            return -1;
-        if ((uint64_t)delta > (UINT64_MAX - total) / (2u * sizeof(float)))
-            return -1;
-        total += (uint64_t)delta * 2u * sizeof(float);
+        /* CPU and both GPU executors already share the canonical rows. */
+        sync->device_positions = position;
         sync->host_positions = position;
     }
     memset(&cuda_attention_stage, 0, sizeof cuda_attention_stage);
-    *copied_bytes = total;
     return 0;
 }
 
 extern "C" int salt_gpu_attention_import(
         SaltGpuSharedBuffer *kv, int position, uint64_t *copied_bytes) {
-    uint64_t total = 0;
     if (copied_bytes) *copied_bytes = 0;
     if (!cuda_ready || !kv || !copied_bytes || position < 0 ||
-        cuda_attention_kv_sync_count < 1)
+        cuda_attention_kv_sync_count < 1 ||
+        cuda_success(cudaDeviceSynchronize(),
+                     "cudaDeviceSynchronize shared KV import") != 0)
         return -1;
     for (int i = 0; i < cuda_attention_kv_sync_count; i++) {
         CudaAttentionKvSync *sync = &cuda_attention_kv_sync[i];
         size_t count;
-        if (cuda_attention_state_range(kv, sync, position, &count) != 0 ||
-            (count &&
-             (cuda_success(cudaMemcpy(
-                cuda_attention_kv + sync->key_offset,
-                (float *)kv->contents + sync->key_offset,
-                count * sizeof(float), cudaMemcpyHostToDevice),
-                "cudaMemcpy import KV keys") != 0 ||
-              cuda_success(cudaMemcpy(
-                cuda_attention_kv + sync->value_offset,
-                (float *)kv->contents + sync->value_offset,
-                count * sizeof(float), cudaMemcpyHostToDevice),
-                "cudaMemcpy import KV values") != 0)))
+        if (cuda_attention_state_range(kv, sync, position, &count) != 0)
             return -1;
-        if ((uint64_t)count > (UINT64_MAX - total) / (2u * sizeof(float)))
-            return -1;
-        total += (uint64_t)count * 2u * sizeof(float);
         sync->device_positions = position;
         sync->host_positions = position;
     }
     memset(&cuda_attention_stage, 0, sizeof cuda_attention_stage);
-    *copied_bytes = total;
     return 0;
 }
 
@@ -4243,7 +4315,8 @@ extern "C" int salt_gpu_attention_transform(
     CudaAttentionKvSync *sync;
     uint64_t query_count, new_kv_count, cache_count, factor_count;
     uint64_t metadata_offset, metadata_count;
-    int copy_start;
+    size_t cache_rows;
+    int deferred_publish;
     memset(&cuda_attention_stage, 0, sizeof cuda_attention_stage);
     if (!cuda_ready || n_heads < 1 || n_kv_heads < 1 ||
         n_heads % n_kv_heads != 0 || head_dim < 2 || head_dim > 512 ||
@@ -4256,8 +4329,16 @@ extern "C" int salt_gpu_attention_transform(
         return -1;
     query_count = (uint64_t)(uint32_t)batch * (uint32_t)query_stride;
     new_kv_count = (uint64_t)(uint32_t)batch * (uint32_t)kv_stride;
-    cache_count = (uint64_t)(uint32_t)(start_position + batch) *
-        (uint32_t)kv_stride;
+    sync = cuda_attention_sync_slot(
+        key_cache_float_offset, value_cache_float_offset, kv_stride);
+    if (!sync) return -1;
+    /* Any multirow overwrite after ring population can destroy history still
+     * needed by an earlier query, even without crossing physical index zero. */
+    deferred_publish = batch > 1 &&
+        (size_t)(start_position + batch) > sync->row_capacity;
+    cache_rows = (size_t)(start_position + batch) < sync->row_capacity
+        ? (size_t)(start_position + batch) : sync->row_capacity;
+    cache_count = (uint64_t)cache_rows * (uint32_t)kv_stride;
     factor_count = (uint64_t)(uint32_t)batch * (uint32_t)rope_pairs;
     metadata_offset = query_count;
     metadata_count = 2u * (uint32_t)head_dim + 2u * factor_count;
@@ -4279,29 +4360,8 @@ extern "C" int salt_gpu_attention_transform(
         cuda_shared_host_float_range(kv, value_cache_float_offset,
             (size_t)cache_count, &host_value_cache) != 0)
         return -1;
-    sync = cuda_attention_sync_slot(
-        key_cache_float_offset, value_cache_float_offset, kv_stride);
-    if (!sync) return -1;
-    copy_start = start_position < sync->device_positions
-        ? 0 : sync->device_positions;
-    if (copy_start < start_position &&
-        (cuda_success(cudaMemcpy(
-            cuda_attention_kv + key_cache_float_offset +
-                (size_t)copy_start * (size_t)kv_stride,
-            host_key_cache + (size_t)copy_start * (size_t)kv_stride,
-            (size_t)(start_position - copy_start) * (size_t)kv_stride *
-                sizeof(float), cudaMemcpyHostToDevice),
-            "cudaMemcpy transform prefix keys") != 0 ||
-         cuda_success(cudaMemcpy(
-            cuda_attention_kv + value_cache_float_offset +
-                (size_t)copy_start * (size_t)kv_stride,
-            host_value_cache + (size_t)copy_start * (size_t)kv_stride,
-            (size_t)(start_position - copy_start) * (size_t)kv_stride *
-                sizeof(float), cudaMemcpyHostToDevice),
-            "cudaMemcpy transform prefix values") != 0))
-        return -1;
-    if (copy_start < start_position)
-        sync->host_positions = start_position;
+    /* Prefix rows are already in the shared seat, including CPU-written rows. */
+    sync->host_positions = start_position;
     float *device_q_weight = cuda_x + metadata_offset;
     float *device_k_weight = device_q_weight + head_dim;
     float *device_cosines = device_k_weight + head_dim;
@@ -4334,7 +4394,8 @@ extern "C" int salt_gpu_attention_transform(
         (uint32_t)(n_heads + 2 * n_kv_heads));
     cuda_attention_transform_exact<<<tasks, 256>>>(
         n_heads, n_kv_heads, head_dim, rope_dim, start_position, batch,
-        query_stride, kv_stride, eps, cuda_x, cuda_y,
+        query_stride, kv_stride, (int)sync->row_capacity,
+        !deferred_publish, eps, cuda_x, cuda_y,
         cuda_y + new_kv_count, device_q_weight, device_k_weight,
         device_cosines, device_sines, rope_pairs,
         cuda_attention_kv + key_cache_float_offset,
@@ -4357,6 +4418,7 @@ extern "C" int salt_gpu_attention_transform(
     cuda_attention_stage.batch = batch;
     cuda_attention_stage.query_stride = query_stride;
     cuda_attention_stage.kv_stride = kv_stride;
+    cuda_attention_stage.deferred_publish = deferred_publish;
     cuda_attention_stage.valid = 1;
     return 0;
 }
@@ -4371,9 +4433,9 @@ extern "C" int salt_gpu_attention_batch(
     float *host_queries, *host_keys, *host_values, *host_outputs;
     uint64_t query_count, kv_count, output_count, tasks, new_kv_count;
     CudaAttentionKvSync *sync = NULL;
-    int copy_start, staged;
+    int staged, deferred_publish;
     int failure = 0;
-    size_t score_bytes;
+    size_t kv_rows, score_rows, score_bytes;
     if (!cuda_ready || (full_attention != 0 && full_attention != 1) ||
         n_heads < 1 || n_kv_heads < 1 || n_heads % n_kv_heads != 0 ||
         head_dim < 1 || head_dim > 512 || (!full_attention && window < 1) ||
@@ -4384,8 +4446,16 @@ extern "C" int salt_gpu_attention_batch(
         return -1;
     tasks = (uint64_t)(uint32_t)batch * (uint32_t)n_heads;
     query_count = (uint64_t)(uint32_t)batch * (uint32_t)query_stride;
-    kv_count = (uint64_t)(uint32_t)(start_position + batch) *
-        (uint32_t)kv_stride;
+    new_kv_count = (uint64_t)(uint32_t)batch * (uint32_t)kv_stride;
+    sync = cuda_attention_sync_slot(
+        key_float_offset, value_float_offset, kv_stride);
+    if (!sync ||
+        (full_attention && (size_t)(start_position + batch) > sync->row_capacity) ||
+        (!full_attention && (size_t)window > sync->row_capacity))
+        return -1;
+    kv_rows = (size_t)(start_position + batch) < sync->row_capacity
+        ? (size_t)(start_position + batch) : sync->row_capacity;
+    kv_count = (uint64_t)kv_rows * (uint32_t)kv_stride;
     staged = cuda_attention_stage.valid &&
         cuda_attention_stage.query_host == queries->contents &&
         cuda_attention_stage.query_offset == query_float_offset &&
@@ -4395,23 +4465,21 @@ extern "C" int salt_gpu_attention_batch(
         cuda_attention_stage.batch == batch &&
         cuda_attention_stage.query_stride == query_stride &&
         cuda_attention_stage.kv_stride == kv_stride;
+    deferred_publish = staged && cuda_attention_stage.deferred_publish;
     cuda_attention_stage.valid = 0;
-    sync = cuda_attention_sync_slot(
-        key_float_offset, value_float_offset, kv_stride);
-    if (!sync) return -1;
-    copy_start = start_position < sync->device_positions
-        ? 0 : sync->device_positions;
-    new_kv_count =
-        (uint64_t)(uint32_t)(start_position + batch - copy_start) *
-        (uint32_t)kv_stride;
     output_count = query_count;
-    if (tasks > UINT32_MAX || query_count > SIZE_MAX || kv_count > SIZE_MAX ||
-        new_kv_count > SIZE_MAX || output_count > SIZE_MAX ||
+    if ((!staged && batch > 1 &&
+         (size_t)(start_position + batch) > sync->row_capacity) ||
+        tasks > UINT32_MAX || query_count > SIZE_MAX || kv_count > SIZE_MAX ||
+        new_kv_count > CUDA_MAX_OUTPUTS / 2u || output_count > SIZE_MAX ||
         query_count > CUDA_MAX_OUTPUTS || output_count > CUDA_MAX_OUTPUTS ||
         (size_t)(start_position + batch) > SIZE_MAX / sizeof(float))
         return -1;
-    score_bytes = (size_t)(start_position + batch) * sizeof(float);
-    if (score_bytes > 48u * 1024u || !cuda_attention_kv ||
+    score_rows = (size_t)(start_position + batch);
+    if (!full_attention && score_rows > (size_t)window)
+        score_rows = (size_t)window;
+    score_bytes = score_rows * sizeof(float);
+    if (!cuda_attention_kv ||
         cuda_attention_kv_host != kv->contents ||
         cuda_attention_kv_nbytes != kv->nbytes ||
         cuda_shared_host_float_range(queries, query_float_offset,
@@ -4423,22 +4491,21 @@ extern "C" int salt_gpu_attention_batch(
         cuda_shared_host_float_range(outputs, output_float_offset,
             (size_t)output_count, &host_outputs) != 0)
         return -1;
+    /* The input seat is startup-owned; the query span remains live for every
+     * score wave. Reject an unrepresentable row before mutating device state. */
+    size_t score_wave = (size_t)tasks;
+    float *global_scores = NULL;
+    if (score_bytes > 48u * 1024u) {
+        if (!full_attention || query_count >= CUDA_MAX_OUTPUTS ||
+            score_rows > (CUDA_MAX_OUTPUTS - (size_t)query_count))
+            return -1;
+        global_scores = cuda_x + query_count;
+        score_wave = (CUDA_MAX_OUTPUTS - (size_t)query_count) / score_rows;
+    }
     if (!staged &&
-        (cuda_success(cudaMemcpy(cuda_x, host_queries,
+        cuda_success(cudaMemcpy(cuda_x, host_queries,
             (size_t)query_count * sizeof(float), cudaMemcpyHostToDevice),
-            "cudaMemcpy attention queries") != 0 ||
-         cuda_success(cudaMemcpy(
-            cuda_attention_kv + key_float_offset +
-                (size_t)copy_start * (size_t)kv_stride,
-            host_keys + (size_t)copy_start * (size_t)kv_stride,
-            (size_t)new_kv_count * sizeof(float), cudaMemcpyHostToDevice),
-            "cudaMemcpy attention keys") != 0 ||
-         cuda_success(cudaMemcpy(
-            cuda_attention_kv + value_float_offset +
-                (size_t)copy_start * (size_t)kv_stride,
-            host_values + (size_t)copy_start * (size_t)kv_stride,
-            (size_t)new_kv_count * sizeof(float), cudaMemcpyHostToDevice),
-            "cudaMemcpy attention values") != 0))
+            "cudaMemcpy attention queries") != 0)
         return -1;
     if (!staged &&
         cuda_success(cudaMemset(cuda_attention_status, 0, sizeof(int)),
@@ -4447,13 +4514,39 @@ extern "C" int salt_gpu_attention_batch(
     if (!staged)
         sync->host_positions = start_position + batch;
     sync->device_positions = start_position + batch;
-    cuda_attention_exact<<<(unsigned int)tasks, 64, score_bytes>>>(
-        full_attention, n_heads, n_kv_heads, head_dim, window,
-        cuda_x, cuda_attention_kv + key_float_offset,
-        cuda_attention_kv + value_float_offset, start_position, batch,
-        query_stride, kv_stride, cuda_y, cuda_attention_status);
-    if (cuda_success(cudaGetLastError(), "attention launch") != 0 ||
-        cuda_success(cudaMemcpy(host_outputs, cuda_y,
+    /* Larger full-attention contexts use the unused tail of the input seat
+     * allocated at startup. Each wave owns disjoint score rows and writes the
+     * same canonical output as the shared-memory path; no scores are truncated. */
+    for (uint64_t first = 0; first < tasks; first += score_wave) {
+        unsigned int wave = (unsigned int)((tasks - first) < score_wave
+            ? (tasks - first) : score_wave);
+        cuda_attention_exact<<<wave, 256, global_scores ? 0 : score_bytes>>>(
+            full_attention, n_heads, n_kv_heads, head_dim, window,
+            cuda_x, cuda_attention_kv + key_float_offset,
+            cuda_attention_kv + value_float_offset, start_position, batch,
+            query_stride, kv_stride, (int)sync->row_capacity,
+            deferred_publish ? cuda_y : NULL,
+            deferred_publish ? cuda_y + new_kv_count : NULL,
+            start_position, deferred_publish ? batch : 0,
+            deferred_publish ? cuda_x : cuda_y, cuda_attention_status,
+            global_scores, score_rows, (uint32_t)first);
+        if (cuda_success(cudaGetLastError(), "attention launch") != 0)
+            return -1;
+    }
+    if (deferred_publish) {
+        cuda_attention_publish_exact<<<
+            (unsigned int)((new_kv_count + 255u) / 256u), 256>>>(
+            cuda_y, cuda_y + new_kv_count,
+            cuda_attention_kv + key_float_offset,
+            cuda_attention_kv + value_float_offset,
+            start_position, batch, kv_stride, (int)sync->row_capacity,
+            cuda_attention_status);
+        if (cuda_success(cudaGetLastError(),
+                "attention ring publish launch") != 0)
+            return -1;
+    }
+    if (cuda_success(cudaMemcpy(host_outputs,
+                                deferred_publish ? cuda_x : cuda_y,
                                 (size_t)output_count * sizeof(float),
                                 cudaMemcpyDeviceToHost),
                      "cudaMemcpy attention output") != 0 ||
@@ -4461,6 +4554,7 @@ extern "C" int salt_gpu_attention_batch(
                                 cudaMemcpyDeviceToHost),
                      "cudaMemcpy attention status") != 0)
         return -1;
+    if (!failure) sync->host_positions = sync->device_positions;
     return failure ? -1 : 0;
 }
 
@@ -4498,12 +4592,13 @@ static int cuda_moe_descriptor(const uint32_t *vals,
         boff = tensor->bias_offset;
     } else {
         uintptr_t payload_base, payload_end, v, s, b, identity;
-        if (!cuda_pageable_mmap || !cuda_selected_resources ||
+        if (!cuda_selected_resources ||
             !cuda_selected_logical_slots || expected_slot < 0 ||
             expected_slot >= cuda_selected_capacity)
             return -1;
         selected = &cuda_selected_resources[expected_slot];
-        if (!selected->active || selected->logical_resource_id >=
+        if (!selected->active || !selected->device_payload ||
+            selected->logical_resource_id >=
                 (uint64_t)(uint32_t)cuda_selected_logical_capacity ||
             selected->logical_resource_id != expected_logical_resource_id ||
             cuda_selected_logical_slots[selected->logical_resource_id] !=
@@ -4526,7 +4621,7 @@ static int cuda_moe_descriptor(const uint32_t *vals,
         boff = (uint64_t)(b - payload_base);
     }
     memset(descriptor, 0, sizeof *descriptor);
-    descriptor->resource = selected ? selected->payload : resource->device;
+    descriptor->resource = selected ? selected->device_payload : resource->device;
     descriptor->value_offset = voff;
     descriptor->scale_offset = soff;
     descriptor->bias_offset = boff;
@@ -4725,7 +4820,7 @@ extern "C" int salt_gpu_q4_moe_chain_selected(
 
 extern "C" int salt_gpu_selected_resources_prepare(
     int capacity, int logical_capacity) {
-    if (!cuda_ready || !cuda_pageable_mmap || capacity < 1 ||
+    if (!cuda_ready || capacity < 1 ||
         logical_capacity < 1 || logical_capacity > INT_MAX)
         return -1;
     if (cuda_selected_resources)
@@ -4753,8 +4848,9 @@ extern "C" int salt_gpu_selected_resource_bind(
     int slot, uint64_t logical_resource_id, const void *base, size_t nbytes,
     const void *payload) {
     CudaSelectedResource *resource;
+    const unsigned char *device_payload;
     uintptr_t b, p;
-    if (!cuda_ready || !cuda_pageable_mmap || !cuda_selected_resources ||
+    if (!cuda_ready || !cuda_selected_resources ||
         !cuda_selected_logical_slots || slot < 0 ||
         slot >= cuda_selected_capacity || logical_resource_id >=
             (uint64_t)(uint32_t)cuda_selected_logical_capacity ||
@@ -4763,11 +4859,30 @@ extern "C" int salt_gpu_selected_resource_bind(
     b = (uintptr_t)base;
     p = (uintptr_t)payload;
     if (nbytes > UINTPTR_MAX - b || p < b || p - b >= nbytes) return -1;
+    device_payload = (const unsigned char *)payload;
+    if (!cuda_pageable_mmap) {
+        CudaResource *pool = cuda_resource(SALT_GPU_RESOURCE_EXPERT_LAYER, 15);
+        uintptr_t host, device;
+        size_t offset;
+        if (!pool || !pool->active || !pool->registered || !pool->device ||
+            pool->policy != SALT_GPU_WEIGHT_ADDRESS_REGISTERED_PERSISTENT ||
+            !pool->host)
+            return -1;
+        host = (uintptr_t)(const void *)pool->host;
+        device = (uintptr_t)(void *)pool->device;
+        if (p < host || p - host > pool->nbytes ||
+            nbytes > pool->nbytes - (size_t)(p - host) ||
+            device > UINTPTR_MAX - (p - host))
+            return -1;
+        offset = (size_t)(p - host);
+        device_payload = (const unsigned char *)(void *)(device + offset);
+    }
     resource = &cuda_selected_resources[slot];
     if (resource->active)
         return resource->logical_resource_id == logical_resource_id &&
             resource->base == (const unsigned char *)base &&
             resource->payload == (const unsigned char *)payload &&
+            resource->device_payload == device_payload &&
             resource->nbytes == nbytes &&
             cuda_selected_logical_slots[logical_resource_id] == slot ? 0 : -1;
     if (cuda_selected_logical_slots[logical_resource_id] != -1) return -1;
@@ -4775,6 +4890,7 @@ extern "C" int salt_gpu_selected_resource_bind(
     resource->logical_resource_id = logical_resource_id;
     resource->base = (const unsigned char *)base;
     resource->payload = (const unsigned char *)payload;
+    resource->device_payload = device_payload;
     resource->nbytes = nbytes;
     cuda_selected_logical_slots[logical_resource_id] = slot;
     cuda_selected_retirement_fenced = 0;
@@ -4790,10 +4906,14 @@ extern "C" int salt_gpu_selected_resource_bind_resident(
 }
 
 extern "C" int salt_gpu_selected_resources_fence(void) {
-    if (!cuda_ready || !cuda_selected_resources ||
-        cuda_success(cudaDeviceSynchronize(),
-            "cudaDeviceSynchronize selected retirement batch") != 0)
+    if (!cuda_ready || !cuda_selected_resources)
         return -1;
+    if (cuda_text_resource_fence_credit) {
+        cuda_text_resource_fence_credit = 0;
+    } else if (cuda_success(cudaDeviceSynchronize(),
+            "cudaDeviceSynchronize selected retirement batch") != 0) {
+        return -1;
+    }
     cuda_selected_retirement_fenced = 1;
     return 0;
 }
@@ -5065,6 +5185,120 @@ static int cuda_text_realize_optional(
     return cuda_text_realize_tensor(program, tensor, ref);
 }
 
+typedef struct CudaTextBootSamples {
+    uint64_t offset[3], nbytes[3];
+    unsigned char first[3], middle[3], last[3];
+} CudaTextBootSamples;
+
+/* One startup-only device dereference of the already-realized address book.
+ * The counter lives in the program's existing attention workspace; no weight
+ * registration, residency action or inference state is involved. */
+__global__ static void cuda_text_boot_check_kernel(
+        const unsigned char *resource, CudaTextBootSamples samples,
+        unsigned int *mismatches) {
+    unsigned int part = threadIdx.x;
+    if (part >= 3u || !samples.nbytes[part]) return;
+    const unsigned char *bytes = resource + samples.offset[part];
+    uint64_t last = samples.nbytes[part] - 1u;
+    if (bytes[0] != samples.first[part] ||
+        bytes[samples.nbytes[part] / 2u] != samples.middle[part] ||
+        bytes[last] != samples.last[part])
+        atomicAdd(mismatches, 1u);
+}
+
+static int cuda_text_boot_check_tensor(CudaTextProgramState *state,
+        const SaltTextVerifyProgram *program, const SaltTextTensorDesc *tensor,
+        const CudaTextTensorRef *ref, unsigned int *parts) {
+    const SaltTensorResourceSpec *spec;
+    CudaTextBootSamples samples = {};
+    const uint64_t offsets[3] = {tensor->storage.value_offset,
+        tensor->storage.scale_offset, tensor->storage.bias_offset};
+    const uint64_t sizes[3] = {tensor->storage.value_bytes,
+        tensor->storage.scale_bytes, tensor->storage.bias_bytes};
+    if (salt_tensor_desc_absent(tensor)) return 0;
+    if (tensor->storage.source_class == SALT_TENSOR_SOURCE_SELECTED)
+        return 0; /* A selected slot has no payload until the router asks. */
+    if (!ref->resource ||
+        !(spec = cuda_text_resource_spec(program, &tensor->storage)) ||
+        !spec->base || spec->mapped_nbytes < spec->nbytes ||
+        ref->resource != cuda_text_resource_device(program, &tensor->storage))
+        return -1;
+    for (unsigned int part = 0; part < 3u; part++) {
+        uint64_t offset = offsets[part], size = sizes[part];
+        if (!size) continue;
+        if (offset > spec->nbytes || size > spec->nbytes - offset ||
+            offset > spec->mapped_nbytes ||
+            size > spec->mapped_nbytes - offset)
+            return -1;
+        const unsigned char *expected =
+            (const unsigned char *)spec->base + (size_t)offset;
+        samples.offset[part] = offset;
+        samples.nbytes[part] = size;
+        samples.first[part] = expected[0];
+        samples.middle[part] = expected[(size_t)(size / 2u)];
+        samples.last[part] = expected[(size_t)(size - 1u)];
+        ++*parts;
+    }
+    cuda_text_boot_check_kernel<<<1, 32, 0, state->stream>>>(
+        ref->resource, samples,
+        (unsigned int *)(void *)state->attention_score_workspace);
+    if (cuda_success(cudaGetLastError(), "CUDA trunk boot check launch") != 0)
+        return -1;
+    return 1;
+}
+
+static int cuda_text_boot_check_program(CudaTextProgramState *state,
+        const SaltTextVerifyProgram *program) {
+    unsigned int tensors = 0, parts = 0, mismatches = 0;
+    if (!cuda_pageable_mmap) return 0;
+    if (!state->stream || !state->attention_score_workspace ||
+        !state->attention_score_workspace_floats ||
+        cuda_success(cudaMemsetAsync(state->attention_score_workspace, 0,
+            sizeof(unsigned int), state->stream),
+            "CUDA trunk boot check reset") != 0)
+        return -1;
+#define BOOT_CHECK(tensor, ref) do { \
+    int check = cuda_text_boot_check_tensor(state, program, (tensor), (ref), \
+        &parts); \
+    if (check < 0) return -1; \
+    tensors += (unsigned int)check; \
+} while (0)
+    BOOT_CHECK(&program->descriptor->embedding, &state->embedding);
+    BOOT_CHECK(&program->descriptor->final_norm, &state->final_norm);
+    BOOT_CHECK(&program->descriptor->output_head, &state->output_head);
+    for (uint32_t layer = 0; layer < program->layer_count; layer++) {
+        const SaltTextLayerExecDesc *source = program->layers[layer].descriptor;
+        const CudaTextLayerRefs *target = &state->layers[layer];
+        if (!source) return -1;
+#define CHECK(field) BOOT_CHECK(&source->field, &target->field)
+        CHECK(q); CHECK(k); CHECK(v); CHECK(o);
+        CHECK(dense_gate); CHECK(dense_up); CHECK(dense_down);
+        CHECK(router); CHECK(pre_attention_norm); CHECK(q_norm);
+        CHECK(k_norm); CHECK(post_attention_norm);
+        CHECK(pre_ffn_norm_1); CHECK(pre_ffn_norm_2);
+        CHECK(post_ffn_norm_1); CHECK(post_ffn_norm_2);
+        CHECK(post_ffn_norm); CHECK(router_scale);
+        CHECK(per_expert_scale); CHECK(layer_scalar);
+#undef CHECK
+    }
+#undef BOOT_CHECK
+    if (!tensors || !parts ||
+        cuda_success(cudaMemcpyAsync(&mismatches,
+            state->attention_score_workspace, sizeof mismatches,
+            cudaMemcpyDeviceToHost, state->stream),
+            "CUDA trunk boot check readback") != 0 ||
+        cuda_success(cudaStreamSynchronize(state->stream),
+            "CUDA trunk boot check fence") != 0 || mismatches) {
+        fprintf(stderr, "CUDA_TRUNK_BOOT_ADDRESS_CHECK status=FAIL "
+            "tensors=%u parts=%u mismatches=%u\n",
+            tensors, parts, mismatches);
+        return -1;
+    }
+    fprintf(stderr, "CUDA_TRUNK_BOOT_ADDRESS_CHECK status=PASS "
+        "tensors=%u parts=%u mismatches=0\n", tensors, parts);
+    return 0;
+}
+
 static int cuda_text_expert_spec(const SaltTextVerifyProgram *program,
         uint32_t layer, uint32_t expert) {
     const SaltTextLayerExecDesc *source;
@@ -5116,7 +5350,7 @@ static int cuda_text_selected_refs(const SaltTextVerifyProgram *program,
     const CudaSelectedResource *selected;
     uint64_t logical, origin;
     uintptr_t base, payload;
-    if (!cuda_pageable_mmap || !refs ||
+    if (!refs ||
         cuda_text_expert_spec(program, layer, expert) != 0 ||
         !cuda_selected_resources || !cuda_selected_logical_slots ||
         slot < 0 || slot >= cuda_selected_capacity)
@@ -5131,7 +5365,8 @@ static int cuda_text_selected_refs(const SaltTextVerifyProgram *program,
     origin = entry->gate.storage.value_offset;
     base = (uintptr_t)(const void *)selected->base;
     payload = (uintptr_t)(const void *)selected->payload;
-    if (!resource || !selected->active || !base || !payload ||
+    if (!resource || !selected->active || !selected->device_payload ||
+        !base || !payload ||
         logical >= (uint64_t)(uint32_t)cuda_selected_logical_capacity ||
         selected->logical_resource_id != logical ||
         cuda_selected_logical_slots[logical] != slot ||
@@ -5163,13 +5398,13 @@ static int cuda_text_selected_refs(const SaltTextVerifyProgram *program,
                     (size_t)(storage->bias_offset - origin)), values,
                 (int)tensors[phase]->rows, (int)tensors[phase]->cols, 1,
                 slot, logical, 1, 0u, 0u, &descriptor) != 0 ||
-            descriptor.resource != selected->payload ||
+            descriptor.resource != selected->device_payload ||
             descriptor.value_offset != storage->value_offset - origin ||
             descriptor.scale_offset != storage->scale_offset - origin ||
             descriptor.bias_offset != storage->bias_offset - origin)
             return -1;
         memset(&refs[phase], 0, sizeof refs[phase]);
-        refs[phase].resource = selected->payload;
+        refs[phase].resource = selected->device_payload;
         refs[phase].value_offset = storage->value_offset - origin;
         refs[phase].scale_offset = storage->scale_offset - origin;
         refs[phase].bias_offset = storage->bias_offset - origin;
@@ -5178,6 +5413,29 @@ static int cuda_text_selected_refs(const SaltTextVerifyProgram *program,
         refs[phase].encoding = (uint32_t)storage->encoding;
     }
     return 0;
+}
+
+static int cuda_text_selected_address_book_realize(
+        CudaTextProgramState *state,
+        const SaltTextVerifyProgram *program) {
+    const uint32_t logical_count = CUDA_TEXT_LAYERS * CUDA_TEXT_EXPERTS;
+    if (!state || !program ||
+        !cuda_selected_resources || !cuda_selected_logical_slots)
+        return 0;
+    if (cuda_selected_capacity != (int)logical_count ||
+        cuda_selected_logical_capacity != (int)logical_count)
+        return 0;
+    for (uint32_t layer = 0; layer < CUDA_TEXT_LAYERS; layer++)
+        for (uint32_t expert = 0; expert < CUDA_TEXT_EXPERTS; expert++) {
+            uint32_t logical = layer * CUDA_TEXT_EXPERTS + expert;
+            int32_t slot = cuda_selected_logical_slots[logical];
+            size_t base = (size_t)logical * 3u;
+            if (slot < 0 ||
+                cuda_text_selected_refs(program, layer, expert, slot,
+                    &state->expert_refs[base]) != 0)
+                return -1;
+        }
+    return 1;
 }
 
 static const float *cuda_text_tensor_f32(const CudaTextTensorRef *ref) {
@@ -5216,6 +5474,89 @@ static int cuda_text_project(
     } else {
         return -1;
     }
+    return cudaGetLastError() == cudaSuccess ? 0 : -1;
+}
+
+/* Existing tensor bindings become by-value command arguments captured by the
+ * existing extent graph.  No table, resource, or activation staging is added. */
+static uint32_t cuda_text_projection_group_size(
+        const CudaTextProgramState *state, uint32_t first_cell) {
+    const SaltTextVerifyProgram *program = state->program;
+    const SaltTextExecutionCell *cells = program->dispatch.cells;
+    const CudaTextTensorRef *refs[3];
+    uint32_t kinds[3], count;
+    if (first_cell >= program->dispatch.cell_count ||
+        cells[first_cell].layer >= program->layer_count) return 0u;
+    const CudaTextLayerRefs *layer =
+        &state->layers[cells[first_cell].layer];
+    if (cells[first_cell].kind == SALT_TEXT_CELL_QUERY_PROJECTION) {
+        count = program->layers[cells[first_cell].layer].descriptor->plan->
+            attention.shared_kv_projection ? 2u : 3u;
+        kinds[0] = SALT_TEXT_CELL_QUERY_PROJECTION;
+        kinds[1] = SALT_TEXT_CELL_KEY_PROJECTION;
+        kinds[2] = SALT_TEXT_CELL_VALUE_PROJECTION;
+        refs[0] = &layer->q; refs[1] = &layer->k; refs[2] = &layer->v;
+    } else if (cells[first_cell].kind == SALT_TEXT_CELL_DENSE_GATE) {
+        count = 2u;
+        kinds[0] = SALT_TEXT_CELL_DENSE_GATE;
+        kinds[1] = SALT_TEXT_CELL_DENSE_UP;
+        refs[0] = &layer->dense_gate; refs[1] = &layer->dense_up;
+    } else return 0u;
+    if (count > program->dispatch.cell_count - first_cell) return 0u;
+    for (uint32_t i = 0; i < count; i++)
+        if ((uint32_t)cells[first_cell + i].kind != kinds[i] ||
+            cells[first_cell + i].layer != cells[first_cell].layer ||
+            refs[i]->encoding != SALT_TENSOR_ENCODING_AFFINE_Q4 ||
+            refs[i]->cols != refs[0]->cols) return 0u;
+    return count;
+}
+
+static int cuda_text_project_group(
+        CudaTextProgramState *state, uint32_t first_cell, uint32_t count) {
+    const SaltTextVerifyProgram *program = state->program;
+    const SaltTextExecutionCell *cell = &program->dispatch.cells[first_cell];
+    const CudaTextLayerRefs *layer = &state->layers[cell->layer];
+    const CudaTextTensorRef *refs[3];
+    CudaBatchDesc descriptors[3] = {};
+    uint32_t max_rows = 0u;
+    uint64_t input_offset = program->layout.normalized;
+    if (count < 2u || count > 3u ||
+        cuda_text_projection_group_size(state, first_cell) != count ||
+        input_offset % sizeof(float) ||
+        input_offset / sizeof(float) > UINT32_MAX) return -1;
+    if (cell->kind == SALT_TEXT_CELL_QUERY_PROJECTION) {
+        refs[0] = &layer->q; refs[1] = &layer->k; refs[2] = &layer->v;
+    } else {
+        refs[0] = &layer->dense_gate; refs[1] = &layer->dense_up;
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        const CudaTextTensorRef *ref = refs[i];
+        uint64_t output_offset = cell[i].destination_offset;
+        if (!ref->resource || !ref->rows || !ref->cols ||
+            ref->rows > INT_MAX || ref->cols > INT_MAX ||
+            input_offset > state->canonical_bytes ||
+            (uint64_t)ref->cols * sizeof(float) >
+                state->canonical_bytes - input_offset ||
+            output_offset % sizeof(float) ||
+            output_offset / sizeof(float) > UINT32_MAX ||
+            output_offset > state->canonical_bytes ||
+            (uint64_t)ref->rows * sizeof(float) >
+                state->canonical_bytes - output_offset) return -1;
+        descriptors[i].resource = ref->resource;
+        descriptors[i].value_offset = ref->value_offset;
+        descriptors[i].scale_offset = ref->scale_offset;
+        descriptors[i].bias_offset = ref->bias_offset;
+        descriptors[i].input_offset = (uint32_t)(input_offset / sizeof(float));
+        descriptors[i].output_offset = (uint32_t)(output_offset / sizeof(float));
+        descriptors[i].rows = (int)ref->rows;
+        descriptors[i].cols = (int)ref->cols;
+        descriptors[i].batch = 1;
+        if (ref->rows > max_rows) max_rows = ref->rows;
+    }
+    cuda_q4_heterogeneous_warp<<<dim3((max_rows + 3u) / 4u, 1u, count),
+        128, 0, state->stream>>>(NULL, (int)count,
+            cuda_text_f32(state, 0u), cuda_text_f32(state, 0u),
+            descriptors[0], descriptors[1], descriptors[2]);
     return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }
 
@@ -5260,6 +5601,9 @@ static int cuda_text_requirements(
     requirements->backend_state_bytes = sizeof(CudaTextProgramState);
     requirements->command_bytes = sizeof(CudaTextProgramCommand);
     requirements->maximum_commands = program->dispatch.cell_count;
+    /* Selected reads remain in flight after expert-down encoding. The next
+     * NEED_RESOURCE wait (or final finish) is the existing release fence. */
+    requirements->flags = SALT_TEXT_GPU_DEFER_EXPERT_RELEASE;
     return 0;
 }
 
@@ -5271,6 +5615,12 @@ static void cuda_text_state_release(CudaTextProgramState *state) {
             (void)cudaGraphExecDestroy(state->graphs[index].executable);
         if (state->graphs[index].graph)
             (void)cudaGraphDestroy(state->graphs[index].graph);
+        for (uint32_t extent = 0; extent < CUDA_TEXT_MAX_EXTENTS; extent++) {
+            CudaTextExtentGraph *entry = &state->extent_graphs[index][extent];
+            if (entry->executable)
+                (void)cudaGraphExecDestroy(entry->executable);
+            if (entry->graph) (void)cudaGraphDestroy(entry->graph);
+        }
     }
     if (state->graph_tokens) (void)cudaFreeHost(state->graph_tokens);
     if (state->graph_parent_rows) (void)cudaFreeHost(state->graph_parent_rows);
@@ -5335,6 +5685,9 @@ static int cuda_text_prepare_templates(
 }
 
 static int cuda_text_capture_graphs(
+    CudaTextProgramState *state, const SaltTextVerifyProgram *program,
+    const SaltTextExecutorPlan *plan);
+static int cuda_text_capture_extent_graphs(
     CudaTextProgramState *state, const SaltTextVerifyProgram *program,
     const SaltTextExecutorPlan *plan);
 
@@ -5412,8 +5765,15 @@ static int cuda_text_prepare(
         (expert_resource->source_class != SALT_TENSOR_SOURCE_SELECTED &&
          expert_resource->source_class != SALT_TENSOR_SOURCE_STATIC))
         goto fail;
-    state->dynamic_experts =
-        expert_resource->source_class == SALT_TENSOR_SOURCE_SELECTED ? 1u : 0u;
+    if (expert_resource->source_class == SALT_TENSOR_SOURCE_SELECTED) {
+        int address_book =
+            cuda_text_selected_address_book_realize(state, program);
+        if (address_book < 0 || (!cuda_pageable_mmap && address_book != 1))
+            goto fail;
+        state->dynamic_experts = address_book == 1 ? 0u : 1u;
+    } else {
+        state->dynamic_experts = 0u;
+    }
     state->canonical_bytes = program->layout.total_bytes;
     if (cuda_text_realize_tensor(program, &program->descriptor->embedding,
             &state->embedding) != 0 ||
@@ -5462,8 +5822,11 @@ static int cuda_text_prepare(
         for (uint32_t expert = 0; expert < source->expert_count; expert++) {
             const SaltTextExpertDesc *entry = &source->experts[expert];
             size_t base = ((size_t)layer * CUDA_TEXT_EXPERTS + expert) * 3u;
-            if (state->dynamic_experts) {
-                if (cuda_text_expert_spec(program, layer, expert) != 0)
+            if (entry->gate.storage.source_class ==
+                    SALT_TENSOR_SOURCE_SELECTED) {
+                if (cuda_text_expert_spec(program, layer, expert) != 0 ||
+                    (!state->dynamic_experts &&
+                     !state->expert_refs[base].resource))
                     goto fail;
                 continue;
             }
@@ -5477,7 +5840,8 @@ static int cuda_text_prepare(
                 goto fail;
         }
     }
-    if (cuda_text_prepare_templates(state, program) != 0 ||
+    if (cuda_text_boot_check_program(state, program) != 0 ||
+        cuda_text_prepare_templates(state, program) != 0 ||
         cuda_success(cudaMalloc((void **)&state->device_experts,
             sizeof state->expert_refs), "cudaMalloc text expert refs") != 0 ||
         cuda_success(cudaMalloc((void **)&state->device_kv,
@@ -5512,9 +5876,13 @@ static int cuda_text_prepare(
             goto fail;
     state->magic = CUDA_TEXT_STATE_MAGIC;
     state->ready = 1;
-    if (!state->dynamic_experts && !cuda_pageable_mmap &&
-        cuda_text_capture_graphs(state, program, plan) != 0)
+    if (state->dynamic_experts && cuda_pageable_mmap) {
+        if (cuda_text_capture_extent_graphs(state, program, plan) != 0)
+            goto fail;
+    } else if (!state->dynamic_experts &&
+               cuda_text_capture_graphs(state, program, plan) != 0) {
         goto fail;
+    }
     *canonical_out = &state->canonical;
     return 0;
 fail:
@@ -5522,10 +5890,18 @@ fail:
     return -1;
 }
 
+static int cuda_text_full_graph_eligible(
+        const CudaTextProgramState *state, uint32_t input_count,
+        uint32_t output_rows, uint32_t score_rows) {
+    return state && state->graphs_ready && !state->capture_mode &&
+        input_count <= CUDA_TEXT_GRAPH_COUNT && output_rows == input_count &&
+        (size_t)score_rows <= state->attention_dynamic_limit / sizeof(float);
+}
+
 static int cuda_text_begin_depth(void *backend_state, void *command,
         uint64_t generation, uint32_t source_position,
         const int32_t *input_token_ids, uint32_t input_count,
-        uint32_t maximum_depth, uint32_t output_rows) {
+        uint32_t maximum_depth, uint32_t output_rows, int authoritative) {
     CudaTextProgramState *state = (CudaTextProgramState *)backend_state;
     CudaTextProgramCommand *cmd = (CudaTextProgramCommand *)command;
     uint32_t *parents, *depths;
@@ -5537,6 +5913,7 @@ static int cuda_text_begin_depth(void *backend_state, void *command,
         output_rows > input_count)
         return -1;
     memset(cmd, 0, sizeof *cmd);
+    cuda_text_resource_fence_credit = 0;
     cmd->ffn_norm_wave_layer = UINT32_MAX;
     cmd->resource_layer = UINT32_MAX;
     if (salt_text_attention_score_rows(state->program, source_position,
@@ -5551,7 +5928,16 @@ static int cuda_text_begin_depth(void *backend_state, void *command,
                 cmd->touched_spans, SALT_TEXT_MAX_TOUCHED_SPANS,
                 &cmd->touched_span_count, &cmd->touched_span_bytes)) != 0)
         return -1;
-    cmd->stats.canonical_clear_bytes = cmd->touched_span_bytes;
+    /* The one-row authoritative HMM program overwrites every live operand
+     * before consuming it. Keep its startup-owned seats resident; clearing
+     * those spans is neither initialization nor KV commitment. Preserve the
+     * tentative/multirow path and its failure scrub unchanged. */
+    int retain_scratch = authoritative && input_count == 1u &&
+        maximum_depth == 0u && output_rows == 1u &&
+        state->dynamic_experts && cuda_pageable_mmap;
+    cmd->authoritative = authoritative ? 1u : 0u;
+    cmd->stats.canonical_clear_bytes =
+        retain_scratch ? 0u : cmd->touched_span_bytes;
     parents = state->graph_parent_rows +
         (size_t)(input_count - 1u) * CUDA_TEXT_MAX_ROWS;
     depths = state->graph_depths +
@@ -5561,14 +5947,15 @@ static int cuda_text_begin_depth(void *backend_state, void *command,
         parents[row] = row == 0u ? UINT32_MAX : row - 1u;
         depths[row] = row;
     }
-    if (state->graphs_ready && !state->capture_mode &&
-        input_count <= CUDA_TEXT_GRAPH_COUNT) {
+    if (cuda_text_full_graph_eligible(state, input_count, output_rows,
+            cmd->attention_score_rows)) {
         int32_t *staging = state->graph_tokens +
             (size_t)(input_count - 1u) * CUDA_TEXT_MAX_ROWS;
         memcpy(staging, input_token_ids,
             (size_t)input_count * sizeof(int32_t));
     } else {
-        for (uint32_t index = 0; index < cmd->touched_span_count; index++)
+        for (uint32_t index = 0;
+             !retain_scratch && index < cmd->touched_span_count; index++)
             if (cuda_success(cudaMemsetAsync(
                     cuda_text_bytes(state, cmd->touched_spans[index].offset), 0,
                     cmd->touched_spans[index].bytes, state->stream),
@@ -5613,19 +6000,17 @@ static int cuda_text_begin(void *backend_state, void *command,
     if (input_count == 0) return -1;
     return cuda_text_begin_depth(backend_state, command, generation,
         source_position, input_token_ids, input_count, input_count - 1u,
-        input_count);
+        input_count, 0);
 }
 
 static int cuda_text_begin_authoritative(
         void *backend_state, void *command,
         uint64_t generation, uint32_t source_position,
         const int32_t *input_token_ids, uint32_t input_count) {
-    CudaTextProgramCommand *cmd = (CudaTextProgramCommand *)command;
-    if (cuda_text_begin(backend_state, command, generation, source_position,
-            input_token_ids, input_count) != 0 || !cmd)
-        return -1;
-    cmd->authoritative = 1u;
-    return 0;
+    if (input_count == 0u) return -1;
+    return cuda_text_begin_depth(backend_state, command, generation,
+        source_position, input_token_ids, input_count, input_count - 1u,
+        input_count, 1);
 }
 
 static int cuda_text_begin_authoritative_output(
@@ -5637,7 +6022,7 @@ static int cuda_text_begin_authoritative_output(
     if (output_rows > 1u ||
         cuda_text_begin_depth(backend_state, command, generation,
             source_position, input_token_ids, input_count, input_count - 1u,
-            output_rows) != 0 || !cmd)
+            output_rows, 1) != 0 || !cmd)
         return -1;
     cmd->authoritative = 1u;
     return 0;
@@ -5663,7 +6048,7 @@ static int cuda_text_begin_frontier(
             (maximum_depth + 1u) ||
         cuda_text_begin_depth(backend_state, command, generation,
             source_position, input_token_ids, input_count, maximum_depth,
-            input_count) != 0)
+            input_count, 0) != 0)
         return -1;
     staged_parents = state->graph_parent_rows +
         (size_t)(input_count - 1u) * CUDA_TEXT_MAX_ROWS;
@@ -5674,8 +6059,8 @@ static int cuda_text_begin_frontier(
     memcpy(staged_depths, depths, (size_t)input_count * sizeof(uint32_t));
     state->graph_source_positions[input_count - 1u] = source_position;
     cmd->source_position = source_position;
-    if (!(state->graphs_ready && !state->capture_mode &&
-          input_count <= CUDA_TEXT_GRAPH_COUNT) &&
+    if (!cuda_text_full_graph_eligible(state, input_count,
+            cmd->authoritative_output_rows, cmd->attention_score_rows) &&
         (cuda_success(cudaMemcpyAsync(cuda_text_bytes(state,
             state->program->layout.target_parent_rows), staged_parents,
             (size_t)input_count * sizeof(uint32_t), cudaMemcpyHostToDevice,
@@ -5723,6 +6108,8 @@ static int cuda_text_selected_live(const CudaTextProgramState *state,
             state->expert_refs[(size_t)logical * 3u].resource != live->payload)
             return -1;
     }
+    /* Validated selected-resource reads are about to enter the stream. */
+    cuda_selected_retirement_fenced = 0;
     return 0;
 }
 
@@ -5791,9 +6178,8 @@ static int cuda_text_encode_cell(
         output_first = input_count - count;
     }
     if (assignment->gpu.count < count) return -1;
-    if (state->graphs_ready && !state->capture_mode &&
-        input_count <= CUDA_TEXT_GRAPH_COUNT &&
-        cmd->authoritative_output_rows == input_count) {
+    if (cuda_text_full_graph_eligible(state, input_count,
+            cmd->authoritative_output_rows, cmd->attention_score_rows)) {
         cmd->next_cell++;
         cmd->encoded_cells++;
         cmd->highest_completion = cell_template->completion_epoch;
@@ -5850,20 +6236,32 @@ static int cuda_text_encode_cell(
             hidden, input_count, hidden, program->descriptor->norm_epsilon,
             1, status);
         break;
-    case SALT_TEXT_CELL_QUERY_PROJECTION:
-        if (cuda_text_project(state, &refs->q,
+    case SALT_TEXT_CELL_QUERY_PROJECTION: {
+        uint32_t group = input_count == 1u
+            ? cuda_text_projection_group_size(state, cmd->next_cell) : 0u;
+        if (group) {
+            if (cuda_text_project_group(state, cmd->next_cell, group) != 0)
+                return -1;
+        } else if (cuda_text_project(state, &refs->q,
                 cuda_text_f32(state, layout->normalized), destination,
                 input_count) != 0) return -1;
         cmd->stats.projection_dispatches++;
         break;
+    }
     case SALT_TEXT_CELL_KEY_PROJECTION:
-        if (cuda_text_project(state, &refs->k,
+        if (input_count == 1u && cmd->next_cell > 0u &&
+            cuda_text_projection_group_size(state, cmd->next_cell - 1u))
+            physical_launches = 0u;
+        else if (cuda_text_project(state, &refs->k,
                 cuda_text_f32(state, layout->normalized), destination,
                 input_count) != 0) return -1;
         cmd->stats.projection_dispatches++;
         break;
     case SALT_TEXT_CELL_VALUE_PROJECTION:
-        if (attention->shared_kv_projection ||
+        if (input_count == 1u && cmd->next_cell > 1u &&
+            cuda_text_projection_group_size(state, cmd->next_cell - 2u) == 3u)
+            physical_launches = 0u;
+        else if (attention->shared_kv_projection ||
             cuda_text_project(state, &refs->v,
                 cuda_text_f32(state, layout->normalized), destination,
                 input_count) != 0) return -1;
@@ -6012,14 +6410,23 @@ static int cuda_text_encode_cell(
             input_count, hidden, program->descriptor->norm_epsilon, status);
         cmd->ffn_norm_wave_layer = cell->layer;
         break;
-    case SALT_TEXT_CELL_DENSE_GATE:
-        if (cuda_text_project(state, &refs->dense_gate,
+    case SALT_TEXT_CELL_DENSE_GATE: {
+        uint32_t group = input_count == 1u
+            ? cuda_text_projection_group_size(state, cmd->next_cell) : 0u;
+        if (group) {
+            if (cuda_text_project_group(state, cmd->next_cell, group) != 0)
+                return -1;
+        } else if (cuda_text_project(state, &refs->dense_gate,
                 cuda_text_f32(state, layout->normalized), destination,
                 input_count) != 0) return -1;
         cmd->stats.projection_dispatches++;
         break;
+    }
     case SALT_TEXT_CELL_DENSE_UP:
-        if (cuda_text_project(state, &refs->dense_up,
+        if (input_count == 1u && cmd->next_cell > 0u &&
+            cuda_text_projection_group_size(state, cmd->next_cell - 1u) == 2u)
+            physical_launches = 0u;
+        else if (cuda_text_project(state, &refs->dense_up,
                 cuda_text_f32(state, layout->normalized), destination,
                 input_count) != 0) return -1;
         cmd->stats.projection_dispatches++;
@@ -6084,7 +6491,8 @@ static int cuda_text_encode_cell(
         if (jobs == 0u || jobs > state->selected_job_capacity)
             return -1;
         if (state->dynamic_experts &&
-            (cuda_text_selected_live(state, cmd, cell->layer) != 0 ||
+            ((!state->capture_mode &&
+              cuda_text_selected_live(state, cmd, cell->layer) != 0) ||
              cmd->expert_chain_mask != (phase == 0u ? 0u :
                  phase == 1u ? 1u : 7u)))
             return -1;
@@ -6097,11 +6505,35 @@ static int cuda_text_encode_cell(
             : cuda_text_f32(state, layout->routed_input);
         if (state->dynamic_experts)
             cmd->expert_chain_mask |= phase == 2u ? 8u : (1u << phase);
-        cuda_text_expert_q4<<<dim3((rows + 3u) / 4u, jobs, 1u), 128,
-            0, state->stream>>>(state->device_experts, cell->layer, phase,
-            cuda_text_i32(state, layout->selected_experts),
-            cuda_text_i32(state, layout->grouped_to_canonical), jobs, topk,
-            input, destination, rows, cols, status);
+        if (input_count == 1u && phase < 2u) {
+            if (cmd->next_cell < phase) return -1;
+            uint32_t gate_cell = cmd->next_cell - phase;
+            if (gate_cell + 1u >= program->dispatch.cell_count ||
+                program->dispatch.cells[gate_cell].kind !=
+                    SALT_TEXT_CELL_EXPERT_GATE ||
+                program->dispatch.cells[gate_cell + 1u].kind !=
+                    SALT_TEXT_CELL_EXPERT_UP ||
+                program->dispatch.cells[gate_cell].layer != cell->layer ||
+                program->dispatch.cells[gate_cell + 1u].layer != cell->layer)
+                return -1;
+            if (phase == 0u) {
+                cuda_text_expert_q4<<<dim3((rows + 3u) / 4u, jobs, 2u),
+                    128, 0, state->stream>>>(state->device_experts,
+                    cell->layer, phase,
+                    cuda_text_i32(state, layout->selected_experts),
+                    cuda_text_i32(state, layout->grouped_to_canonical),
+                    jobs, topk, input, destination,
+                    cuda_text_f32(state,
+                        program->dispatch.cells[gate_cell + 1u].destination_offset),
+                    rows, cols, status);
+            } else physical_launches = 0u;
+        } else {
+            cuda_text_expert_q4<<<dim3((rows + 3u) / 4u, jobs, 1u), 128,
+                0, state->stream>>>(state->device_experts, cell->layer, phase,
+                cuda_text_i32(state, layout->selected_experts),
+                cuda_text_i32(state, layout->grouped_to_canonical), jobs, topk,
+                input, destination, NULL, rows, cols, status);
+        }
         if (phase == 2u) cmd->stats.expert_down_dispatches++;
         else cmd->stats.expert_gate_up_dispatches++;
         break;
@@ -6109,7 +6541,8 @@ static int cuda_text_encode_cell(
     case SALT_TEXT_CELL_EXPERT_ACTIVATION: {
         size_t elements = (size_t)jobs * routed;
         if (state->dynamic_experts) {
-            if (cuda_text_selected_live(state, cmd, cell->layer) != 0 ||
+            if ((!state->capture_mode &&
+                 cuda_text_selected_live(state, cmd, cell->layer) != 0) ||
                 cmd->expert_chain_mask != 3u)
                 return -1;
             cmd->expert_chain_mask |= 4u;
@@ -6293,42 +6726,17 @@ static int cuda_text_dependency_barrier(
             if (!jobs || jobs > state->selected_job_capacity ||
                 layout->selected_experts > state->canonical_bytes ||
                 bytes > state->canonical_bytes - layout->selected_experts ||
-                layout->grouped_to_canonical > state->canonical_bytes ||
-                bytes > state->canonical_bytes -
-                    layout->grouped_to_canonical ||
                 cmd->request_count || cmd->expert_chain_mask ||
                 cuda_success(cudaMemcpyAsync(
                     host + layout->selected_experts,
                     cuda_text_bytes(state, layout->selected_experts), bytes,
                     cudaMemcpyDeviceToHost, state->stream),
                     "cudaMemcpy text selected IDs") != 0 ||
-                cuda_success(cudaMemcpyAsync(
-                    host + layout->grouped_to_canonical,
-                    cuda_text_bytes(state, layout->grouped_to_canonical), bytes,
-                    cudaMemcpyDeviceToHost, state->stream),
-                    "cudaMemcpy text grouped map") != 0 ||
-                cuda_success(cudaMemcpyAsync(host + state->status_offset,
-                    cuda_text_bytes(state, state->status_offset), sizeof(int),
-                    cudaMemcpyDeviceToHost, state->stream),
-                    "cudaMemcpy text prefix status") != 0 ||
                 cuda_success(cudaStreamSynchronize(state->stream),
                     "cudaStreamSynchronize text resource prefix") != 0)
                 return -1;
-            {
-                int prefix_status = *(const int *)(const void *)(
-                    host + state->status_offset);
-                if (prefix_status) {
-                    fprintf(stderr,
-                        "gpu-cuda: text prefix status=%d source=%u input=%u scores=%u\n",
-                        prefix_status, cmd->source_position, cmd->input_count,
-                        cmd->attention_score_rows);
-                    return -1;
-                }
-            }
             const int32_t *selected = (const int32_t *)(const void *)(
                 host + layout->selected_experts);
-            const int32_t *grouped = (const int32_t *)(const void *)(
-                host + layout->grouped_to_canonical);
             for (uint32_t row = 0; row < cmd->input_count; row++)
                 for (uint32_t rank = 0; rank < CUDA_TEXT_TOPK; rank++) {
                     uint32_t canonical = row * CUDA_TEXT_TOPK + rank;
@@ -6338,7 +6746,6 @@ static int cuda_text_dependency_barrier(
                         return -1;
                     occupancies[(uint32_t)expert]++;
                 }
-            uint32_t grouped_cursor = 0;
             cmd->request_count = 0;
             for (uint32_t expert = 0; expert < CUDA_TEXT_EXPERTS; expert++) {
                 uint32_t population = occupancies[expert];
@@ -6346,15 +6753,14 @@ static int cuda_text_dependency_barrier(
                 if (cmd->request_count >= CUDA_TEXT_EXPERTS)
                     return -1;
                 cmd->request_experts[cmd->request_count++] = (int32_t)expert;
-                for (uint32_t item = 0; item < population; item++) {
-                    uint32_t canonical = (uint32_t)grouped[grouped_cursor++];
-                    if (canonical >= jobs ||
-                        selected[canonical] != (int32_t)expert)
-                        return -1;
-                }
             }
-            if (grouped_cursor != jobs || !cmd->request_count)
+            if (cmd->request_count == 0)
                 return -1;
+            /* This stream synchronization already fenced every prior
+             * selected-resource consumer.  The immediately following cache
+             * acquire may consume that proof instead of issuing a redundant
+             * device-wide synchronization before slot retirement. */
+            cuda_text_resource_fence_credit = 1;
             cmd->resource_layer = upcoming->layer;
             cmd->resource_pending = 1u;
             return SALT_TEXT_GPU_NEED_RESOURCE;
@@ -6364,27 +6770,16 @@ static int cuda_text_dependency_barrier(
                 !cmd->request_count || cmd->expert_chain_mask)
                 return -1;
         } else if (upcoming->kind == SALT_TEXT_CELL_EXPERT_REDUCTION) {
-            unsigned char *host = (unsigned char *)state->canonical.contents;
             if (cmd->resource_layer != upcoming->layer ||
-                !cmd->request_count || cmd->expert_chain_mask != 15u ||
-                cuda_success(cudaMemcpyAsync(host + state->status_offset,
-                    cuda_text_bytes(state, state->status_offset), sizeof(int),
-                    cudaMemcpyDeviceToHost, state->stream),
-                    "cudaMemcpy text expert status") != 0 ||
-                cuda_success(cudaStreamSynchronize(state->stream),
-                    "cudaStreamSynchronize text expert last consumer") != 0)
+                !cmd->request_count || cmd->expert_chain_mask != 15u)
                 return -1;
-            {
-                int expert_status = *(const int *)(const void *)(
-                    host + state->status_offset);
-                if (expert_status) {
-                    fprintf(stderr,
-                        "gpu-cuda: text expert status=%d source=%u input=%u scores=%u\n",
-                        expert_status, cmd->source_position, cmd->input_count,
-                        cmd->attention_score_rows);
-                    return -1;
-                }
-            }
+            /* The portable executor retains this layer's SaltCache leases
+             * through reduction/combine.  The next layer's resource-prefix
+             * synchronization therefore proves every queued expert consumer
+             * complete before heterogeneous_resume_resource() releases those
+             * leases.  On the final layer, cuda_text_finish() supplies the same
+             * proof before resolve releases them.  Do not add a second stream
+             * synchronization between expert down and reduction. */
             cmd->resource_layer = UINT32_MAX;
             cmd->request_count = 0;
             cmd->expert_chain_mask = 0;
@@ -6420,6 +6815,7 @@ static int cuda_text_resource_resume(
     CudaTextProgramState *state = (CudaTextProgramState *)backend_state;
     CudaTextProgramCommand *cmd = (CudaTextProgramCommand *)command;
     CudaTextTensorRef staged[CUDA_TEXT_EXPERTS][3];
+    uint32_t changed = 0;
     if (!state || state->magic != CUDA_TEXT_STATE_MAGIC ||
         !state->dynamic_experts || !cmd || !cmd->begun || cmd->submitted ||
         !cmd->resource_pending || layer != cmd->resource_layer ||
@@ -6430,6 +6826,7 @@ static int cuda_text_resource_resume(
         state->templates[cmd->next_cell].kind != SALT_TEXT_CELL_EXPERT_GATE ||
         state->templates[cmd->next_cell].layer != layer)
         return -1;
+    cuda_text_resource_fence_credit = 0;
     memset(staged, 0, sizeof staged);
     for (uint32_t index = 0; index < expert_count; index++) {
         int32_t expert = experts[index];
@@ -6442,17 +6839,67 @@ static int cuda_text_resource_resume(
     for (uint32_t index = 0; index < expert_count; index++) {
         size_t base = ((size_t)layer * CUDA_TEXT_EXPERTS +
             (uint32_t)experts[index]) * 3u;
-        memcpy(state->expert_refs + base, staged[index], sizeof staged[index]);
-        if (cuda_success(cudaMemcpyAsync(state->device_experts + base,
-                state->expert_refs + base, sizeof staged[index],
-                cudaMemcpyHostToDevice, state->stream),
-                "cudaMemcpy text selected expert refs") != 0)
-            return -1;
+        if (memcmp(state->expert_refs + base, staged[index],
+                sizeof staged[index]) != 0) {
+            memcpy(state->expert_refs + base, staged[index],
+                sizeof staged[index]);
+            changed++;
+        }
         cmd->request_slots[index] = slots[index];
         cmd->request_bindings[index] = cuda_selected_resources[slots[index]];
     }
-    cmd->stats.backend_dynamic_patches += expert_count * 3u;
+    if (changed) {
+        size_t base = (size_t)layer * CUDA_TEXT_EXPERTS * 3u;
+        size_t count = (size_t)CUDA_TEXT_EXPERTS * 3u;
+        if (cuda_success(cudaMemcpyAsync(state->device_experts + base,
+                state->expert_refs + base,
+                count * sizeof *state->expert_refs,
+                cudaMemcpyHostToDevice, state->stream),
+                "cudaMemcpy text selected layer refs") != 0)
+            return -1;
+    }
+    cmd->stats.backend_dynamic_patches += changed * 3u;
     cmd->resource_pending = 0;
+    return 0;
+}
+
+static int cuda_text_extent_stats_add(
+        CudaTextProgramCommand *cmd, const CudaTextExtentGraph *graph) {
+#define ADD_U32(field) do { \
+    if (UINT32_MAX - cmd->stats.field < graph->stats.field) return -1; \
+    cmd->stats.field += graph->stats.field; \
+} while (0)
+#define ADD_U64(field) do { \
+    if (UINT64_MAX - cmd->stats.field < graph->stats.field) return -1; \
+    cmd->stats.field += graph->stats.field; \
+} while (0)
+    if (!cmd || !graph || !graph->executable || graph->kernel_nodes == 0u)
+        return -1;
+    ADD_U32(projection_dispatches);
+    ADD_U32(expert_gate_up_dispatches);
+    ADD_U32(expert_down_dispatches);
+    ADD_U32(area_m1_dispatches);
+    ADD_U32(area_mk_dispatches);
+    ADD_U32(area_mn_dispatches);
+    ADD_U32(area_matrix_parallel_dispatches);
+    ADD_U64(area_output_row_tiles);
+    ADD_U64(area_candidate_output_tiles);
+    ADD_U32(backend_template_reuses);
+    if (graph->stats.backend_selected_jobs > cmd->stats.backend_selected_jobs)
+        cmd->stats.backend_selected_jobs = graph->stats.backend_selected_jobs;
+    if (UINT32_MAX - cmd->stats.backend_physical_kernel_nodes <
+            graph->kernel_nodes ||
+        cmd->stats.backend_graph_launches == UINT32_MAX ||
+        UINT32_MAX - cmd->stats.backend_graph_parameter_patches <
+            graph->attention_nodes ||
+        cmd->stats.backend_host_kernel_launch_calls == UINT32_MAX)
+        return -1;
+    cmd->stats.backend_physical_kernel_nodes += graph->kernel_nodes;
+    cmd->stats.backend_graph_launches++;
+    cmd->stats.backend_graph_parameter_patches += graph->attention_nodes;
+    cmd->stats.backend_host_kernel_launch_calls++;
+#undef ADD_U32
+#undef ADD_U64
     return 0;
 }
 
@@ -6473,8 +6920,68 @@ static int cuda_text_encode_extent(void *backend_state, void *command,
         cell_count > state->template_count - first_cell)
         return -1;
     *encoded_cells = 0;
-    if (state->graphs_ready && !state->capture_mode &&
-        input_count <= CUDA_TEXT_GRAPH_COUNT) {
+    if (state->extent_graphs_ready && !state->capture_mode &&
+        input_count <= CUDA_TEXT_GRAPH_COUNT &&
+        cmd->authoritative_output_rows == input_count) {
+        CudaTextExtentGraph *graph = NULL;
+        const SaltTextExecutionCell *first =
+            &program->dispatch.cells[first_cell];
+        const SaltTextExecutionCell *last =
+            &program->dispatch.cells[first_cell + cell_count - 1u];
+        uint32_t barriers =
+            plan->assignments[first_cell].gpu_traversal_barriers;
+        for (uint32_t extent = 0; extent < state->extent_graph_count; extent++) {
+            CudaTextExtentGraph *candidate =
+                &state->extent_graphs[input_count - 1u][extent];
+            if (candidate->first_cell == first_cell &&
+                candidate->cell_count == cell_count) {
+                graph = candidate;
+                break;
+            }
+        }
+        if (!graph || !graph->executable ||
+            last->completion_epoch <= cmd->highest_completion)
+            return -1;
+        if (first->dependency_epoch > 0u) {
+            if (barriers == 0u) return -1;
+            barriers--;
+        }
+        if (UINT32_MAX - cmd->barrier_count < barriers)
+            return -1;
+        if (first->kind == SALT_TEXT_CELL_EXPERT_GATE &&
+            (cuda_text_selected_live(state, cmd, first->layer) != 0 ||
+             cmd->expert_chain_mask != 0u))
+            return -1;
+        if (graph->attention_nodes) {
+            cudaKernelNodeParams parameters;
+            if (graph->attention_nodes != 1u || !graph->attention_node ||
+                cuda_success(cudaGraphKernelNodeGetParams(
+                    graph->attention_node, &parameters),
+                    "cudaGraphKernelNodeGetParams text extent attention") != 0)
+                return -1;
+            parameters.sharedMemBytes =
+                (size_t)cmd->attention_score_rows * sizeof(float);
+            if (cuda_success(cudaGraphExecKernelNodeSetParams(
+                    graph->executable, graph->attention_node, &parameters),
+                    "cudaGraphExecKernelNodeSetParams text extent attention") != 0)
+                return -1;
+        }
+        if (cuda_success(cudaGraphLaunch(graph->executable, state->stream),
+                "cudaGraphLaunch text extent") != 0 ||
+            cuda_text_extent_stats_add(cmd, graph) != 0)
+            return -1;
+        if (first->kind == SALT_TEXT_CELL_EXPERT_GATE)
+            cmd->expert_chain_mask = 15u;
+        cmd->barrier_count += barriers;
+        cmd->stats.backend_graph_count = state->extent_graphs_ready;
+        cmd->next_cell += cell_count;
+        cmd->encoded_cells += cell_count;
+        cmd->highest_completion = last->completion_epoch;
+        *encoded_cells = cell_count;
+        return SALT_TEXT_GPU_DEPENDENCY_READY;
+    }
+    if (cuda_text_full_graph_eligible(state, input_count,
+            cmd->authoritative_output_rows, cmd->attention_score_rows)) {
         const SaltTextExecutionCell *first =
             &program->dispatch.cells[first_cell];
         const SaltTextExecutionCell *last =
@@ -6523,11 +7030,10 @@ static int cuda_text_submit(void *backend_state, void *command) {
         cmd->next_cell != state->program->dispatch.cell_count ||
         cmd->encoded_cells != state->program->dispatch.cell_count)
         return -1;
-    if (state->graphs_ready && !state->capture_mode &&
-        cmd->input_count <= CUDA_TEXT_GRAPH_COUNT &&
-        cmd->authoritative_output_rows == cmd->input_count) {
+    if (cuda_text_full_graph_eligible(state, cmd->input_count,
+            cmd->authoritative_output_rows, cmd->attention_score_rows)) {
         CudaTextGraphTemplate *graph = &state->graphs[cmd->input_count - 1u];
-        if (!graph->executable || graph->kernel_nodes != 719u ||
+        if (!graph->executable || graph->kernel_nodes == 0u ||
             graph->attention_node_count != state->program->layer_count)
             return -1;
         for (uint32_t layer = 0; layer < graph->attention_node_count; layer++) {
@@ -6610,7 +7116,7 @@ static int cuda_text_capture_nodes(CudaTextGraphTemplate *target) {
             }
         }
     }
-    return target->kernel_nodes == 719u &&
+    return target->kernel_nodes > 0u &&
         target->attention_node_count == CUDA_TEXT_LAYERS ? 0 : -1;
 }
 
@@ -6672,6 +7178,131 @@ static int cuda_text_capture_graphs(
     }
     state->capture_mode = 0u;
     state->graphs_ready = CUDA_TEXT_GRAPH_COUNT;
+    return 0;
+capture_fail:
+    {
+        cudaGraph_t abandoned = NULL;
+        (void)cudaStreamEndCapture(state->stream, &abandoned);
+        if (abandoned) (void)cudaGraphDestroy(abandoned);
+    }
+fail:
+    state->capture_mode = 0u;
+    return -1;
+}
+
+static int cuda_text_extent_capture_nodes(CudaTextExtentGraph *target) {
+    cudaGraphNode_t nodes[CUDA_TEXT_GRAPH_MAX_NODES];
+    size_t node_count = CUDA_TEXT_GRAPH_MAX_NODES;
+    if (!target || !target->graph ||
+        cuda_success(cudaGraphGetNodes(target->graph, nodes, &node_count),
+            "cudaGraphGetNodes text extent") != 0 ||
+        node_count == 0u || node_count > CUDA_TEXT_GRAPH_MAX_NODES)
+        return -1;
+    target->kernel_nodes = 0u;
+    target->attention_nodes = 0u;
+    target->attention_node = NULL;
+    for (size_t index = 0; index < node_count; index++) {
+        cudaGraphNodeType type;
+        if (cuda_success(cudaGraphNodeGetType(nodes[index], &type),
+                "cudaGraphNodeGetType text extent") != 0)
+            return -1;
+        if (type != cudaGraphNodeTypeKernel) continue;
+        cudaKernelNodeParams parameters;
+        target->kernel_nodes++;
+        if (cuda_success(cudaGraphKernelNodeGetParams(nodes[index], &parameters),
+                "cudaGraphKernelNodeGetParams text extent capture") != 0)
+            return -1;
+        if (parameters.func == (void *)cuda_text_attention_body) {
+            if (target->attention_nodes != 0u) return -1;
+            target->attention_node = nodes[index];
+            target->attention_nodes = 1u;
+        }
+    }
+    return target->kernel_nodes > 0u ? 0 : -1;
+}
+
+static int cuda_text_capture_extent_graphs(
+        CudaTextProgramState *state, const SaltTextVerifyProgram *program,
+        const SaltTextExecutorPlan *plan) {
+    uint32_t extent_first[CUDA_TEXT_MAX_EXTENTS];
+    uint32_t extent_count[CUDA_TEXT_MAX_EXTENTS];
+    uint32_t extents = 0u, cursor = 0u;
+    if (!state || !program || !plan || plan->program != program ||
+        !state->dynamic_experts || !cuda_pageable_mmap ||
+        plan->assignment_count != program->dispatch.cell_count ||
+        !state->stream)
+        return -1;
+    while (cursor < plan->assignment_count) {
+        uint32_t count = plan->assignments[cursor].gpu_traversal_count;
+        if (count == 0u || count > plan->assignment_count - cursor ||
+            extents >= CUDA_TEXT_MAX_EXTENTS)
+            return -1;
+        extent_first[extents] = cursor;
+        extent_count[extents] = count;
+        extents++;
+        cursor += count;
+    }
+    if (cursor != plan->assignment_count || extents == 0u)
+        return -1;
+    state->capture_mode = 1u;
+    for (uint32_t batch = 1u; batch <= CUDA_TEXT_GRAPH_COUNT; batch++) {
+        for (uint32_t extent = 0u; extent < extents; extent++) {
+            CudaTextExtentGraph *target =
+                &state->extent_graphs[batch - 1u][extent];
+            CudaTextProgramCommand command;
+            uint32_t first = extent_first[extent];
+            uint32_t count = extent_count[extent];
+            const SaltTextExecutionCell *first_cell =
+                &program->dispatch.cells[first];
+            memset(&command, 0, sizeof command);
+            command.generation = 1u;
+            command.input_count = batch;
+            command.maximum_depth = batch - 1u;
+            command.authoritative_output_rows = batch;
+            command.attention_score_rows = program->maximum_context;
+            command.next_cell = first;
+            command.highest_completion = first_cell->dependency_epoch;
+            command.ffn_norm_wave_layer = UINT32_MAX;
+            command.resource_layer = UINT32_MAX;
+            command.begun = 1u;
+            if (first_cell->kind == SALT_TEXT_CELL_EXPERT_GATE) {
+                command.resource_layer = first_cell->layer;
+                command.request_count = 1u;
+                command.request_experts[0] = 0;
+                command.request_slots[0] = 0;
+            }
+            if (cuda_success(cudaStreamBeginCapture(
+                    state->stream, cudaStreamCaptureModeThreadLocal),
+                    "cudaStreamBeginCapture text extent") != 0)
+                goto fail;
+            for (uint32_t offset = 0u; offset < count; offset++) {
+                uint32_t index = first + offset;
+                if (cuda_text_encode_cell(state, &command, program,
+                        &program->dispatch.cells[index],
+                        &plan->assignments[index], batch) != 0)
+                    goto capture_fail;
+            }
+            if (command.next_cell != first + count ||
+                command.encoded_cells != count ||
+                cuda_success(cudaStreamEndCapture(state->stream, &target->graph),
+                    "cudaStreamEndCapture text extent") != 0 ||
+                !target->graph)
+                goto fail;
+            target->first_cell = first;
+            target->cell_count = count;
+            target->stats = command.stats;
+            if (cuda_text_extent_capture_nodes(target) != 0 ||
+                cuda_success(cudaGraphInstantiate(
+                    &target->executable, target->graph, NULL, NULL, 0),
+                    "cudaGraphInstantiate text extent") != 0 ||
+                !target->executable)
+                goto fail;
+        }
+    }
+    state->capture_mode = 0u;
+    state->extent_graph_count = extents;
+    if (extents > UINT32_MAX / CUDA_TEXT_GRAPH_COUNT) goto fail;
+    state->extent_graphs_ready = extents * CUDA_TEXT_GRAPH_COUNT;
     return 0;
 capture_fail:
     {
@@ -6764,6 +7395,7 @@ static int cuda_text_resolve(
         input_count != cmd->input_count || committed_count > input_count)
         return -1;
     *scrubbed_bytes = 0;
+    cuda_text_resource_fence_credit = 0;
     memset(cmd, 0, sizeof *cmd);
     return 0;
 }
@@ -6787,6 +7419,7 @@ static int cuda_text_scrub(
             return -1;
     }
     *scrubbed_bytes = state->program->tentative_kv_bytes;
+    cuda_text_resource_fence_credit = 0;
     memset(cmd, 0, sizeof *cmd);
     return 0;
 }

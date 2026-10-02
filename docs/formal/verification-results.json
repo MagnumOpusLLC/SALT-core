@@ -1,7 +1,8 @@
 {
   "schema": "salt.public-formal-verification.v1",
-  "method": "Nine historical public modules retain their original independent Docker results and unchanged input hashes. The later copied loader module was independently checked with TLC, an expected RED counterexample, and clean-fingerprint TLAPS. No native inference qualification.",
-  "source_manifest_sha256": "8f2def6ad19bb07ecb4ff0b945032baef9f0ea660bfc7c9277aa68662a7fdecd",
+  "method": "Nine historical public modules retain their original independent Docker results and unchanged input hashes. The later copied loader module was independently checked with TLC, an expected RED counterexample, and clean-fingerprint TLAPS. The exported runtime source has since been refreshed; these proof results were not rerun against its native code and are not native inference qualification.",
+  "source_manifest_sha256": "e5b4fe4af102464214a3611a1a653fcffb46cb5fa3985b09f087120132aac5ec",
+  "exported_runtime_commit": "ce0363260a488c96b951b4d826a188e1014575d4",
   "toolchain": {
     "tlapm_sha256": "f992e87324b6b166a60816c127d2bf628f6c74b08bdb33f66acf52e724888a1b",
     "tlapm_version": "1eabe97-dirty",
@@ -269,5 +270,5 @@
   ],
   "tlc_pass": 10,
   "tlaps_pass": 10,
-  "scope": "Nine historical abstract modules plus one independently rechecked supplemental loader proof. No complete current-source refinement, concrete tensor/KV identity, OS outcome observation, or composed-system theorem is claimed."
+  "scope": "Nine historical abstract modules plus one independently rechecked supplemental loader proof. The later runtime bytes are separate from the older engine proof pins; no complete current-source refinement, concrete tensor/KV identity, OS outcome observation, or composed-system theorem is claimed."
 }

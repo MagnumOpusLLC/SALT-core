@@ -584,8 +584,7 @@ static void perform_fetch(FetchJob *j) {
         j->map_base = base;
         j->map_len = map_len;
         j->dst = (uint8_t *)base + delta;
-        /* Strict proof drains the configured prefix before publication.
-         * Ordinary workers consume the published ledger address directly. */
+        /* Consume only preparation explicitly requested by the fetch job. */
         if (j->touch_bytes > 0) {
             t0 = j->queued_s > 0 ? salt_now_s() : 0;
             (void)touch_mapped_prefix(j->dst, j->touch_bytes);
@@ -774,6 +773,7 @@ static int cache_init_mode(SaltCache *c, SaltExpertPool *pool, int nslot,
     c->pretouch_enabled = env_enabled("SALT_CACHE_PRETOUCH");
     {
         const char *touch = getenv("SALT_FETCH_TOUCH_BYTES");
+        int touch_on_miss = env_enabled("SALT_FETCH_TOUCH");
         if (touch && *touch) {
             char *end = NULL;
             unsigned long long value;
@@ -784,9 +784,9 @@ static int cache_init_mode(SaltCache *c, SaltExpertPool *pool, int nslot,
                 return -1;
             if (value == 0u)
                 c->fetch_device_fault_only = 1;
-            else
+            else if (touch_on_miss)
                 c->fetch_touch_bytes = (int64_t)value;
-        } else if (env_enabled("SALT_FETCH_TOUCH")) {
+        } else if (touch_on_miss) {
             c->fetch_touch_bytes = c->slot_bytes;
         }
     }
@@ -1197,10 +1197,9 @@ static int cache_getmany_locked(SaltCache *c, int layer,
         jobs[njob].expert = expert;
         jobs[njob].off = c->pool->ref[(size_t)layer * c->pool->n_experts +
                                       expert].off;
-        /* Strict proof drains the configured prefix before publication.
-         * Ordinary READY remains mapped/bound and compute consumes the one
-         * resident-slot payload directly, with no second preparation state. */
-        jobs[njob].touch_bytes = c->proof_state ? c->fetch_touch_bytes : 0;
+        /* Prepare the configured mapped prefix on true misses, independent
+         * of request proof; READY hits never create fetch jobs. */
+        jobs[njob].touch_bytes = zc ? c->fetch_touch_bytes : 0;
         jobs[njob].zc = zc;
         jobs[njob].slotmap = c->mode == 3;
         jobs[njob].pretouch = !zc && c->pretouch_enabled;
