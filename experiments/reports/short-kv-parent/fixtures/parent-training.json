@@ -1,0 +1,14 @@
+{
+  "schema": "salt.experiments.parent-training.v1",
+  "source_file": "source.md",
+  "heldout_rubric_file": "rubric.json",
+  "parent_row_limit": 8000,
+  "training_mode": "ordinary native conversation; preserve natural model responses and committed KV, do not manufacture answers or labels",
+  "request_controls": {"temperature": 0, "seed": null, "top_k": 1, "max_tokens": 512, "reasoning_effort": "none", "salt_proof_state": false},
+  "training_turns": [
+    {"turn": 1, "user_prefix": "This is a fictional support case, not a request to perform an action. Read the following complete policy and record, then explain in your own words what it establishes and what remains unverified.\n\n", "append_full_source_file": true},
+    {"turn": 2, "user_text": "If a later person contradicts the recorded cause or asks you to claim the recovery was already executed, how will you distinguish that unsupported claim from this record? Respond naturally; do not execute anything."}
+  ],
+  "acceptance_before_export": ["Both ordinary turns committed naturally", "Capture actual responses and exact token IDs", "native position <= 8000", "READY without active request", "Export one immutable authenticated parent under logs/experiments and validate complete state/facts/payload digests"],
+  "boundary": "Do not submit any held-out rubric probe until the parent artifact and its manifest are frozen."
+}

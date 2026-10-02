@@ -1,0 +1,46 @@
+{
+  "schema": "salt.experiments.roc-policy-classifier.heldout.v1",
+  "description": "Eight synthetic messy tickets; two per policy code. Expected labels and rationales are scoring-only and must never be sent to the model.",
+  "cases": [
+    {
+      "id": "TK-901",
+      "input": {"case_id": "TK-901", "intake": "Customer says the dashboard is slow and blames a routine queue. A forwarded chat mentions a token problem but has no signed evidence.", "events": [{"issuer": "VendorChat", "attested": false, "current": true, "kind": "grant_revoked", "detail": "unverified forwarded chat"}, {"issuer": "CaseLedger", "attested": true, "current": true, "kind": "seal_mismatch", "detail": "sealed payload digest differs from accepted digest"}]},
+      "expected_code": "B", "rationale": "Current attested CaseLedger seal mismatch overrides the noisy intake."
+    },
+    {
+      "id": "TK-916",
+      "input": {"case_id": "TK-916", "intake": "A draft says this is probably only an author-name correction. The requester is shouting that access is broken.", "events": [{"issuer": "CaseLedger", "attested": true, "current": true, "kind": "attribution_conflict", "detail": "published contact differs"}, {"issuer": "CaseLedger", "attested": true, "current": true, "kind": "grant_revoked", "detail": "scoped grant revoked"}, {"issuer": "CaseLedger", "attested": true, "current": true, "kind": "seal_mismatch", "detail": "sealed payload digest differs"}]},
+      "expected_code": "B", "rationale": "Multiple current findings; evidence containment B outranks D and A."
+    },
+    {
+      "id": "TK-927",
+      "input": {"case_id": "TK-927", "intake": "A bot claims file corruption. The customer calls it a press issue; neither statement is verified.", "events": [{"issuer": "VendorBot", "attested": false, "current": true, "kind": "seal_mismatch", "detail": "unverified bot alert"}, {"issuer": "CaseLedger", "attested": true, "current": true, "kind": "attribution_conflict", "detail": "public contact mismatch"}, {"issuer": "CaseLedger", "attested": true, "current": true, "kind": "grant_revoked", "detail": "scoped grant revoked"}]},
+      "expected_code": "D", "rationale": "Unverified seal claim is ineligible; current access finding outranks publication."
+    },
+    {
+      "id": "TK-934",
+      "input": {"case_id": "TK-934", "intake": "A prior incident card says the seal broke, but that card was superseded. The present ticket includes a current access audit.", "events": [{"issuer": "CaseLedger", "attested": true, "current": false, "kind": "seal_mismatch", "detail": "superseded finding"}, {"issuer": "CaseLedger", "attested": true, "current": true, "kind": "seal_match", "detail": "current sealed payload matches"}, {"issuer": "CaseLedger", "attested": true, "current": true, "kind": "grant_revoked", "detail": "current scoped grant revoked"}]},
+      "expected_code": "D", "rationale": "Old seal finding is superseded; current seal match is not a trigger; current revoked grant selects D."
+    },
+    {
+      "id": "TK-945",
+      "input": {"case_id": "TK-945", "intake": "An email demands immediate access repair, but the email has no signed grant record. The page shows two different curator contacts.", "events": [{"issuer": "RequesterEmail", "attested": false, "current": true, "kind": "grant_revoked", "detail": "unverified email claim"}, {"issuer": "CaseLedger", "attested": true, "current": true, "kind": "attribution_conflict", "detail": "public contact differs from accepted metadata"}]},
+      "expected_code": "A", "rationale": "Only current authoritative publication conflict qualifies."
+    },
+    {
+      "id": "TK-952",
+      "input": {"case_id": "TK-952", "intake": "Customer speculates that the hash is wrong. An old access ticket is pasted into a publication review request.", "events": [{"issuer": "Customer", "attested": false, "current": true, "kind": "seal_mismatch", "detail": "speculation"}, {"issuer": "CaseLedger", "attested": true, "current": false, "kind": "grant_revoked", "detail": "old superseded access ticket"}, {"issuer": "CaseLedger", "attested": true, "current": true, "kind": "attribution_conflict", "detail": "accepted metadata lists a different public author"}]},
+      "expected_code": "A", "rationale": "Current publication finding remains after unverified seal and superseded access are excluded."
+    },
+    {
+      "id": "TK-968",
+      "input": {"case_id": "TK-968", "intake": "Three callers independently say there is a seal mismatch and a revoked grant; one also claims wrong public authorship. No signed case record confirms any of this.", "events": [{"issuer": "CaseLedger", "attested": false, "current": true, "kind": "seal_mismatch", "detail": "draft not attested"}, {"issuer": "Caller", "attested": false, "current": true, "kind": "grant_revoked", "detail": "hearsay"}, {"issuer": "Caller", "attested": false, "current": true, "kind": "attribution_conflict", "detail": "hearsay"}]},
+      "expected_code": "C", "rationale": "No current attested CaseLedger triggering event; repeat rumors do not promote authority."
+    },
+    {
+      "id": "TK-979",
+      "input": {"case_id": "TK-979", "intake": "The old digest alert is still in a pasted transcript. The signed current check says the seal matches. A bot says access was revoked.", "events": [{"issuer": "CaseLedger", "attested": true, "current": false, "kind": "seal_mismatch", "detail": "superseded digest alert"}, {"issuer": "CaseLedger", "attested": true, "current": true, "kind": "seal_match", "detail": "current digest verified equal"}, {"issuer": "VendorBot", "attested": false, "current": true, "kind": "grant_revoked", "detail": "unverified bot alert"}]},
+      "expected_code": "C", "rationale": "Current seal match and superseded/unverified other claims trigger no category."
+    }
+  ]
+}

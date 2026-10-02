@@ -1,0 +1,70 @@
+{
+  "schema": "salt.experiments.aiayn-large-o-prefix-gate.v1",
+  "question": "Give the scaled dot-product attention formula from Attention Is All You Need, then briefly explain why the query-key dot products are divided by the square root of d_k.",
+  "sampler": "greedy temperature=0 top_k=1",
+  "source": {
+    "host": "Acerbox DGX Spark",
+    "backend": "registered full CUDA spark",
+    "parent": "authenticated AIAYN/TML turn-14 source state at position 22899",
+    "context": 65536,
+    "workers": 8,
+    "head": "6c4c8fcb91fe1c94d29e4c2c6cfe0ef886eb8589",
+    "head_time": "2026-09-29T08:22:59-04:00",
+    "binary_sha256": "1998f0835fcc9608c04cd079a2ce01e3fdb0e97f9c080ed266f5cfddee20c462",
+    "receipt_sha256": "4f678adeabeb6dc253da742040275491c2e1c4b2cc18c43c555af50ae422f0de"
+  },
+  "destination": {
+    "host": "V520 ROCm",
+    "backend": "full HIP GPU rocm",
+    "parent_imported": false,
+    "context": 8192,
+    "workers": 8,
+    "nfq": {"n": 104, "f": 1, "q": 4},
+    "configured_x": 48,
+    "dpr_mode": "off for alignment controls",
+    "head": "6c4c8fcb91fe1c94d29e4c2c6cfe0ef886eb8589",
+    "head_time": "2026-09-29T08:22:59-04:00",
+    "binary_sha256": "9a60c6b54094e2e943e61e1f3ba0b0f2699a9337380ee4a84dde9c0a414c3fbb",
+    "receipt_sha256": "a8860ac9bf663f013ce015cf199e6885bee09c2588ed46e8796f1b85fb70d5a8"
+  },
+  "cells": [
+    {
+      "requested_o": 256,
+      "spark_output_tokens": 112,
+      "spark_finish": "stop",
+      "spark_wall_s": 73.203373,
+      "rocm_output_tokens": 256,
+      "rocm_finish": "length",
+      "rocm_wall_s": 84.44661,
+      "rocm_prefill_ms_per_input": 80.37921408163265,
+      "rocm_decode_ms_per_output": 311.4001908046875,
+      "rocm_rss_peak_bytes": 5821972480,
+      "rocm_export_bytes": 131604736,
+      "common_prefix": 0,
+      "first_mismatch_index": 0,
+      "first_mismatch_ids": [818, 10354],
+      "eligible_48": false
+    },
+    {
+      "requested_o": 512,
+      "spark_output_tokens": 112,
+      "spark_finish": "stop",
+      "spark_wall_s": 72.568293,
+      "rocm_output_tokens": 401,
+      "rocm_finish": "stop",
+      "rocm_wall_s": 137.099747,
+      "rocm_prefill_ms_per_input": 83.4087936122449,
+      "rocm_decode_ms_per_output": 330.46004387281795,
+      "rocm_rss_peak_bytes": 5821734912,
+      "rocm_export_bytes": 193536256,
+      "common_prefix": 0,
+      "first_mismatch_index": 0,
+      "first_mismatch_ids": [818, 10354],
+      "eligible_48": false
+    }
+  ],
+  "publication": false,
+  "dpr_hit_rates": "not measured; no compatible draft was published",
+  "verdict": "BLOCKED: both O256 and O512 differ at token 0 between source-conditioned Spark and blank-parent ROCm; raising O did not create a target-compatible 48-token trajectory",
+  "owned_listeners_stopped": true
+}

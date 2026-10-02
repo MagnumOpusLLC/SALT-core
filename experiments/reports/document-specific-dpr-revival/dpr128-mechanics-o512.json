@@ -1,0 +1,33 @@
+{
+  "schema": "salt.experiments.dpr128-mechanics-o512.v1",
+  "host": "V520 ROCm",
+  "recipe": "rocm",
+  "mode": "full HIP GPU",
+  "fixture": "aiayn-dpr-o512-question-v1.json",
+  "context": 8192,
+  "workers": 8,
+  "nfq": {"n": 104, "f": 1, "q": 4},
+  "dpr_mode": "dynamic",
+  "draft_n": 128,
+  "candidate_source": "ROCm new-build natural target trace compiled on Spark; mechanics control ONLY, not Spark document-conditioned training",
+  "edge_count": 128,
+  "edge_file_bytes": 512,
+  "reference_files": 0,
+  "parent_imported": false,
+  "compatibility_sha256": "a8f65419be9bf410e229426dc6b7659006fe6e4d5fe6bbf079c891e587263c57",
+  "binary_sha256": "913d3bbc0490a3ad0225fc0ad62dc9129e575413df267074ce843b4c8e798eec",
+  "receipt_sha256": "e2d00b094eb5dc0563bd0bc9b8bcaac92e0dcd6630cf49a5b12518d82027ce5d",
+  "source_head": "6c4c8fcb91fe1c94d29e4c2c6cfe0ef886eb8589",
+  "source_head_time": "2026-09-29T08:22:59-04:00",
+  "source_dirty": "scoped uncommitted DPR128 candidate staged from primary checkout",
+  "off_control": {"output_tokens": 401, "http_wall_s": 136.994632, "peak_rss_bytes": 5821820928, "state_export_bytes": 193536256},
+  "cells": [
+    {"configured_x": 48, "status": "exact_pass", "native_dpr_horizon": 48, "accepted": 48, "committed": 48, "nomogram_hits": 1, "output_tokens": 401, "prompt_tokens": 49, "prefill_ms_per_input": 82.68040395918368, "decode_ms_per_output": 294.79827145386537, "http_wall_s": 123.168621, "peak_rss_bytes": 5822414848, "kernel_nodes": 664, "host_launches": 664, "output_ids_equal": true, "complete_state_equal": true},
+    {"configured_x": 72, "status": "exact_pass", "native_dpr_horizon": 72, "accepted": 72, "committed": 72, "nomogram_hits": 1, "output_tokens": 401, "prompt_tokens": 49, "prefill_ms_per_input": 79.96960951020408, "decode_ms_per_output": 275.83664213715707, "http_wall_s": 115.479208, "peak_rss_bytes": 5822300160, "kernel_nodes": 664, "host_launches": 664, "output_ids_equal": true, "complete_state_equal": true},
+    {"configured_x": 128, "status": "exact_pass", "native_dpr_horizon": 128, "accepted": 128, "committed": 128, "nomogram_hits": 1, "output_tokens": 401, "prompt_tokens": 49, "prefill_ms_per_input": 82.32691469387755, "decode_ms_per_output": 227.5641924114713, "http_wall_s": 96.260709, "peak_rss_bytes": 5822058496, "kernel_nodes": 664, "host_launches": 664, "output_ids_equal": true, "complete_state_equal": true}
+  ],
+  "completed_count": 3,
+  "all_complete": true,
+  "listener_stopped": true,
+  "no_speedup_promoted": true
+}

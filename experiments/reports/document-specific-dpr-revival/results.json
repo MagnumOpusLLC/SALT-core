@@ -1,0 +1,81 @@
+{
+  "schema": "salt.experiments.document-specific-dpr-revival.v1",
+  "verdict": "AIAYN one-token ND revival exactness PASS on ROCm; TML candidate first-token RED; no demonstrated speedup or full-document-KV revival",
+  "source_compatibility_sha256": "35eeec434dfe1e68d61ffc2a6db88f4738a7ba20ee55967031bded29da967a8a",
+  "spark_producer": {
+    "recipe": "spark",
+    "compute": "registered full CUDA",
+    "source_state_id": "reading-aiayn-tml-v1-t14-core-graph",
+    "source_position": 22899,
+    "source_payload_bytes": 887992320,
+    "source_purpose": "candidate production only; never imported into ROCm"
+  },
+  "rocm": {
+    "recipe": "rocm",
+    "context": 8192,
+    "workers": 8,
+    "nfq": {"n": 104, "f": 1, "q": 4},
+    "configured_target_x": 8,
+    "observed_dpr_horizon": 1,
+    "dpr_mode": "dynamic",
+    "retention_budget_bytes": 1000000000,
+    "parent_imported": false,
+    "memory_limit_bytes": 7500000000
+  },
+  "aiayn": {
+    "source_sha256": "ccc9fd3451dc99e8822b747f53c1351dce55c04fc649fced4052070951a758e7",
+    "question": "Give only the scaled dot-product attention formula from Attention Is All You Need.",
+    "response": "$$\\text{Attention}(Q, K, V) = \\text{softmax}\\left(\\frac{QK^T}{\\sqrt{d_k}}\\right)V$$",
+    "output_tokens": 36,
+    "spark_published_nd_edges": 8,
+    "immutable_edge_bytes": 4096,
+    "reference_files": 0,
+    "qa_key_sha256": "029455a9231b2a00da11b5c68adba82a946884ee9f26705eccd0927a2d22081b",
+    "actual_fresh_process_hits": 3,
+    "accepted_tokens_each": [1, 1, 1],
+    "off_request_wall_s": 12.005859,
+    "empty_dpr_request_wall_s": 12.259881,
+    "hit_request_walls_s": [12.042545, 12.155373, 11.929355],
+    "median_hit_request_wall_s": 12.042545,
+    "median_vs_one_off_pct": 0.3055674733478231,
+    "max_hit_rss_bytes": 5822332928,
+    "export_bytes": 27955456,
+    "exact_after_each_hit": {
+      "output_ids": true,
+      "complete_payload_sha256": "6123f599835fea3eecf1ab750cc9b9e60e7f949debcae09c3058e7dd296ebf93",
+      "state_sha256": "a301ff0a7f62c36ce4793267340bbafc6a6e1a369de31af218349e6e8a65afe1",
+      "facts_sha256": "892e600ec3647f2644c8a816a67154e646e0b129689093cc9b1eb484b725fd8e"
+    },
+    "learned_chart": {
+      "real_hit_rounds": 3,
+      "accepted_tokens_total": 3,
+      "committed_tokens_total": 3,
+      "lookup_ns_total": 870991,
+      "verify_ns_total": 1122680526,
+      "cost_ns_total": 1123551517,
+      "engine_chart_ms_per_accepted_plus_assumed_bonus": 187.25858616666665,
+      "measured_cost_ms_per_actual_committed": 374.5171723333333,
+      "serial_reference_ms_per_output": 243.07803655555554,
+      "initial_static_chart": "Provisional admission prior from three real matching target continuations and measured DPR-off B1 cost; not three measured DPR verifications"
+    }
+  },
+  "thinking_machines_lab": {
+    "source_sha256": "edbc2518f9d3cf8bb7300e9e5088a587c6e8c7d1c47be0fd6b8e994a8080438c",
+    "question": "According to the Thinking Machines Lab article on inference determinism, what does batch invariance require when the number of concurrent requests changes? Answer in one sentence.",
+    "spark_answer": "To achieve batch invariance, the kernel's reduction strategy must remain identical regardless of the batch size or the number of tokens being processed in a sequence.",
+    "rocm_answer": "According to the article, batch invariance requires that the model's output remains identical regardless of whether a request is processed individually or as part of a larger batch of concurrent requests.",
+    "spark_output_tokens": 31,
+    "rocm_output_tokens": 36,
+    "first_spark_token": 2021,
+    "first_rocm_token": 10450,
+    "common_output_prefix_tokens": 0,
+    "edge_published": false,
+    "verdict": "No target-accepted Spark trajectory for this fresh ROCm parent; stopped before publication"
+  },
+  "qualification_limits": [
+    "No parent KV imported into ROCm; no document-KV restoration or proof of source-dependent knowledge",
+    "Configured X8 did not run as eight physical DPR rows; observed hit horizon was one",
+    "No request-wall speedup versus the one matched DPR-off control; static/learned chart does not override this measured result",
+    "No general-DPR test or full repository test suite"
+  ]
+}

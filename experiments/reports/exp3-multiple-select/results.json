@@ -1,0 +1,217 @@
+{
+  "accuracy": {
+    "correct": 5,
+    "natural_stop": 5,
+    "strict_single_letter": 5,
+    "total": 5
+  },
+  "aggregate": {
+    "decode_ms_per_output": 69.1713993,
+    "http_wall_s": 33.635733,
+    "new_input_tokens": 942,
+    "output_tokens": 10,
+    "prefill_ms_per_new_input": 34.231122524416136,
+    "rss_peak_bytes": 30887186432
+  },
+  "binary_sha256": "1998f0835fcc9608c04cd079a2ce01e3fdb0e97f9c080ed266f5cfddee20c462",
+  "build_receipt_sha256": "4f678adeabeb6dc253da742040275491c2e1c4b2cc18c43c555af50ae422f0de",
+  "controls": {
+    "max_tokens": 16,
+    "reasoning_effort": "none",
+    "salt_proof_state": false,
+    "seed": 128,
+    "stream": false,
+    "temperature": 0.65,
+    "top_k": 20
+  },
+  "final_export": {
+    "bytes": 457462016,
+    "compatibility_sha256": "35eeec434dfe1e68d61ffc2a6db88f4738a7ba20ee55967031bded29da967a8a",
+    "export_wall_s": 16.44568092469126,
+    "facts_sha256": "0a4eb2dfdb4d8b770e9a159c971fdb7d0438cb01660fd269ed5b11a30f6cfe35",
+    "id": "exp3-mcq-spark-t0p65-s128-0930",
+    "payload_sha256": "b96e7b02f6fb8b9c4a3943a514af4a39e41553540505feaddfa45590d6ad2266",
+    "position": 1877,
+    "state_sha256": "fa8bdf0cccb1357865d8f6f22e9dad7a692b8a5e98e4bd0b460ac12b21e15685"
+  },
+  "final_export_deleted": true,
+  "fixture_sha256": "b43a0f71d6170153be9123cd3ff338a748fcb7b0c5afe321252039f7258bf64b",
+  "interpretation": "four supplied answers, one best letter selected; not free-form recall, not multi-label subset selection",
+  "limitations": [
+    "Answers are supplied as options; the result tests selecting among them, not unaided recall of source facts",
+    "One option ordering and one sampled seed on one host/build; no robustness or deterministic repeat",
+    "Input lengths and continuing KV histories differ from the free-form Section 2 comparator; speed is not an equal-work compute claim",
+    "Reported decode ms/output includes a one-letter answer and a stop token per request; the low denominator is not a kernel-throughput improvement",
+    "No no-parent control, GPU duty/power measurement, or physical NFQ/X engagement trace"
+  ],
+  "local_section2_checkpoint": "efa8c87e5d01c6a848f4de2d50dbea476daae50d 2026-09-30T19:07:56-04:00",
+  "model_source_sha256": "6fb79ac4b0a45113d9582d13d00a83f50f51add1c68c42080a934fd01e9145b3",
+  "observed_wall_ratio_baseline_over_exp3": 2.880367405699171,
+  "parent_id": "exp-parent-synthetic-spark-ctx12288-v1",
+  "parent_position": 925,
+  "parent_preserved": true,
+  "parent_state_sha256": "3e381e4bb6b9b555b68210f9313e2aa6670d50023583e4356eb365ff2584b6b0",
+  "probes": [
+    {
+      "baseline_open_answer": {
+        "http_wall_s": 25.356191,
+        "new_input_tokens": 37,
+        "output_tokens": 188
+      },
+      "correct": true,
+      "decode_ms_per_output": 67.249103,
+      "expected_label": "B",
+      "finish_reason": "stop",
+      "http_wall_s": 6.00787,
+      "id": "expected_behavior_choice",
+      "loaded_position": 925,
+      "native_decode_cycles": 2,
+      "new_input_tokens": 186,
+      "output_ids_sha256": "624dfc6f79222a1d1f2f15a98f94310cb1a522f1eae92262a689c6995d496d65",
+      "output_tokens": 2,
+      "prefill_ms_per_input": 30.846755532258065,
+      "rss_peak_bytes": 30887186432,
+      "saved_position": 1113,
+      "section": "2.1",
+      "selected_label": "B",
+      "strict_single_letter": true
+    },
+    {
+      "baseline_open_answer": {
+        "http_wall_s": 30.257643,
+        "new_input_tokens": 41,
+        "output_tokens": 213
+      },
+      "correct": true,
+      "decode_ms_per_output": 68.2288225,
+      "expected_label": "D",
+      "finish_reason": "stop",
+      "http_wall_s": 5.960404,
+      "id": "consistent_behavior_choice",
+      "loaded_position": 1113,
+      "native_decode_cycles": 2,
+      "new_input_tokens": 169,
+      "output_ids_sha256": "1830a79bca694f39d3860b6a148001b517f813594f5d6e86cbcb6f3e39f5bc14",
+      "output_tokens": 2,
+      "prefill_ms_per_input": 33.64581741420118,
+      "rss_peak_bytes": 30887186432,
+      "saved_position": 1284,
+      "section": "2.2",
+      "selected_label": "D",
+      "strict_single_letter": true
+    },
+    {
+      "baseline_open_answer": {
+        "http_wall_s": 15.754605,
+        "new_input_tokens": 38,
+        "output_tokens": 102
+      },
+      "correct": true,
+      "decode_ms_per_output": 69.681621,
+      "expected_label": "C",
+      "finish_reason": "stop",
+      "http_wall_s": 8.690132,
+      "id": "expected_consistent_facts_choice",
+      "loaded_position": 1284,
+      "native_decode_cycles": 2,
+      "new_input_tokens": 256,
+      "output_ids_sha256": "059fa6e179765c474764288e505a00c2ca5bc0c733e111cd17c0317a8a436e22",
+      "output_tokens": 2,
+      "prefill_ms_per_input": 32.85127819921875,
+      "rss_peak_bytes": 30887186432,
+      "saved_position": 1542,
+      "section": "2.3",
+      "selected_label": "C",
+      "strict_single_letter": true
+    },
+    {
+      "baseline_open_answer": {
+        "http_wall_s": 16.622901,
+        "new_input_tokens": 44,
+        "output_tokens": 105
+      },
+      "correct": true,
+      "decode_ms_per_output": 69.7573575,
+      "expected_label": "A",
+      "finish_reason": "stop",
+      "http_wall_s": 6.735264,
+      "id": "skew_facts_choice",
+      "loaded_position": 1542,
+      "native_decode_cycles": 2,
+      "new_input_tokens": 176,
+      "output_ids_sha256": "af565f42d26c4183088b4447ffe112821e1fd51c462d8c6cbdaaf9bb1ba7826b",
+      "output_tokens": 2,
+      "prefill_ms_per_input": 36.673955954545455,
+      "rss_peak_bytes": 30887186432,
+      "saved_position": 1720,
+      "section": "2.4",
+      "selected_label": "A",
+      "strict_single_letter": true
+    },
+    {
+      "baseline_open_answer": {
+        "http_wall_s": 8.891929,
+        "new_input_tokens": 42,
+        "output_tokens": 48
+      },
+      "correct": true,
+      "decode_ms_per_output": 70.9400925,
+      "expected_label": "B",
+      "finish_reason": "stop",
+      "http_wall_s": 6.242063,
+      "id": "skew_behavior_choice",
+      "loaded_position": 1720,
+      "native_decode_cycles": 2,
+      "new_input_tokens": 155,
+      "output_ids_sha256": "624dfc6f79222a1d1f2f15a98f94310cb1a522f1eae92262a689c6995d496d65",
+      "output_tokens": 2,
+      "prefill_ms_per_input": 38.43570502580645,
+      "rss_peak_bytes": 30887186432,
+      "saved_position": 1877,
+      "section": "2.5",
+      "selected_label": "B",
+      "strict_single_letter": true
+    }
+  ],
+  "recipe": {
+    "compute_node": "full",
+    "expert_budget_gb": 13,
+    "nfq": {
+      "candidate_count": 48,
+      "configured": true,
+      "f": 1,
+      "n": 48,
+      "nodes": 48,
+      "q": 4
+    },
+    "rss_limit_gb": 60.0,
+    "w": 8,
+    "x": 48
+  },
+  "remote_checkout_head": "6c4c8fcb91fe1c94d29e4c2c6cfe0ef886eb8589",
+  "resource_snapshots": {
+    "approximate": true,
+    "count": 10,
+    "max_bytes": {
+      "application_bytes": 2290356224,
+      "compressed_bytes": 0,
+      "external_bytes": 28261773312,
+      "internal_bytes": 544251904,
+      "page_table_bytes": 60018688,
+      "resident_bytes": 30492110848,
+      "resident_os_peak_bytes": 30887186432,
+      "shared_bytes": 1686085632,
+      "swap_bytes": 0
+    }
+  },
+  "schema": "salt.experiments.exp3.embedded-answer-choice.report.v1",
+  "section2_comparator": {
+    "decode_ms_per_output": 131.20400607317075,
+    "different_request_information": true,
+    "http_wall_s": 96.883269,
+    "new_input_tokens": 202,
+    "output_tokens": 656,
+    "prefill_ms_per_new_input": 50.118511168316836,
+    "rss_peak_bytes": 30887321600
+  }
+}

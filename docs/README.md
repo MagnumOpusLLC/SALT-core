@@ -9,6 +9,12 @@ closed work-order records, future backlog, and historical material.
   reproduced proof results, and explicit limits on runtime correspondence.
 - [`TRANSMUTATION.md`](TRANSMUTATION.md) — curated Citrinitas/Rosarium findings,
   the scoped loader proof, and its unresolved source-provenance boundary.
+- [`../experiments/reports/README.md`](../experiments/reports/README.md) —
+  seven historical experiment families and their source-indexed results.
+  The authoring links to the separate manuscript and two private work orders
+  are not bundled here; these reports are not release qualification.
+- [`EC2-START.md`](EC2-START.md) — Mac-side status/start command for existing
+  c6i.2xlarge and g4ad.xlarge instances; no provisioning or server launch.
 
 1. [`COGNITIVE-STATE-RISK.md`](COGNITIVE-STATE-RISK.md) — KV Cache and Persistent
    Agent State Statement: beyond-prompt state, rights, consent, risks, and the

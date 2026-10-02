@@ -1,0 +1,25 @@
+{
+  "schema": "salt.experiments.rocm-daily-conversation-ctx4096.v1",
+  "description": "Three independent fresh native processes, each carrying one four-turn everyday lunch-planning conversation in live KV. Synthetic user constraints, no imported parent or policy attachment.",
+  "host_recipe": "rocm",
+  "context_tokens": 4096,
+  "server_max_output": 512,
+  "kv_budget_gb": 1.0,
+  "workers": 8,
+  "repeats": 3,
+  "request_controls": {"model": "gemma-4-26b-a4b-it", "temperature": 0, "top_k": 1, "max_tokens": 192, "reasoning_effort": "none", "stream": false, "salt_proof_state": false},
+  "turns": [
+    {"id": "lunch_idea", "user": "I'm making lunch for three with rice, chickpeas, and spinach. One guest avoids peanuts. Suggest a simple dish in two short sentences."},
+    {"id": "time_and_pan", "user": "I only have 25 minutes and one pan. Can you adapt that lunch so I can actually make it in time?"},
+    {"id": "dairy_and_budget", "user": "One guest also avoids dairy. What extra ingredients, if any, should I buy on a small budget?"},
+    {"id": "final_plan", "user": "Thanks. Summarize the final plan and all the food and time constraints in a short checklist."}
+  ],
+  "semantic_review": {
+    "lunch_idea": "Uses the available rice, chickpeas, spinach; no peanut-containing recommendation.",
+    "time_and_pan": "Adapts to one pan and 25 minutes, preserving the peanut restriction and using feasible ready-to-cook ingredients.",
+    "dairy_and_budget": "Retains peanut restriction, adds dairy avoidance, suggests only modest missing ingredients and no expensive or time-intensive substitution.",
+    "final_plan": "Recalls three people, rice/chickpeas/spinach, peanut-free and dairy-free guest, one pan, 25 minutes, and budget-minded shopping without contradicting earlier turns."
+  },
+  "state_contract": "Greedy with no seed; require identical input/output IDs, rendered text, finish reasons, positions, complete state/facts/payload/canonical SHA after the same four turns across three fresh processes. Keep live KV in one session across turns; export only after the final answer, separately timed and deleted after exact verification.",
+  "limits": ["One ROCm host and one synthetic conversation; no cross-platform or multi-user guarantee", "Model stops naturally below O192 when possible; cap closure is a semantic partial, not a forced four-turn PASS", "Native startup, state export, and cleanup excluded from per-request HTTP wall; OS page-cache warmth can vary across repeats", "No CTX12288 parent import into CTX4096"]
+}

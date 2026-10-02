@@ -1,0 +1,38 @@
+{
+  "schema": "salt.experiments.aiayn-35-x-sweep-report.v1",
+  "host": "V520 ROCm",
+  "mode": "full GPU",
+  "recipe": "rocm",
+  "identity": {
+    "source_head": "6c4c8fcb91fe1c94d29e4c2c6cfe0ef886eb8589",
+    "source_head_committed": "2026-09-29T08:22:59-04:00",
+    "binary_sha256": "9a60c6b54094e2e943e61e1f3ba0b0f2699a9337380ee4a84dde9c0a414c3fbb",
+    "receipt_sha256": "a8860ac9bf663f013ce015cf199e6885bee09c2588ed46e8796f1b85fb70d5a8"
+  },
+  "source_dirty": "scoped uncommitted flag patch staged onto remote source",
+  "compatibility_sha256": "35eeec434dfe1e68d61ffc2a6db88f4738a7ba20ee55967031bded29da967a8a",
+  "context": 8192,
+  "workers": 8,
+  "nfq": {"n": 104, "f": 1, "q": 4},
+  "dpr_mode": "dynamic",
+  "flag": "SALT_DPR_INDEPENDENT_DRAFT=1",
+  "dpr_draft_n": 64,
+  "fixture": "aiayn-dpr-revival-question-v1.json",
+  "source_artifact": "Spark full-CUDA turn14 natural 36-token answer, full 36-ID ROCm prefix matched",
+  "source_edges": 35,
+  "source_output_tokens": 36,
+  "stop_id_excluded": true,
+  "parent_imported": false,
+  "cells": [
+    {"configured_x": 12, "native_dpr_horizon": 12, "accepted": 12, "committed": 12, "acceptance_rate": 1.0, "prompt_tokens": 29, "output_tokens": 36, "prefill_ms_per_input": 103.9298506551724, "decode_ms_per_output": 192.07331927777778, "request_wall_s": 10.444749, "rss_peak_bytes": 5822300160, "gpu_kernel_nodes": 664, "gpu_host_launches": 664, "output_ids_equal": true, "complete_state_equal": true},
+    {"configured_x": 24, "native_dpr_horizon": 24, "accepted": 24, "committed": 24, "acceptance_rate": 1.0, "prompt_tokens": 29, "output_tokens": 36, "prefill_ms_per_input": 103.97950203448276, "decode_ms_per_output": 130.3320578611111, "request_wall_s": 8.23277, "rss_peak_bytes": 5822357504, "gpu_kernel_nodes": 664, "gpu_host_launches": 664, "output_ids_equal": true, "complete_state_equal": true},
+    {"configured_x": 36, "native_dpr_horizon": 35, "accepted": 35, "committed": 35, "acceptance_rate": 1.0, "prompt_tokens": 29, "output_tokens": 36, "prefill_ms_per_input": 103.85556244827586, "decode_ms_per_output": 80.5748106111111, "request_wall_s": 6.212512, "rss_peak_bytes": 5822287872, "gpu_kernel_nodes": 664, "gpu_host_launches": 664, "output_ids_equal": true, "complete_state_equal": true},
+    {"configured_x": 48, "native_dpr_horizon": 35, "accepted": 35, "committed": 35, "acceptance_rate": 1.0, "prompt_tokens": 29, "output_tokens": 36, "prefill_ms_per_input": 103.99735948275863, "decode_ms_per_output": 80.9881166388889, "request_wall_s": 6.230767, "rss_peak_bytes": 5822251008, "gpu_kernel_nodes": 664, "gpu_host_launches": 664, "output_ids_equal": true, "complete_state_equal": true}
+  ],
+  "matched_build_off_control": {"decode_ms_per_output": 238.7585038888889, "nomogram_hits": 0, "prefill_ms_per_input": 103.9815256551724, "request_wall_s": 11.929124, "rss_peak_bytes": 5821804544},
+  "mean_acceptance_rate": 1.0,
+  "max_rss_bytes": 5822357504,
+  "all_output_ids_and_complete_kv_state_facts_equal": true,
+  "no_speedup_promoted": true,
+  "x36_x48_physical_horizon_saturated_at": 35
+}

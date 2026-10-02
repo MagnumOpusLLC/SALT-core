@@ -1,0 +1,571 @@
+{
+  "binary_sha256_by_mode": {
+    "acer-ec2-cpu": "6bc531b3e0ea297a85b34298dc175c28953a9342656985bd58013d58cee92aa1",
+    "ec2": "eb76e43bda6bcd360c3e830c4c186bc7f23a5c6d1473bd62fc69eb4317533b8d",
+    "mac": "e036f58faed9c878863878c27f724b3325227f4afd85820bae8e3f4b4658afa1",
+    "mac-metal": "e036f58faed9c878863878c27f724b3325227f4afd85820bae8e3f4b4658afa1",
+    "rocm": "3db881c2b312e9bd820b489415e98e14fe44ca8451e288e44001b746edb9d4e4",
+    "spark": "1998f0835fcc9608c04cd079a2ce01e3fdb0e97f9c080ed266f5cfddee20c462"
+  },
+  "compatibility_sha256": "35eeec434dfe1e68d61ffc2a6db88f4738a7ba20ee55967031bded29da967a8a",
+  "counted_cells": 360,
+  "execution_status": "six-mode corrected grid complete; latest bounded spark-hmm cell exact on six fresh replays; broader HMM temperature coverage not established",
+  "grid_sha256": "335d574a67f3a8f66f4cb18f7cb3d5128f40801a4ffc344e913f69a2ea3c9464",
+  "latest_hmm_capture": {
+    "counted_in_v5_grid": false,
+    "final_payload_sha256": "150e641279b946618b832725dbb5197986b6d35548938b29a723b23a5dbfb251",
+    "final_position": 1719,
+    "final_state_sha256": "85b2c48014e0829edbe78b75b2a545c96b2f367950c3e840ec2a82cf15a5ce7d",
+    "local_action_logs": [
+      "logs/experiments/114-capture-v5-hmm.log",
+      "logs/experiments/114-capture-v5-hmm-final-only.log"
+    ],
+    "per_turn_export_replays": 3,
+    "result": "all six fresh HMM replays matched registered Spark output IDs, payload, facts, and complete state at each observed export boundary",
+    "retained_capture_kv": false,
+    "scope": "0.1 / seed 1024 / authenticated parent / P512-O128 / two turns",
+    "uninterrupted_final_only_replays": 3
+  },
+  "latest_semantic_followup": {
+    "counted_in_six_mode_grid": false,
+    "first_output_cap": 128,
+    "first_turn_output_ids_equal_to_grid": true,
+    "followup_finish_reason": "stop",
+    "followup_first_128_ids_equal_to_grid": true,
+    "followup_output_cap": 256,
+    "followup_output_tokens": 132,
+    "followup_response": "The authenticated case record supports the following regarding the east-gateway incident:\n\n*   **First causal event:** At 14:37 UTC, worker group cobalt reused resource slot 41 before the final consumer lease released, and the successor state failed.\n*   **Rejected explanation:** Network saturation was investigated and rejected because link utilization and packet loss remained normal.\n*   **Recovery instruction:** Roll back release 2026.09.17 and drain worker group cobalt.\n*   **Preventive control:** Never reuse a slot before the final consumer fence.\n\nI did not personally execute any rollback or drain.",
+    "native_phase_metrics": [
+      {
+        "completion_tokens": 93,
+        "decode_cycles": 93,
+        "decode_misses": 0,
+        "decode_ms_per_completion_token": 133.79774150537634,
+        "elapsed_ms": 28467.50858705491,
+        "live_kv_loaded_tokens": 925,
+        "modality": "text",
+        "nomogram_hits": 0,
+        "parent_hits": 0,
+        "prefill_cached_tokens": 0,
+        "prefill_hits": 0,
+        "prefill_ms_per_input_token": 31.026464837890625,
+        "prompt_tokens": 512,
+        "proposal_ms_per_proposed_token": null,
+        "request": "2",
+        "target_ms_per_accepted_token": null
+      },
+      {
+        "completion_tokens": 132,
+        "decode_cycles": 132,
+        "decode_misses": 0,
+        "decode_ms_per_completion_token": 136.29079982575757,
+        "elapsed_ms": 21250.890452880412,
+        "live_kv_loaded_tokens": 1530,
+        "modality": "text",
+        "nomogram_hits": 0,
+        "parent_hits": 0,
+        "prefill_cached_tokens": 0,
+        "prefill_hits": 0,
+        "prefill_ms_per_input_token": 47.993983584615385,
+        "prompt_tokens": 65,
+        "proposal_ms_per_proposed_token": null,
+        "request": "3",
+        "target_ms_per_accepted_token": null
+      }
+    ],
+    "receipt": "logs/experiments/semantic-followup-v1/spark-t0p65-s128-o256/result.json",
+    "scope": "one fresh registered Spark two-turn ordinary HTTP session; same parent/first request; follow-up cap 256",
+    "seed": 128,
+    "semantic_verdict": "PASS for this single follow-up: complete factual answer and explicit non-execution; broader temperature/seed matrix untested at O256",
+    "temperature": 0.65,
+    "turns": [
+      {
+        "finish_reason": "stop",
+        "http_wall_s": 28.479017,
+        "loaded_position": 925,
+        "new_prompt_tokens": 512,
+        "output_ids_sha256": "c84b916cb0b9b6e257bd3164a25addd89a713d1015eb4c93aab5df1712e3ae3a",
+        "output_tokens": 93,
+        "rss_peak_bytes": 30887198720,
+        "saved_position": 1530,
+        "turn": 1
+      },
+      {
+        "finish_reason": "stop",
+        "http_wall_s": 21.252563,
+        "loaded_position": 1530,
+        "new_prompt_tokens": 65,
+        "output_ids_sha256": "a3d89b9c3e3b78a5edea2155e4b411f31187f560c82f132f5abf9f60b4e0fdf1",
+        "output_tokens": 132,
+        "rss_peak_bytes": 30887198720,
+        "saved_position": 1727,
+        "turn": 2
+      }
+    ]
+  },
+  "mode_counts": {
+    "acer-ec2-cpu": 60,
+    "ec2": 60,
+    "mac": 60,
+    "mac-metal": 60,
+    "rocm": 60,
+    "spark": 60
+  },
+  "model_source_sha256": "6fb79ac4b0a45113d9582d13d00a83f50f51add1c68c42080a934fd01e9145b3",
+  "parent_id": "exp-parent-synthetic-spark-ctx12288-v1",
+  "parent_payload_sha256": "533211e7220f8cf4c978963368dde4a6e56c4b7b97f6f919c30497651be00184",
+  "parent_position": 925,
+  "parent_state_sha256": "3e381e4bb6b9b555b68210f9313e2aa6670d50023583e4356eb365ff2584b6b0",
+  "per_mode": {
+    "acer-ec2-cpu": {
+      "cells": 60,
+      "median_first_decode_ms_per_output": 323.9975212754116,
+      "median_first_http_wall_s": 59.5742685,
+      "median_first_prefill_ms_per_input": 59.4786807265625,
+      "median_followup_decode_ms_per_output": 327.20911714062504,
+      "median_followup_http_wall_s": 46.0359115,
+      "peak_rss_bytes": 8585338880,
+      "temperatures": {
+        "0.1": 12,
+        "0.2": 12,
+        "0.65": 12,
+        "0.8": 12,
+        "1.0": 12
+      }
+    },
+    "ec2": {
+      "cells": 60,
+      "median_first_decode_ms_per_output": 353.5206787724719,
+      "median_first_http_wall_s": 148.35296499999998,
+      "median_first_prefill_ms_per_input": 227.91785937499998,
+      "median_followup_decode_ms_per_output": 356.34315804296875,
+      "median_followup_http_wall_s": 62.0127035,
+      "peak_rss_bytes": 8583299072,
+      "temperatures": {
+        "0.1": 12,
+        "0.2": 12,
+        "0.65": 12,
+        "0.8": 12,
+        "1.0": 12
+      }
+    },
+    "mac": {
+      "cells": 60,
+      "median_first_decode_ms_per_output": 181.90883776301217,
+      "median_first_http_wall_s": 47.157993000000005,
+      "median_first_prefill_ms_per_input": 59.9422734375,
+      "median_followup_decode_ms_per_output": 184.02197265625,
+      "median_followup_http_wall_s": 29.1910305,
+      "peak_rss_bytes": 3678109696,
+      "temperatures": {
+        "0.1": 12,
+        "0.2": 12,
+        "0.65": 12,
+        "0.8": 12,
+        "1.0": 12
+      }
+    },
+    "mac-metal": {
+      "cells": 60,
+      "median_first_decode_ms_per_output": 197.6156413188871,
+      "median_first_http_wall_s": 37.9011115,
+      "median_first_prefill_ms_per_input": 40.0016220703125,
+      "median_followup_decode_ms_per_output": 185.56287109375,
+      "median_followup_http_wall_s": 28.0174825,
+      "peak_rss_bytes": 3758784512,
+      "temperatures": {
+        "0.1": 12,
+        "0.2": 12,
+        "0.65": 12,
+        "0.8": 12,
+        "1.0": 12
+      }
+    },
+    "rocm": {
+      "cells": 60,
+      "median_first_decode_ms_per_output": 430.2934326966292,
+      "median_first_http_wall_s": 73.3067135,
+      "median_first_prefill_ms_per_input": 67.48860890039063,
+      "median_followup_decode_ms_per_output": 439.2387344257812,
+      "median_followup_http_wall_s": 61.9702495,
+      "peak_rss_bytes": 5992771584,
+      "temperatures": {
+        "0.1": 12,
+        "0.2": 12,
+        "0.65": 12,
+        "0.8": 12,
+        "1.0": 12
+      }
+    },
+    "spark": {
+      "cells": 60,
+      "median_first_decode_ms_per_output": 134.164110100644,
+      "median_first_http_wall_s": 27.799339,
+      "median_first_prefill_ms_per_input": 31.0458154609375,
+      "median_followup_decode_ms_per_output": 136.31014101171874,
+      "median_followup_http_wall_s": 20.8486915,
+      "peak_rss_bytes": 30887399424,
+      "temperatures": {
+        "0.1": 12,
+        "0.2": 12,
+        "0.65": 12,
+        "0.8": 12,
+        "1.0": 12
+      }
+    }
+  },
+  "per_temperature": {
+    "0.1": {
+      "cells": 72,
+      "first_length": 0,
+      "first_stop": 72,
+      "followup_length": 72,
+      "followup_stop": 0,
+      "modes": {
+        "acer-ec2-cpu": 12,
+        "ec2": 12,
+        "mac": 12,
+        "mac-metal": 12,
+        "rocm": 12,
+        "spark": 12
+      },
+      "unique_trajectories": 3
+    },
+    "0.2": {
+      "cells": 72,
+      "first_length": 0,
+      "first_stop": 72,
+      "followup_length": 72,
+      "followup_stop": 0,
+      "modes": {
+        "acer-ec2-cpu": 12,
+        "ec2": 12,
+        "mac": 12,
+        "mac-metal": 12,
+        "rocm": 12,
+        "spark": 12
+      },
+      "unique_trajectories": 4
+    },
+    "0.65": {
+      "cells": 72,
+      "first_length": 0,
+      "first_stop": 72,
+      "followup_length": 72,
+      "followup_stop": 0,
+      "modes": {
+        "acer-ec2-cpu": 12,
+        "ec2": 12,
+        "mac": 12,
+        "mac-metal": 12,
+        "rocm": 12,
+        "spark": 12
+      },
+      "unique_trajectories": 4
+    },
+    "0.8": {
+      "cells": 72,
+      "first_length": 0,
+      "first_stop": 72,
+      "followup_length": 72,
+      "followup_stop": 0,
+      "modes": {
+        "acer-ec2-cpu": 12,
+        "ec2": 12,
+        "mac": 12,
+        "mac-metal": 12,
+        "rocm": 12,
+        "spark": 12
+      },
+      "unique_trajectories": 4
+    },
+    "1.0": {
+      "cells": 72,
+      "first_length": 0,
+      "first_stop": 72,
+      "followup_length": 72,
+      "followup_stop": 0,
+      "modes": {
+        "acer-ec2-cpu": 12,
+        "ec2": 12,
+        "mac": 12,
+        "mac-metal": 12,
+        "rocm": 12,
+        "spark": 12
+      },
+      "unique_trajectories": 4
+    }
+  },
+  "projection_sha256": "e5f55aa35262a824431d833a04d1e9f887190bb94cc26d3f5a24a02b04154ad0",
+  "qualification_scope": "six complete modes pass this matched grid; HMM latest six-replay cell is exact, but its five-temperature matrix is not complete",
+  "repeat_differences": [],
+  "schema": "salt.experiments.randomplay.corrected-v5.report.v1",
+  "semantic_scope": "manual review of all 14 full unique transcript pairs, not the five held-out rubric probes",
+  "six_mode_cross_mode_differences": [],
+  "source_commit": "c3e80041a30add8ff0add42000a551880805cb7d",
+  "source_commit_time": "2026-09-30T03:11:03-04:00",
+  "unique_trajectories": [
+    {
+      "cells": 36,
+      "first_finish_reason": "stop",
+      "first_output_tokens": 89,
+      "first_turn_manual_review": "source-grounded facts and instruction, no asserted execution",
+      "followup_finish_reason": "length",
+      "followup_manual_review": "incomplete at cap; direct action-status answer not complete",
+      "followup_output_tokens": 128,
+      "id": "R01",
+      "stray_s_bullet": false,
+      "temperature_seed": [
+        {
+          "seed": 42,
+          "temperature": 0.1
+        },
+        {
+          "seed": 42,
+          "temperature": 0.2
+        }
+      ]
+    },
+    {
+      "cells": 54,
+      "first_finish_reason": "stop",
+      "first_output_tokens": 89,
+      "first_turn_manual_review": "source-grounded facts and instruction, no asserted execution",
+      "followup_finish_reason": "length",
+      "followup_manual_review": "incomplete at cap; direct action-status answer not complete",
+      "followup_output_tokens": 128,
+      "id": "R02",
+      "stray_s_bullet": true,
+      "temperature_seed": [
+        {
+          "seed": 47,
+          "temperature": 0.1
+        },
+        {
+          "seed": 128,
+          "temperature": 0.1
+        },
+        {
+          "seed": 47,
+          "temperature": 0.2
+        }
+      ]
+    },
+    {
+      "cells": 18,
+      "first_finish_reason": "stop",
+      "first_output_tokens": 88,
+      "first_turn_manual_review": "source-grounded facts and instruction, no asserted execution",
+      "followup_finish_reason": "length",
+      "followup_manual_review": "incomplete at cap; direct action-status answer not complete",
+      "followup_output_tokens": 128,
+      "id": "R03",
+      "stray_s_bullet": true,
+      "temperature_seed": [
+        {
+          "seed": 1024,
+          "temperature": 0.1
+        }
+      ]
+    },
+    {
+      "cells": 18,
+      "first_finish_reason": "stop",
+      "first_output_tokens": 90,
+      "first_turn_manual_review": "source-grounded facts and instruction, no asserted execution",
+      "followup_finish_reason": "length",
+      "followup_manual_review": "incomplete at cap; direct action-status answer not complete",
+      "followup_output_tokens": 128,
+      "id": "R04",
+      "stray_s_bullet": false,
+      "temperature_seed": [
+        {
+          "seed": 128,
+          "temperature": 0.2
+        }
+      ]
+    },
+    {
+      "cells": 18,
+      "first_finish_reason": "stop",
+      "first_output_tokens": 90,
+      "first_turn_manual_review": "source-grounded facts and instruction, no asserted execution",
+      "followup_finish_reason": "length",
+      "followup_manual_review": "incomplete at cap; direct action-status answer not complete",
+      "followup_output_tokens": 128,
+      "id": "R05",
+      "stray_s_bullet": false,
+      "temperature_seed": [
+        {
+          "seed": 1024,
+          "temperature": 0.2
+        }
+      ]
+    },
+    {
+      "cells": 18,
+      "first_finish_reason": "stop",
+      "first_output_tokens": 84,
+      "first_turn_manual_review": "source-grounded facts and instruction, no asserted execution",
+      "followup_finish_reason": "length",
+      "followup_manual_review": "incomplete at cap; direct action-status answer not complete",
+      "followup_output_tokens": 128,
+      "id": "R06",
+      "stray_s_bullet": false,
+      "temperature_seed": [
+        {
+          "seed": 42,
+          "temperature": 0.65
+        }
+      ]
+    },
+    {
+      "cells": 18,
+      "first_finish_reason": "stop",
+      "first_output_tokens": 89,
+      "first_turn_manual_review": "source-grounded facts and instruction, no asserted execution",
+      "followup_finish_reason": "length",
+      "followup_manual_review": "incomplete at cap; direct action-status answer not complete",
+      "followup_output_tokens": 128,
+      "id": "R07",
+      "stray_s_bullet": true,
+      "temperature_seed": [
+        {
+          "seed": 47,
+          "temperature": 0.65
+        }
+      ]
+    },
+    {
+      "cells": 18,
+      "first_finish_reason": "stop",
+      "first_output_tokens": 93,
+      "first_turn_manual_review": "source-grounded facts and instruction, no asserted execution",
+      "followup_finish_reason": "length",
+      "followup_manual_review": "incomplete at cap; direct action-status answer not complete",
+      "followup_output_tokens": 128,
+      "id": "R08",
+      "stray_s_bullet": false,
+      "temperature_seed": [
+        {
+          "seed": 128,
+          "temperature": 0.65
+        }
+      ]
+    },
+    {
+      "cells": 54,
+      "first_finish_reason": "stop",
+      "first_output_tokens": 86,
+      "first_turn_manual_review": "source-grounded facts and instruction, no asserted execution",
+      "followup_finish_reason": "length",
+      "followup_manual_review": "incomplete at cap; direct action-status answer not complete",
+      "followup_output_tokens": 128,
+      "id": "R09",
+      "stray_s_bullet": false,
+      "temperature_seed": [
+        {
+          "seed": 1024,
+          "temperature": 0.65
+        },
+        {
+          "seed": 1024,
+          "temperature": 0.8
+        },
+        {
+          "seed": 1024,
+          "temperature": 1.0
+        }
+      ]
+    },
+    {
+      "cells": 36,
+      "first_finish_reason": "stop",
+      "first_output_tokens": 82,
+      "first_turn_manual_review": "source-grounded facts and instruction, no asserted execution",
+      "followup_finish_reason": "length",
+      "followup_manual_review": "incomplete at cap; direct action-status answer not complete",
+      "followup_output_tokens": 128,
+      "id": "R10",
+      "stray_s_bullet": false,
+      "temperature_seed": [
+        {
+          "seed": 42,
+          "temperature": 0.8
+        },
+        {
+          "seed": 42,
+          "temperature": 1.0
+        }
+      ]
+    },
+    {
+      "cells": 18,
+      "first_finish_reason": "stop",
+      "first_output_tokens": 89,
+      "first_turn_manual_review": "source-grounded facts and instruction, no asserted execution",
+      "followup_finish_reason": "length",
+      "followup_manual_review": "incomplete at cap; direct action-status answer not complete",
+      "followup_output_tokens": 128,
+      "id": "R11",
+      "stray_s_bullet": true,
+      "temperature_seed": [
+        {
+          "seed": 47,
+          "temperature": 0.8
+        }
+      ]
+    },
+    {
+      "cells": 18,
+      "first_finish_reason": "stop",
+      "first_output_tokens": 93,
+      "first_turn_manual_review": "source-grounded facts and instruction, no asserted execution",
+      "followup_finish_reason": "length",
+      "followup_manual_review": "incomplete at cap; direct action-status answer not complete",
+      "followup_output_tokens": 128,
+      "id": "R12",
+      "stray_s_bullet": false,
+      "temperature_seed": [
+        {
+          "seed": 128,
+          "temperature": 0.8
+        }
+      ]
+    },
+    {
+      "cells": 18,
+      "first_finish_reason": "stop",
+      "first_output_tokens": 89,
+      "first_turn_manual_review": "source-grounded facts and instruction, no asserted execution",
+      "followup_finish_reason": "length",
+      "followup_manual_review": "incomplete at cap; direct action-status answer not complete",
+      "followup_output_tokens": 128,
+      "id": "R13",
+      "stray_s_bullet": true,
+      "temperature_seed": [
+        {
+          "seed": 47,
+          "temperature": 1.0
+        }
+      ]
+    },
+    {
+      "cells": 18,
+      "first_finish_reason": "stop",
+      "first_output_tokens": 86,
+      "first_turn_manual_review": "source-grounded facts and instruction, no asserted execution",
+      "followup_finish_reason": "length",
+      "followup_manual_review": "incomplete at cap; direct action-status answer not complete",
+      "followup_output_tokens": 128,
+      "id": "R14",
+      "stray_s_bullet": false,
+      "temperature_seed": [
+        {
+          "seed": 128,
+          "temperature": 1.0
+        }
+      ]
+    }
+  ]
+}

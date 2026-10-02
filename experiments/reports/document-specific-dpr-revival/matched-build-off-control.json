@@ -1,0 +1,16 @@
+{
+  "schema": "salt.experiments.aiayn-dpr-independent-off.v1",
+  "x": 6,
+  "dpr_mode": "off",
+  "flag_in_rocm_recipe": 1,
+  "prompt_tokens": 29,
+  "output_tokens": 36,
+  "request_wall_s": 11.929124,
+  "decode_ms_per_output": 238.7585038888889,
+  "prefill_ms_per_input": 103.9815256551724,
+  "rss_peak_bytes": 5821804544,
+  "nomogram_hits": 0,
+  "output_ids_equal": true,
+  "complete_state_equal": true,
+  "payload_bytes": 27955200
+}

@@ -1,0 +1,23 @@
+{
+  "schema": "salt.experiments.roc-policy-classifier.v1",
+  "host_recipe": "rocm",
+  "policy_file": "fixtures/policy.md",
+  "heldout_file": "fixtures/heldout.json",
+  "parent_id": "exp-aster-policy-rocm-v1",
+  "parent_max_rows": 8000,
+  "context_tokens": 12288,
+  "server_max_output": 512,
+  "workers": 8,
+  "kv_budget_gb": 1.0,
+  "dpr_mode": "off",
+  "parent_training": [
+    "Read the full fictional Aster policy as a system instruction. Explain naturally how to select among the four fixed codes and distinguish authoritative current evidence from noisy intake. Do not classify any held-out ticket or claim an external action occurred.",
+    "If several events conflict or an old signed event was superseded, how do you apply evidence authority and precedence? Answer naturally without using a held-out ticket."
+  ],
+  "parent_training_controls": {"model": "gemma-4-26b-a4b-it", "temperature": 0, "top_k": 1, "max_tokens": 512, "reasoning_effort": "none", "stream": false, "salt_proof_state": false},
+  "classification_controls": {"model": "gemma-4-26b-a4b-it", "temperature": 0, "top_k": 1, "max_tokens": 16, "reasoning_effort": "none", "stream": false, "salt_proof_state": false},
+  "case_prefix": "Classify this fictional ticket under the standing routing policy. Return exactly one uppercase code A, B, C, or D, with no explanation or other text.\n\n",
+  "arms": ["no_parent", "parent", "fresh_policy"],
+  "method": "For each held-out case, start a separate fresh managed ROCm server. The no-parent arm sees only the structured ticket, the parent arm imports the same immutable authenticated policy state and sees only the ticket, and the fresh-policy arm receives the full exact policy as a system message plus the same ticket. Scoring keys are never sent. Each arm has a unique session and no preceding held-out tickets. Measure native PREFILL/decode, HTTP wall, import wall, resource peaks, selection format/accuracy, and preserve request receipts. The parent is created by two prior ordinary natural conversation turns over the policy, not synthetic QA pairs.",
+  "limits": ["One ROCm host, one frozen synthetic policy, eight held-out cases and one greedy sampler cell", "No-parent and fresh-policy arms differ in information; accuracy is not an equal-quality speed comparator unless both answer correctly", "A preserved parent contains its two natural model replies as well as policy text; fresh policy is a raw system message", "No vLLM/SGLang prefix cache or DPR exact transition hit is implied by an imported full state"]
+}

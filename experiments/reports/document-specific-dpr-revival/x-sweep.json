@@ -1,0 +1,27 @@
+{
+  "schema": "salt.experiments.aiayn-dpr-x-sweep.v1",
+  "host": "V520 ROCm",
+  "recipe": "rocm",
+  "compatibility_sha256": "35eeec434dfe1e68d61ffc2a6db88f4738a7ba20ee55967031bded29da967a8a",
+  "context_tokens": 8192,
+  "workers": 8,
+  "nfq": {"n": 104, "f": 1, "q": 4},
+  "dpr_mode": "dynamic",
+  "parent_imported": false,
+  "fixture": "aiayn-dpr-revival-question-v1.json",
+  "fresh_native_process_per_cell": true,
+  "isolated_initial_dpr_stats_per_cell": true,
+  "records": [
+    {"requested_x": 2, "reported_x": 2, "observed_dpr_horizon": 1, "accepted": 1, "committed": 1, "nomogram_hits": 1, "prompt_tokens": 29, "output_tokens": 36, "prefill_ms_per_input": 104.71923327586207, "decode_ms_per_output": 229.4834127222222, "http_wall_s": 11.983372, "peak_rss_bytes": 5822308352},
+    {"requested_x": 3, "reported_x": 3, "observed_dpr_horizon": 1, "accepted": 1, "committed": 1, "nomogram_hits": 1, "prompt_tokens": 29, "output_tokens": 36, "prefill_ms_per_input": 104.40287534482759, "decode_ms_per_output": 228.95946652777778, "http_wall_s": 11.946955, "peak_rss_bytes": 5822308352},
+    {"requested_x": 4, "reported_x": 4, "observed_dpr_horizon": 1, "accepted": 1, "committed": 1, "nomogram_hits": 1, "prompt_tokens": 29, "output_tokens": 36, "prefill_ms_per_input": 103.95217206896552, "decode_ms_per_output": 228.76338425, "http_wall_s": 11.931841, "peak_rss_bytes": 5822230528},
+    {"requested_x": 6, "reported_x": 6, "observed_dpr_horizon": 1, "accepted": 1, "committed": 1, "nomogram_hits": 1, "prompt_tokens": 29, "output_tokens": 36, "prefill_ms_per_input": 104.28553410344827, "decode_ms_per_output": 228.84731866666667, "http_wall_s": 11.944545, "peak_rss_bytes": 5822324736}
+  ],
+  "all_output_ids_equal_to_dpr_off": true,
+  "all_complete_kv_state_facts_equal_to_dpr_off": true,
+  "all_gpu_prefill_markers_present": true,
+  "all_gpu_dpr_target_records_present": true,
+  "all_request_finish_reasons": "stop",
+  "observed_widths": [1, 1, 1, 1],
+  "interpretation": "The normal-serving pre-request KV threshold forces X1 at position zero; these are four configured-X cells, not four physical multirow X comparisons. No speed winner is established."
+}

@@ -1,0 +1,31 @@
+{
+  "schema": "salt.experiments.aiayn-dpr-independent-report.v1",
+  "host": "V520 ROCm",
+  "mode": "full GPU",
+  "recipe": "rocm",
+  "source_head": "6c4c8fcb91fe1c94d29e4c2c6cfe0ef886eb8589",
+  "source_head_committed": "2026-09-29T08:22:59-04:00",
+  "source_dirty": "scoped uncommitted flag patch staged onto remote source",
+  "binary_sha256": "9a60c6b54094e2e943e61e1f3ba0b0f2699a9337380ee4a84dde9c0a414c3fbb",
+  "build_receipt_sha256": "a8860ac9bf663f013ce015cf199e6885bee09c2588ed46e8796f1b85fb70d5a8",
+  "compatibility_sha256": "35eeec434dfe1e68d61ffc2a6db88f4738a7ba20ee55967031bded29da967a8a",
+  "context": 8192,
+  "workers": 8,
+  "nfq": {"n": 104, "f": 1, "q": 4},
+  "dpr_mode": "dynamic",
+  "dpr_draft_n": 64,
+  "flag": "SALT_DPR_INDEPENDENT_DRAFT=1",
+  "fixture": "aiayn-dpr-revival-question-v1.json",
+  "parent_imported": false,
+  "cells": [
+    {"x": 2, "native_horizon": 2, "accepted": 2, "committed": 2, "acceptance_rate": 1.0, "prefill_ms_per_input": 103.60807627586208, "decode_ms_per_output": 235.18264961111112, "request_wall_s": 12.045911, "rss_peak_bytes": 5822283776, "kernel_nodes": 664, "host_launches": 664, "complete_state_equal": true},
+    {"x": 3, "native_horizon": 3, "accepted": 3, "committed": 3, "acceptance_rate": 1.0, "prefill_ms_per_input": 103.72816937931034, "decode_ms_per_output": 229.01207758333334, "request_wall_s": 11.869445, "rss_peak_bytes": 5822267392, "kernel_nodes": 664, "host_launches": 664, "complete_state_equal": true},
+    {"x": 4, "native_horizon": 4, "accepted": 4, "committed": 4, "acceptance_rate": 1.0, "prefill_ms_per_input": 103.31900231034483, "decode_ms_per_output": 225.66862683333335, "request_wall_s": 11.712195, "rss_peak_bytes": 5822300160, "kernel_nodes": 664, "host_launches": 664, "complete_state_equal": true},
+    {"x": 6, "native_horizon": 6, "accepted": 6, "committed": 6, "acceptance_rate": 1.0, "prefill_ms_per_input": 103.36425834482759, "decode_ms_per_output": 216.81379030555556, "request_wall_s": 11.386029, "rss_peak_bytes": 5822304256, "kernel_nodes": 664, "host_launches": 664, "complete_state_equal": true}
+  ],
+  "mean_acceptance_rate": 1.0,
+  "max_rss_bytes": 5822304256,
+  "output_ids_equal_to_dpr_off": true,
+  "complete_kv_state_facts_equal_to_dpr_off": true,
+  "no_speedup_promoted": true
+}

@@ -1,0 +1,444 @@
+{
+  "binary_sha256": "3db881c2b312e9bd820b489415e98e14fe44ca8451e288e44001b746edb9d4e4",
+  "build_receipt_sha256": "ecfa7db8002521e8f387f6fcaddea760cafae4b0026ec7b31c5878021ce73632",
+  "context_tokens": 4096,
+  "controls": {
+    "max_tokens": 192,
+    "model": "gemma-4-26b-a4b-it",
+    "reasoning_effort": "none",
+    "salt_proof_state": false,
+    "stream": false,
+    "temperature": 0,
+    "top_k": 1
+  },
+  "determinism": {
+    "artifact_bytes": 163430656,
+    "canonical_sha256": "01916407cda0a3709e0d6944bbc8b93882a0220d8ca67cde9f9248ac79b4cce6",
+    "complete_state_facts_payload_canonical_equal": true,
+    "facts_sha256": "7676bdf9e8a08db1b9479d186fb677711f1c15f171f7ac334a095d13c737ea8e",
+    "final_exports_deleted": true,
+    "final_position": 380,
+    "output_ids_content_finish_position_equal": true,
+    "payload_sha256": "152810746b587f2f6f02274b4088999f933b8a2c6d722336e7b1c16f92bd491c",
+    "prompt_ids_equal": true,
+    "repeats": 3,
+    "state_sha256": "f5d27fe769f40c17f266f287a5f83591af50e185a3dc6d998ebdfb809051781b"
+  },
+  "fixture_sha256": "a72551521425900ab92185d9ca650ca63662a8effe0fe3d24e98662a43dd933e",
+  "limits": [
+    "One host/recipe/model/quant and one synthetic conversation; not a cross-platform or policy-state test",
+    "Three fresh processes with possible OS page-cache warmth; no concurrency, host-contention or device-duty measurement",
+    "Native timing buckets include resource and wait costs; configured NFQ/X are not measured physical engagement",
+    "No parent was imported; the CTX12288 policy artifact is incompatible with CTX4096"
+  ],
+  "local_checkpoint": "28774b1740f8c06396bafdbff8693db716240e59 2026-09-30T20:05:31-04:00",
+  "model_source_sha256": "6fb79ac4b0a45113d9582d13d00a83f50f51add1c68c42080a934fd01e9145b3",
+  "recipe": {
+    "compute_node": "full",
+    "expert_budget_gb": 3,
+    "memory_limit_gb": 7.5,
+    "nfq": {
+      "candidate_count": 104,
+      "configured": true,
+      "f": 1,
+      "n": 104,
+      "nodes": 104,
+      "q": 4
+    },
+    "platform_recipe": "rocm",
+    "target_area_workers": 8,
+    "target_x": 16
+  },
+  "resources": {
+    "approximate": true,
+    "max_bytes": {
+      "application_bytes": 1228963840,
+      "compressed_bytes": 0,
+      "external_bytes": 4433391616,
+      "internal_bytes": 138866688,
+      "page_table_bytes": 14352384,
+      "resident_bytes": 5648007168,
+      "resident_os_peak_bytes": 5648007168,
+      "shared_bytes": 1075748864,
+      "swap_bytes": 0
+    },
+    "snapshot_count": 24
+  },
+  "runs": [
+    {
+      "aggregate": {
+        "decode_total_s": 68.206348124,
+        "http_wall_s": 82.199045,
+        "input_tokens": 146,
+        "output_tokens": 234,
+        "prefill_total_s": 12.313874264,
+        "rss_peak_bytes": 5648007168,
+        "weighted_decode_ms_per_output": 291.48012018803416,
+        "weighted_prefill_ms_per_input": 84.34160454794521
+      },
+      "binary_sha256": "3db881c2b312e9bd820b489415e98e14fe44ca8451e288e44001b746edb9d4e4",
+      "build_receipt_sha256": "ecfa7db8002521e8f387f6fcaddea760cafae4b0026ec7b31c5878021ce73632",
+      "final_export": {
+        "bytes": 163430656,
+        "canonical_sha256": "01916407cda0a3709e0d6944bbc8b93882a0220d8ca67cde9f9248ac79b4cce6",
+        "compatibility_sha256": "35eeec434dfe1e68d61ffc2a6db88f4738a7ba20ee55967031bded29da967a8a",
+        "context_tokens": 4096,
+        "export_wall_s": 12.941925894003361,
+        "facts_sha256": "7676bdf9e8a08db1b9479d186fb677711f1c15f171f7ac334a095d13c737ea8e",
+        "id": "exp-rocm-daily-ctx4096-r1-1001",
+        "payload_sha256": "152810746b587f2f6f02274b4088999f933b8a2c6d722336e7b1c16f92bd491c",
+        "position": 380,
+        "state_sha256": "f5d27fe769f40c17f266f287a5f83591af50e185a3dc6d998ebdfb809051781b"
+      },
+      "policy": {
+        "compute_node": "full",
+        "expert_budget_gb": 3,
+        "memory_limit_gb": 7.5,
+        "nfq": {
+          "candidate_count": 104,
+          "configured": true,
+          "f": 1,
+          "n": 104,
+          "nodes": 104,
+          "q": 4
+        },
+        "platform_recipe": "rocm",
+        "target_area_workers": 8,
+        "target_x": 16
+      },
+      "repeat": 1,
+      "startup_s": 8.344320973847061,
+      "turns": [
+        {
+          "decode_ms_per_output": 256.3184972352941,
+          "finish_reason": "stop",
+          "http_wall_s": 14.096916,
+          "id": "lunch_idea",
+          "loaded_position": 0,
+          "new_input_tokens": 42,
+          "output_ids_sha256": "7913182d280a6cf749aeddb249d47908153263a28c3f6baa51636bb169b07082",
+          "output_tokens": 34,
+          "prefill_ms_per_input": 118.68747392857144,
+          "prompt": "I'm making lunch for three with rice, chickpeas, and spinach. One guest avoids peanuts. Suggest a simple dish in two short sentences.",
+          "prompt_ids_sha256": "5f6c945b84fcb81b49a2d3340323b42ccda6374895ddf7a0b630270186feb86d",
+          "response": "Sauté the spinach with garlic and spices, then mix it with the rice and chickpeas. Serve the warm mixture in bowls for a simple, peanut-free meal.",
+          "rss_peak_bytes": 5647986688,
+          "saved_position": 76,
+          "semantic_grade": "PASS",
+          "turn": 1
+        },
+        {
+          "decode_ms_per_output": 251.24113364864866,
+          "finish_reason": "stop",
+          "http_wall_s": 12.308795,
+          "id": "time_and_pan",
+          "loaded_position": 76,
+          "new_input_tokens": 38,
+          "output_ids_sha256": "d97c4c48b943df39481ad1db3b97390c77fb7151d57c57e14f17e8381607f573",
+          "output_tokens": 37,
+          "prefill_ms_per_input": 68.504106,
+          "prompt": "I only have 25 minutes and one pan. Can you adapt that lunch so I can actually make it in time?",
+          "prompt_ids_sha256": "243afacf3e344e78b40f919aae42c703f8173bedf47844eda8e6387513ee49e8",
+          "response": "Sauté the chickpeas and spinach in the pan with seasonings until the spinach wilts. Stir in the pre-cooked rice to heat everything through, then serve directly from the pan.",
+          "rss_peak_bytes": 5647994880,
+          "saved_position": 151,
+          "semantic_grade": "PARTIAL",
+          "turn": 2
+        },
+        {
+          "decode_ms_per_output": 284.8581192903226,
+          "finish_reason": "stop",
+          "http_wall_s": 20.605723,
+          "id": "dairy_and_budget",
+          "loaded_position": 151,
+          "new_input_tokens": 34,
+          "output_ids_sha256": "ddeefb7617bea945da4ccf10c4dbe1ff5d842b3c2f370e6fe8736a2b95de7d54",
+          "output_tokens": 62,
+          "prefill_ms_per_input": 74.11947338235295,
+          "prompt": "One guest also avoids dairy. What extra ingredients, if any, should I buy on a small budget?",
+          "prompt_ids_sha256": "3765188daf8ee1ed7d0b0c9fc727cbda88ece12a5f73b455a121daf73ce26000",
+          "response": "Since you are avoiding dairy, you don't need to buy butter or milk. To add flavor and healthy fats on a budget, buy a **lemon** and a small jar of **tahini** or a bag of **seeds/nuts** (like sunflower seeds) to top the bowls.",
+          "rss_peak_bytes": 5647994880,
+          "saved_position": 247,
+          "semantic_grade": "PARTIAL",
+          "turn": 3
+        },
+        {
+          "decode_ms_per_output": 322.12271165346533,
+          "finish_reason": "stop",
+          "http_wall_s": 35.187611,
+          "id": "final_plan",
+          "loaded_position": 247,
+          "new_input_tokens": 32,
+          "output_ids_sha256": "eb3b93c6741ef193a33cb943d6a2dc0e4e7999af528c377a27661fbd5be5fdff",
+          "output_tokens": 101,
+          "prefill_ms_per_input": 68.930694875,
+          "prompt": "Thanks. Summarize the final plan and all the food and time constraints in a short checklist.",
+          "prompt_ids_sha256": "e91362b29107872fa9de644f70fe6754f82ff930fb723ce84098aedd0f398e04",
+          "response": "**Final Plan Checklist:**\n\n*   **Goal:** One-pan, 25-minute, dairy-free, and peanut-free lunch for three.\n*   **Ingredients to use:** Rice, chickpeas, spinach, garlic, and spices.\n*   **Ingredients to buy:** Lemon, tahini (or seeds/nuts).\n*   **Method:** Sauté chickpeas and spinach in one pan, stir in rice, and top with lemon juice and tahini/seeds.",
+          "rss_peak_bytes": 5648007168,
+          "saved_position": 380,
+          "semantic_grade": "PARTIAL",
+          "turn": 4
+        }
+      ]
+    },
+    {
+      "aggregate": {
+        "decode_total_s": 68.190780141,
+        "http_wall_s": 80.916062,
+        "input_tokens": 146,
+        "output_tokens": 234,
+        "prefill_total_s": 11.046654365000002,
+        "rss_peak_bytes": 5647151104,
+        "weighted_decode_ms_per_output": 291.41359034615385,
+        "weighted_prefill_ms_per_input": 75.66201619863014
+      },
+      "binary_sha256": "3db881c2b312e9bd820b489415e98e14fe44ca8451e288e44001b746edb9d4e4",
+      "build_receipt_sha256": "ecfa7db8002521e8f387f6fcaddea760cafae4b0026ec7b31c5878021ce73632",
+      "final_export": {
+        "bytes": 163430656,
+        "canonical_sha256": "01916407cda0a3709e0d6944bbc8b93882a0220d8ca67cde9f9248ac79b4cce6",
+        "compatibility_sha256": "35eeec434dfe1e68d61ffc2a6db88f4738a7ba20ee55967031bded29da967a8a",
+        "context_tokens": 4096,
+        "export_wall_s": 12.584863943047822,
+        "facts_sha256": "7676bdf9e8a08db1b9479d186fb677711f1c15f171f7ac334a095d13c737ea8e",
+        "id": "exp-rocm-daily-ctx4096-r2-1001",
+        "payload_sha256": "152810746b587f2f6f02274b4088999f933b8a2c6d722336e7b1c16f92bd491c",
+        "position": 380,
+        "state_sha256": "f5d27fe769f40c17f266f287a5f83591af50e185a3dc6d998ebdfb809051781b"
+      },
+      "policy": {
+        "compute_node": "full",
+        "expert_budget_gb": 3,
+        "memory_limit_gb": 7.5,
+        "nfq": {
+          "candidate_count": 104,
+          "configured": true,
+          "f": 1,
+          "n": 104,
+          "nodes": 104,
+          "q": 4
+        },
+        "platform_recipe": "rocm",
+        "target_area_workers": 8,
+        "target_x": 16
+      },
+      "repeat": 2,
+      "startup_s": 10.357997937127948,
+      "turns": [
+        {
+          "decode_ms_per_output": 257.03023738235294,
+          "finish_reason": "stop",
+          "http_wall_s": 12.90608,
+          "id": "lunch_idea",
+          "loaded_position": 0,
+          "new_input_tokens": 42,
+          "output_ids_sha256": "7913182d280a6cf749aeddb249d47908153263a28c3f6baa51636bb169b07082",
+          "output_tokens": 34,
+          "prefill_ms_per_input": 89.75731866666668,
+          "prompt": "I'm making lunch for three with rice, chickpeas, and spinach. One guest avoids peanuts. Suggest a simple dish in two short sentences.",
+          "prompt_ids_sha256": "5f6c945b84fcb81b49a2d3340323b42ccda6374895ddf7a0b630270186feb86d",
+          "response": "Sauté the spinach with garlic and spices, then mix it with the rice and chickpeas. Serve the warm mixture in bowls for a simple, peanut-free meal.",
+          "rss_peak_bytes": 5647130624,
+          "saved_position": 76,
+          "semantic_grade": "PASS",
+          "turn": 1
+        },
+        {
+          "decode_ms_per_output": 250.30932475675675,
+          "finish_reason": "stop",
+          "http_wall_s": 12.237104,
+          "id": "time_and_pan",
+          "loaded_position": 76,
+          "new_input_tokens": 38,
+          "output_ids_sha256": "d97c4c48b943df39481ad1db3b97390c77fb7151d57c57e14f17e8381607f573",
+          "output_tokens": 37,
+          "prefill_ms_per_input": 67.54051828947368,
+          "prompt": "I only have 25 minutes and one pan. Can you adapt that lunch so I can actually make it in time?",
+          "prompt_ids_sha256": "243afacf3e344e78b40f919aae42c703f8173bedf47844eda8e6387513ee49e8",
+          "response": "Sauté the chickpeas and spinach in the pan with seasonings until the spinach wilts. Stir in the pre-cooked rice to heat everything through, then serve directly from the pan.",
+          "rss_peak_bytes": 5647138816,
+          "saved_position": 151,
+          "semantic_grade": "PARTIAL",
+          "turn": 2
+        },
+        {
+          "decode_ms_per_output": 284.440418483871,
+          "finish_reason": "stop",
+          "http_wall_s": 20.564747,
+          "id": "dairy_and_budget",
+          "loaded_position": 151,
+          "new_input_tokens": 34,
+          "output_ids_sha256": "ddeefb7617bea945da4ccf10c4dbe1ff5d842b3c2f370e6fe8736a2b95de7d54",
+          "output_tokens": 62,
+          "prefill_ms_per_input": 73.68051888235294,
+          "prompt": "One guest also avoids dairy. What extra ingredients, if any, should I buy on a small budget?",
+          "prompt_ids_sha256": "3765188daf8ee1ed7d0b0c9fc727cbda88ece12a5f73b455a121daf73ce26000",
+          "response": "Since you are avoiding dairy, you don't need to buy butter or milk. To add flavor and healthy fats on a budget, buy a **lemon** and a small jar of **tahini** or a bag of **seeds/nuts** (like sunflower seeds) to top the bowls.",
+          "rss_peak_bytes": 5647138816,
+          "saved_position": 247,
+          "semantic_grade": "PARTIAL",
+          "turn": 3
+        },
+        {
+          "decode_ms_per_output": 322.3267436435643,
+          "finish_reason": "stop",
+          "http_wall_s": 35.208131,
+          "id": "final_plan",
+          "loaded_position": 247,
+          "new_input_tokens": 32,
+          "output_ids_sha256": "eb3b93c6741ef193a33cb943d6a2dc0e4e7999af528c377a27661fbd5be5fdff",
+          "output_tokens": 101,
+          "prefill_ms_per_input": 68.911551375,
+          "prompt": "Thanks. Summarize the final plan and all the food and time constraints in a short checklist.",
+          "prompt_ids_sha256": "e91362b29107872fa9de644f70fe6754f82ff930fb723ce84098aedd0f398e04",
+          "response": "**Final Plan Checklist:**\n\n*   **Goal:** One-pan, 25-minute, dairy-free, and peanut-free lunch for three.\n*   **Ingredients to use:** Rice, chickpeas, spinach, garlic, and spices.\n*   **Ingredients to buy:** Lemon, tahini (or seeds/nuts).\n*   **Method:** Sauté chickpeas and spinach in one pan, stir in rice, and top with lemon juice and tahini/seeds.",
+          "rss_peak_bytes": 5647151104,
+          "saved_position": 380,
+          "semantic_grade": "PARTIAL",
+          "turn": 4
+        }
+      ]
+    },
+    {
+      "aggregate": {
+        "decode_total_s": 68.11100792799999,
+        "http_wall_s": 80.754794,
+        "input_tokens": 146,
+        "output_tokens": 234,
+        "prefill_total_s": 10.966241497,
+        "rss_peak_bytes": 5647638528,
+        "weighted_decode_ms_per_output": 291.0726834529915,
+        "weighted_prefill_ms_per_input": 75.11124313013698
+      },
+      "binary_sha256": "3db881c2b312e9bd820b489415e98e14fe44ca8451e288e44001b746edb9d4e4",
+      "build_receipt_sha256": "ecfa7db8002521e8f387f6fcaddea760cafae4b0026ec7b31c5878021ce73632",
+      "final_export": {
+        "bytes": 163430656,
+        "canonical_sha256": "01916407cda0a3709e0d6944bbc8b93882a0220d8ca67cde9f9248ac79b4cce6",
+        "compatibility_sha256": "35eeec434dfe1e68d61ffc2a6db88f4738a7ba20ee55967031bded29da967a8a",
+        "context_tokens": 4096,
+        "export_wall_s": 12.576948134694248,
+        "facts_sha256": "7676bdf9e8a08db1b9479d186fb677711f1c15f171f7ac334a095d13c737ea8e",
+        "id": "exp-rocm-daily-ctx4096-r3-1001",
+        "payload_sha256": "152810746b587f2f6f02274b4088999f933b8a2c6d722336e7b1c16f92bd491c",
+        "position": 380,
+        "state_sha256": "f5d27fe769f40c17f266f287a5f83591af50e185a3dc6d998ebdfb809051781b"
+      },
+      "policy": {
+        "compute_node": "full",
+        "expert_budget_gb": 3,
+        "memory_limit_gb": 7.5,
+        "nfq": {
+          "candidate_count": 104,
+          "configured": true,
+          "f": 1,
+          "n": 104,
+          "nodes": 104,
+          "q": 4
+        },
+        "platform_recipe": "rocm",
+        "target_area_workers": 8,
+        "target_x": 16
+      },
+      "repeat": 3,
+      "startup_s": 9.327992509119213,
+      "turns": [
+        {
+          "decode_ms_per_output": 255.01371688235295,
+          "finish_reason": "stop",
+          "http_wall_s": 12.776106,
+          "id": "lunch_idea",
+          "loaded_position": 0,
+          "new_input_tokens": 42,
+          "output_ids_sha256": "7913182d280a6cf749aeddb249d47908153263a28c3f6baa51636bb169b07082",
+          "output_tokens": 34,
+          "prefill_ms_per_input": 88.29972752380952,
+          "prompt": "I'm making lunch for three with rice, chickpeas, and spinach. One guest avoids peanuts. Suggest a simple dish in two short sentences.",
+          "prompt_ids_sha256": "5f6c945b84fcb81b49a2d3340323b42ccda6374895ddf7a0b630270186feb86d",
+          "response": "Sauté the spinach with garlic and spices, then mix it with the rice and chickpeas. Serve the warm mixture in bowls for a simple, peanut-free meal.",
+          "rss_peak_bytes": 5647622144,
+          "saved_position": 76,
+          "semantic_grade": "PASS",
+          "turn": 1
+        },
+        {
+          "decode_ms_per_output": 250.10337643243244,
+          "finish_reason": "stop",
+          "http_wall_s": 12.219254,
+          "id": "time_and_pan",
+          "loaded_position": 76,
+          "new_input_tokens": 38,
+          "output_ids_sha256": "d97c4c48b943df39481ad1db3b97390c77fb7151d57c57e14f17e8381607f573",
+          "output_tokens": 37,
+          "prefill_ms_per_input": 67.22707455263158,
+          "prompt": "I only have 25 minutes and one pan. Can you adapt that lunch so I can actually make it in time?",
+          "prompt_ids_sha256": "243afacf3e344e78b40f919aae42c703f8173bedf47844eda8e6387513ee49e8",
+          "response": "Sauté the chickpeas and spinach in the pan with seasonings until the spinach wilts. Stir in the pre-cooked rice to heat everything through, then serve directly from the pan.",
+          "rss_peak_bytes": 5647630336,
+          "saved_position": 151,
+          "semantic_grade": "PARTIAL",
+          "turn": 2
+        },
+        {
+          "decode_ms_per_output": 284.31495601612903,
+          "finish_reason": "stop",
+          "http_wall_s": 20.550175,
+          "id": "dairy_and_budget",
+          "loaded_position": 151,
+          "new_input_tokens": 34,
+          "output_ids_sha256": "ddeefb7617bea945da4ccf10c4dbe1ff5d842b3c2f370e6fe8736a2b95de7d54",
+          "output_tokens": 62,
+          "prefill_ms_per_input": 73.49037494117647,
+          "prompt": "One guest also avoids dairy. What extra ingredients, if any, should I buy on a small budget?",
+          "prompt_ids_sha256": "3765188daf8ee1ed7d0b0c9fc727cbda88ece12a5f73b455a121daf73ce26000",
+          "response": "Since you are avoiding dairy, you don't need to buy butter or milk. To add flavor and healthy fats on a budget, buy a **lemon** and a small jar of **tahini** or a bag of **seeds/nuts** (like sunflower seeds) to top the bowls.",
+          "rss_peak_bytes": 5647630336,
+          "saved_position": 247,
+          "semantic_grade": "PARTIAL",
+          "turn": 3
+        },
+        {
+          "decode_ms_per_output": 322.3682114158416,
+          "finish_reason": "stop",
+          "http_wall_s": 35.209259,
+          "id": "final_plan",
+          "loaded_position": 247,
+          "new_input_tokens": 32,
+          "output_ids_sha256": "eb3b93c6741ef193a33cb943d6a2dc0e4e7999af528c377a27661fbd5be5fdff",
+          "output_tokens": 101,
+          "prefill_ms_per_input": 68.88598,
+          "prompt": "Thanks. Summarize the final plan and all the food and time constraints in a short checklist.",
+          "prompt_ids_sha256": "e91362b29107872fa9de644f70fe6754f82ff930fb723ce84098aedd0f398e04",
+          "response": "**Final Plan Checklist:**\n\n*   **Goal:** One-pan, 25-minute, dairy-free, and peanut-free lunch for three.\n*   **Ingredients to use:** Rice, chickpeas, spinach, garlic, and spices.\n*   **Ingredients to buy:** Lemon, tahini (or seeds/nuts).\n*   **Method:** Sauté chickpeas and spinach in one pan, stir in rice, and top with lemon juice and tahini/seeds.",
+          "rss_peak_bytes": 5647638528,
+          "saved_position": 380,
+          "semantic_grade": "PARTIAL",
+          "turn": 4
+        }
+      ]
+    }
+  ],
+  "schema": "salt.experiments.rocm-daily-conversation-ctx4096.report.v1",
+  "scope": "one synthetic four-turn everyday conversation, three independent fresh ROCm native processes, live KV within each run, CTX4096",
+  "semantic_overall": "PARTIAL: constraints recalled but ambiguous seeds/nuts under peanut avoidance and pre-cooked rice assumption",
+  "semantic_review": {
+    "dairy_and_budget": {
+      "grade": "PARTIAL",
+      "reason": "Avoids explicit dairy, but optional generic seeds/nuts leaves peanut avoidance ambiguous; tahini may not be the cheapest missing ingredient."
+    },
+    "final_plan": {
+      "grade": "PARTIAL",
+      "reason": "Recalls three people, 25 minutes, one pan, peanut- and dairy-free constraints, but repeats generic seeds/nuts and omits the pre-cooked-rice prerequisite."
+    },
+    "lunch_idea": {
+      "grade": "PASS",
+      "reason": "Uses available ingredients and proposes a peanut-free dish."
+    },
+    "time_and_pan": {
+      "grade": "PARTIAL",
+      "reason": "One-pan adaptation assumes pre-cooked rice; the user only said rice was available, so the 25-minute feasibility is conditional."
+    }
+  }
+}

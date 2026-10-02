@@ -1,0 +1,24 @@
+{
+  "schema": "salt.experiments.roc-policy-classifier.v2",
+  "host_recipe": "rocm",
+  "policy_file": "fixtures/policy.md",
+  "heldout_file": "fixtures/heldout.json",
+  "parent_id": "exp-aster-policy-rocm-v2",
+  "parent_max_rows": 8000,
+  "context_tokens": 12288,
+  "server_max_output": 512,
+  "workers": 8,
+  "kv_budget_gb": 1.0,
+  "dpr_mode": "off",
+  "parent_training": [
+    "In two natural sentences, explain which ticket evidence is authoritative and how the four routing codes are prioritized. Do not classify a ticket yet.",
+    "In one or two sentences, how do you treat a superseded signed finding and an unverified alarming customer quote?"
+  ],
+  "parent_training_controls": {"model": "gemma-4-26b-a4b-it", "temperature": 0, "top_k": 1, "max_tokens": 256, "reasoning_effort": "none", "stream": false, "salt_proof_state": false},
+  "classification_controls": {"model": "gemma-4-26b-a4b-it", "temperature": 0, "top_k": 1, "max_tokens": 16, "reasoning_effort": "none", "stream": false, "salt_proof_state": false},
+  "case_prefix": "Classify this fictional ticket under the standing routing policy. Return exactly one uppercase code A, B, C, or D, with no explanation or other text.\n\n",
+  "arms": ["no_parent", "parent", "fresh_policy"],
+  "method": "Each held-out case is an independent fresh managed ROCm server. No-parent sees only the ticket; parent imports the same immutable v2 policy state and sees only the ticket; fresh-policy sees the exact full policy as a system message plus the same ticket. The parent is created by two natural policy conversation turns (bounded in length but not fabricated QA), and held-out cases/labels are withheld. Measure input/output tokens, phase timing, HTTP wall, import wall, RSS, strict code accuracy, and normal cleanup.",
+  "supersedes_failed_training_spec": "experiment.json",
+  "limits": ["One ROCm host, one frozen synthetic policy, eight held-out cases and one greedy sampler cell", "No-parent has different information and cannot be treated as equal-quality latency", "Parent contains natural model replies in addition to source policy; fresh sees raw source once per independent case", "No vLLM/SGLang prefix-cache hit or DPR exact-transition hit is asserted"]
+}
