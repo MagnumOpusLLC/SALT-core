@@ -2,6 +2,8 @@
 
 # SALT - State Assured Latent-Trasition engine
 
+**Paper:** [SALT: Reusable Computation for Stateful Language-Model Inference](https://zenodo.org/records/23111764) (Zenodo preprint, 2026).
+
 > **Dry-run public export — not yet a release.**
 
 SALT Core is a portable C99 state-assured latent-transition engine. Its public
