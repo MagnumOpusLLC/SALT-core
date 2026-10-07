@@ -36,6 +36,12 @@ void salt_simd_mx4_matvec(const uint8_t *vals, const uint8_t *scales,
 void salt_simd_bf16_matvec(const uint16_t *W, int R, int C,
                            const float *x, const float *bias, float *y);
 
+/* INT2 loads with the same unfused eight-lane BF16 fold and bounded token
+ * tiles. Return 1 before writes if this substrate has no realization. */
+int salt_simd_int2_matvec_batch_rows(const uint8_t *values, const void *scales,
+    int rows, int cols, int batch, const float *inputs, float *outputs,
+    int first_row, int end_row);
+
 /* SIMD matvecs (issue #6 step 4): I8 (int8 + optional E8M0 block
  * scales) and F8_E4M3 (two-table decode + masked subnormal/inf fixup).
  * The vector path is used when the scale blocks are 16-aligned

@@ -1,6 +1,7 @@
 #include "salt/quant.h"
 #include "salt/kernels.h"
 #include "salt/simd.h"
+#include "salt/int2.h"
 #include <stddef.h>
 
 /* The quant modules: thin adapters over the per-format matvecs so
@@ -44,6 +45,18 @@ static int f8_matvec_bf16(const void *vals, const void *scales,
     return 0;
 }
 
+static int int2_batch(const void *v, const void *s, const void *bias,
+                     int R, int C, int B, const float *x, float *y) {
+    if (bias) return -1;
+    return salt_int2_matvec_batch_rows(v, s, R, C, B, x, y, 0, R);
+}
+static int int2_matvec(const void *v, const void *s, const void *bias,
+                      int R, int C, const float *x, float *y) {
+    return int2_batch(v, s, bias, R, C, 1, x, y);
+}
+const SaltQuant salt_quant_int2 = {
+    2, 0, 8, 0, 0, "row-int2", int2_matvec, int2_batch };
+
 const SaltQuant salt_quant_q4 = {
     4, 1769472, 32, 0, 0, "mlx4", q4_matvec, q4_batch };
 const SaltQuant salt_quant_q8 = {
@@ -55,6 +68,7 @@ const SaltQuant salt_quant_fp8 = {
 
 const SaltQuant *salt_quant_get(int bits) {
     switch (bits) {
+        case 2:  return &salt_quant_int2;
         case 4:  return &salt_quant_q4;
         case 8:  return &salt_quant_q8;
         case 16: return &salt_quant_bf16;

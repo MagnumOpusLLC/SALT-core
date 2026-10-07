@@ -102,7 +102,9 @@ def _load_projection(path: Path, root: Path) -> tuple[str, dict, bytes]:
     if value["schema"] != SCHEMA:
         raise base.CompatibilityError("compatibility projection schema mismatch")
     overrides = value["overrides"]
-    if not isinstance(overrides, list) or not overrides or len(overrides) > 16:
+    # The compatibility manifest admits at most 128 contract files. Each may
+    # have one independently authenticated projection; keep the same bound.
+    if not isinstance(overrides, list) or not overrides or len(overrides) > 128:
         raise base.CompatibilityError("compatibility projection overrides are malformed")
     logical_paths: list[str] = []
     for override in overrides:

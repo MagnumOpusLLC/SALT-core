@@ -3,6 +3,22 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "salt/tensorops.h"
+
+/* A physical lane of the existing PREFILL traversal, not a second controller. */
+typedef struct SaltTextPrefillTeam {
+    SaltTensorHostGraphState *graph;
+    uint32_t worker;
+    uint32_t workers;
+} SaltTextPrefillTeam;
+const SaltTextPrefillTeam *salt_text_prefill_team_current(void);
+int salt_text_prefill_team_sync(int status);
+int salt_text_prefill_team_owner(void);
+/* Execute one indivisible physical operation exactly once. Its body must not
+ * submit CPU work back to the occupied pool. Completion precedes team reuse. */
+int salt_text_prefill_team_once(int (*operation)(void *), void *context);
+int salt_text_prefill_team_slice(int workers,
+    void (*operation)(int worker, void *context), void *context);
 
 typedef enum SaltTextRuntimePhase {
     SALT_TEXT_PHASE_PREFILL = 0,
@@ -129,6 +145,10 @@ typedef struct {
                            int (*operation)(void *operation_context),
                            void *operation_context);
     void *transaction_context;
+    SaltTensorHostGraphState *team_state;
+    SaltTensorHostGraphParallelRun team_run;
+    void *team_context;
+    uint32_t team_workers;
 } SaltTextPrefillPlan;
 
 typedef struct {

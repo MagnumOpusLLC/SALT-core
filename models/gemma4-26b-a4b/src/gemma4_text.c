@@ -5691,12 +5691,18 @@ static int g4_q4_pool_batch_workers(SaltGemma4Text *model,
     task.workers = workers;
     task.inputs = inputs;
     task.outputs = outputs;
-    if (salt_attn_pool_run_n(
-            &model->compute_pool, workers, g4_q4_pool_worker, &task) != 0)
+    if ((salt_text_prefill_team_current()
+            ? salt_text_prefill_team_slice(workers, g4_q4_pool_worker, &task)
+            : salt_attn_pool_run_n(&model->compute_pool, workers,
+                g4_q4_pool_worker, &task)) != 0)
         return -1;
-    for (int worker = 0; worker < workers; worker++)
-        if (task.failed[worker]) return -1;
-    model->q4_pool_submissions++;
+    {
+        int rc = 0;
+        for (int worker = 0; worker < workers; worker++)
+            if (task.failed[worker]) rc = -1;
+        if (salt_text_prefill_team_sync(rc) != 0) return -1;
+    }
+    if (salt_text_prefill_team_owner()) model->q4_pool_submissions++;
     return 0;
 }
 
@@ -5846,14 +5852,22 @@ static int g4_q4_pool_multi_batch_workers(SaltGemma4Text *model,
         if (task.boundaries[worker] > task.boundaries[worker + 1] ||
             task.boundaries[worker + 1] > units)
             return -1;
-    if (salt_attn_pool_run_n(&model->compute_pool, workers,
-            g4_q4_multi_pool_worker, &task) != 0)
+    if ((salt_text_prefill_team_current()
+            ? salt_text_prefill_team_slice(workers, g4_q4_multi_pool_worker, &task)
+            : salt_attn_pool_run_n(&model->compute_pool, workers,
+                g4_q4_multi_pool_worker, &task)) != 0)
         return -1;
-    for (int worker = 0; worker < workers; worker++)
-        if (task.failed[worker]) return -1;
-    model->q4_pool_submissions++;
-    model->q4_multi_pool_submissions++;
-    model->q4_multi_pool_jobs += (uint64_t)job_count;
+    {
+        int rc = 0;
+        for (int worker = 0; worker < workers; worker++)
+            if (task.failed[worker]) rc = -1;
+        if (salt_text_prefill_team_sync(rc) != 0) return -1;
+    }
+    if (salt_text_prefill_team_owner()) {
+        model->q4_pool_submissions++;
+        model->q4_multi_pool_submissions++;
+        model->q4_multi_pool_jobs += (uint64_t)job_count;
+    }
     return 0;
 }
 
@@ -5988,12 +6002,18 @@ static int g4_q8_pool_batch(SaltGemma4Text *model, const G4Q *matrix,
     task.workers = workers;
     task.inputs = inputs;
     task.outputs = outputs;
-    if (salt_attn_pool_run_n(
-            &model->compute_pool, workers, g4_q8_pool_worker, &task) != 0)
+    if ((salt_text_prefill_team_current()
+            ? salt_text_prefill_team_slice(workers, g4_q8_pool_worker, &task)
+            : salt_attn_pool_run_n(&model->compute_pool, workers,
+                g4_q8_pool_worker, &task)) != 0)
         return -1;
-    for (int worker = 0; worker < workers; worker++)
-        if (task.failed[worker]) return -1;
-    model->q8_pool_submissions++;
+    {
+        int rc = 0;
+        for (int worker = 0; worker < workers; worker++)
+            if (task.failed[worker]) rc = -1;
+        if (salt_text_prefill_team_sync(rc) != 0) return -1;
+    }
+    if (salt_text_prefill_team_owner()) model->q8_pool_submissions++;
     return 0;
 }
 
@@ -6030,9 +6050,47 @@ static int g4_shared_output_ref(SaltGemma4Text *model, const float *output,
     return 0;
 }
 
+typedef struct {
+    SaltGemma4Text *model;
+    const G4Q *matrix;
+    int batch;
+    const float *inputs;
+    float *outputs;
+} G4PrefillProjectionCall;
+
+static int g4_prefill_projection_once(void *opaque) {
+    G4PrefillProjectionCall *call = opaque;
+    if (call->batch == 1 && call->matrix && call->matrix->set &&
+            call->matrix->bits == 4) {
+        /* The legacy projection wrapper expands to large stack arrays. The
+         * collective owner uses the existing startup-owned job/address tables
+         * for this same one-row Metal batch, without growing worker stacks. */
+        SaltBatchJob job = {
+            call->matrix->weight, call->matrix->scales, call->matrix->biases,
+            call->matrix->rows, call->matrix->cols, 1,
+            call->inputs, call->outputs, 0, call->matrix->rows,
+        };
+        int expanded = 0;
+        if (g4_gpu_multi_batch(call->model, &job, 1, &expanded) != 0)
+            return -1;
+        if (call->matrix == &call->model->embedding)
+            call->model->gpu_head_submissions += (uint64_t)expanded;
+        else
+            call->model->gpu_dense_submissions += (uint64_t)expanded;
+        call->model->gpu_decode_submissions += (uint64_t)expanded;
+        return 0;
+    }
+    return q_matvec_batch(call->model, call->matrix, call->batch,
+        call->inputs, call->outputs);
+}
+
 static int q_matvec_batch(SaltGemma4Text *model,
                           const G4Q *matrix, int batch,
                           const float *inputs, float *outputs) {
+    if (model && model->full_gpu_intent && salt_text_prefill_team_current()) {
+        G4PrefillProjectionCall call = {model, matrix, batch, inputs, outputs};
+        return salt_text_prefill_team_once(g4_prefill_projection_once, &call);
+    }
     if (!matrix || !matrix->set || batch < 1 ||
         !inputs || !outputs)
         return -1;
@@ -6219,10 +6277,23 @@ static int q_matvec_operation(SaltGemma4Text *model, const G4Q *matrix,
 }
 
 static int q_matvec_batch_exact_views(SaltGemma4Text *model,
+    const G4Q *matrix, int batch, const float *inputs, float *outputs);
+
+static int g4_prefill_exact_projection_once(void *opaque) {
+    G4PrefillProjectionCall *call = opaque;
+    return q_matvec_batch_exact_views(call->model, call->matrix, call->batch,
+        call->inputs, call->outputs);
+}
+
+static int q_matvec_batch_exact_views(SaltGemma4Text *model,
                                       const G4Q *matrix, int batch,
                                       const float *inputs, float *outputs) {
     SaltGpuSharedBuffer *shared_output = NULL;
     size_t shared_offset = 0;
+    if (salt_text_prefill_team_current()) {
+        G4PrefillProjectionCall call = {model, matrix, batch, inputs, outputs};
+        return salt_text_prefill_team_once(g4_prefill_exact_projection_once, &call);
+    }
     if (!model || !model->full_gpu_intent || !matrix || !matrix->set ||
         matrix->bits != 4 || batch < 2 || !inputs || !outputs ||
         !g4_shared_output_ref(model, outputs,
@@ -6333,7 +6404,7 @@ static int qkv_projection_batch(SaltGemma4Text *model, G4Layer *layer,
         return 0;
     }
     if (g4_q4_pool_multi_batch(model, jobs, job_count) == 0) {
-        model->qkv_multi_pool_submissions++;
+        if (salt_text_prefill_team_owner()) model->qkv_multi_pool_submissions++;
         return 0;
     }
 /* SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1 */
@@ -7200,7 +7271,7 @@ static int g4_prefill_attention_batch_prepare(
         !operation->values || !operation->attention_outputs ||
         !operation->branches)
         return -1;
-    memset(operation->attention_outputs, 0,
+    if (salt_text_prefill_team_owner()) memset(operation->attention_outputs, 0,
            operation->query_count * sizeof(float));
     return 0;
 }
@@ -7235,16 +7306,27 @@ static int g4_prefill_attention_batch_norm(
     return 0;
 }
 
+static int g4_prefill_attention_project_once(void *opaque) {
+    const G4PrefillAttentionBatch *operation = opaque;
+    return qkv_projection_batch(operation->model, operation->layer,
+        operation->batch, operation->norm, operation->queries,
+        operation->keys, operation->values);
+}
+
 static int g4_prefill_attention_batch_project(
         const G4PrefillAttentionBatch *operation) {
-    if (qkv_projection_batch(operation->model, operation->layer,
+    int rc = operation->model->full_gpu_intent && salt_text_prefill_team_current()
+        ? salt_text_prefill_team_once(g4_prefill_attention_project_once,
+            (void *)operation)
+        : qkv_projection_batch(operation->model, operation->layer,
             operation->batch, operation->norm, operation->queries,
-            operation->keys, operation->values) != 0)
+            operation->keys, operation->values);
+    if (rc != 0)
         return -1;
-    if (operation->plan->shared_kv_projection)
+    if (salt_text_prefill_team_owner() && operation->plan->shared_kv_projection)
         memcpy(operation->values, operation->keys,
                operation->kv_count * sizeof(float));
-    return 0;
+    return salt_text_prefill_team_sync(0);
 }
 
 static int g4_prefill_attention_batch_transform(
@@ -7305,12 +7387,25 @@ static int g4_prefill_attention_batch_transform(
     return 0;
 }
 
+static int g4_prefill_attention_batch_body(const G4PrefillAttentionBatch *operation);
+
+static int g4_prefill_attention_body_once(void *opaque) {
+    return g4_prefill_attention_batch_body(opaque);
+}
+
 static int g4_prefill_attention_batch_body(
         const G4PrefillAttentionBatch *operation) {
     SaltGemma4Text *model = operation->model;
     G4Layer *layer = operation->layer;
     const SaltAttentionDesc *plan = operation->plan;
     SaltAttentionBatchJob attention_job;
+    /* Match the existing GPU-body eligibility. Sliding-ring Metal attention
+     * remains on its qualified CPU slices; never call a nested pool as owner. */
+    if (salt_text_prefill_team_current() && model->gpu_attention_enabled &&
+        layer->shared_position == 0 && (!layer->kv_ring ||
+            salt_gpu_cuda_present() || salt_gpu_rocm_present()))
+        return salt_text_prefill_team_once(g4_prefill_attention_body_once,
+            (void *)operation);
     memset(&attention_job, 0, sizeof attention_job);
     attention_job.attention = *plan;
     attention_job.queries = operation->queries;
@@ -7399,7 +7494,7 @@ static int prefill_attention_layer_batch(
         start < 0 || batch < 1 || start > model->max_context - batch ||
         batch > model->prefill_attention_capacity)
         return -1;
-    profile = model->prefill_detail.enabled;
+    profile = model->prefill_detail.enabled && salt_text_prefill_team_owner();
     mark = profile ? g4_now_s() : 0.0;
     memset(&operation, 0, sizeof operation);
     operation.model = model;
@@ -7414,8 +7509,10 @@ static int prefill_attention_layer_batch(
         model->prefill_detail.attention_alloc_s += g4_now_s() - mark;
         mark = g4_now_s();
     }
-    if (g4_prefill_attention_batch_history(&operation) != 0 ||
-        g4_prefill_attention_batch_norm(&operation) != 0)
+    if (salt_text_prefill_team_sync(salt_text_prefill_team_owner()
+            ? g4_prefill_attention_batch_history(&operation) : 0) != 0 ||
+        salt_text_prefill_team_sync(salt_text_prefill_team_owner()
+            ? g4_prefill_attention_batch_norm(&operation) : 0) != 0)
         goto done;
     if (profile) {
         model->prefill_detail.attention_norm_s += g4_now_s() - mark;
@@ -7427,14 +7524,16 @@ static int prefill_attention_layer_batch(
         model->prefill_detail.attention_qkv_s += g4_now_s() - mark;
         mark = g4_now_s();
     }
-    if (g4_prefill_attention_batch_transform(&operation) != 0)
+    if (salt_text_prefill_team_sync(salt_text_prefill_team_owner()
+            ? g4_prefill_attention_batch_transform(&operation) : 0) != 0)
         goto done;
     if (profile) {
         model->prefill_detail.attention_transform_s += g4_now_s() - mark;
         mark = g4_now_s();
     }
     if (g4_prefill_attention_batch_body(&operation) != 0 ||
-        g4_prefill_attention_batch_commit(&operation) != 0)
+        salt_text_prefill_team_sync(salt_text_prefill_team_owner()
+            ? g4_prefill_attention_batch_commit(&operation) : 0) != 0)
         goto done;
     if (profile) {
         model->prefill_detail.attention_body_s += g4_now_s() - mark;
@@ -7446,7 +7545,8 @@ static int prefill_attention_layer_batch(
         model->prefill_detail.attention_o_s += g4_now_s() - mark;
         mark = g4_now_s();
     }
-    if (g4_prefill_attention_batch_residual(&operation) != 0)
+    if (salt_text_prefill_team_sync(salt_text_prefill_team_owner()
+            ? g4_prefill_attention_batch_residual(&operation) : 0) != 0)
         goto done;
     if (profile)
         model->prefill_detail.attention_residual_s += g4_now_s() - mark;
@@ -8707,6 +8807,26 @@ static int g4_gpu_multi_batch(SaltGemma4Text *model,
 }
 
 static int g4_group_run_many(void *opaque, const int *experts,
+    void *const *leases, const int *groups, int count,
+    const float *inputs, float *outputs);
+
+typedef struct {
+    void *context;
+    const int *experts;
+    void *const *leases;
+    const int *groups;
+    int count;
+    const float *inputs;
+    float *outputs;
+} G4PrefillGroupCall;
+
+static int g4_prefill_group_once(void *opaque) {
+    G4PrefillGroupCall *call = opaque;
+    return g4_group_run_many(call->context, call->experts, call->leases,
+        call->groups, call->count, call->inputs, call->outputs);
+}
+
+static int g4_group_run_many(void *opaque, const int *experts,
                              void *const *lease_opaque, const int *groups,
                              int count, const float *inputs, float *outputs) {
     G4GroupContext *context = (G4GroupContext *)opaque;
@@ -8716,9 +8836,16 @@ static int g4_group_run_many(void *opaque, const int *experts,
     int *offsets;
     double mark = 0.0, gate_up_s = 0.0, activation_s = 0.0, down_s = 0.0;
     int profile, rows = 0;
+    int owner = salt_text_prefill_team_owner(), prepare_rc = 0;
     if (!context || !(model = context->model) || !experts || !lease_opaque ||
         !groups || !inputs || !outputs || count < 1 || count > G4_EXPERTS)
         return -1;
+    if (model->full_gpu_intent && salt_text_prefill_team_current()) {
+        G4PrefillGroupCall call = {
+            context, experts, lease_opaque, groups, count, inputs, outputs,
+        };
+        return salt_text_prefill_team_once(g4_prefill_group_once, &call);
+    }
     if (model->nvfp4_mode) {
         int offsets[G4_EXPERTS + 1];
         offsets[0] = 0;
@@ -8828,9 +8955,9 @@ static int g4_group_run_many(void *opaque, const int *experts,
     down = model->prefill_down_jobs;
     slots = model->prefill_job_slots;
     offsets = model->prefill_job_offsets;
-    profile = model->prefill_detail.enabled;
-    offsets[0] = 0;
-    for (int i = 0; i < count; i++) {
+    profile = model->prefill_detail.enabled && owner;
+    if (owner) offsets[0] = 0;
+    if (owner) for (int i = 0; i < count; i++) {
         G4ExpertLease *lease = (G4ExpertLease *)lease_opaque[i];
         const unsigned char *gate, *up;
         if (!lease || !lease->active || !lease->bytes || groups[i] < 1 ||
@@ -8838,7 +8965,7 @@ static int g4_group_run_many(void *opaque, const int *experts,
             lease->logical_resource_id !=
                 (uint64_t)(uint32_t)context->layer * G4_EXPERTS +
                 (uint32_t)experts[i])
-            goto fallback;
+            { prepare_rc = -1; break; }
         slots[i] = lease->bytes;
         gate = slots[i];
         up = slots[i] + G4_PROJ_BYTES;
@@ -8883,6 +9010,8 @@ static int g4_group_run_many(void *opaque, const int *experts,
             .logical_resource_id = lease->logical_resource_id,
         };
     }
+    if (salt_text_prefill_team_sync(prepare_rc) != 0) goto fallback;
+    rows = offsets[count];
     mark = profile ? g4_now_s() : 0.0;
     if (model->full_gpu_intent) {
         if (model->gpu_bounded_weights && !model->gpu_expert_layer_view) {
@@ -8919,19 +9048,19 @@ static int g4_group_run_many(void *opaque, const int *experts,
     if (g4_q4_pool_multi_batch(model, gate_up, 2 * count) != 0) {
         goto fallback;
     }
-    model->expert_gate_up_epochs++;
+    if (owner) model->expert_gate_up_epochs++;
     if (profile) {
         gate_up_s = g4_now_s() - mark;
         mark = g4_now_s();
     }
-    for (size_t element = 0; element < (size_t)rows * G4_ROUTED; element++)
+    if (owner) for (size_t element = 0; element < (size_t)rows * G4_ROUTED; element++)
         context->gate[element] =
             salt_gemma4_gelu_tanh(context->gate[element]) * context->up[element];
     if (profile) {
         activation_s = g4_now_s() - mark;
         mark = g4_now_s();
     }
-    for (int i = 0; i < count; i++) {
+    if (owner) for (int i = 0; i < count; i++) {
         const unsigned char *projection = slots[i] + 2 * G4_PROJ_BYTES;
         down[i] = (SaltBatchJob) {
             (const uint32_t *)(const void *)projection,
@@ -8943,10 +9072,11 @@ static int g4_group_run_many(void *opaque, const int *experts,
             0, G4_HIDDEN,
         };
     }
+    if (salt_text_prefill_team_sync(0) != 0) goto fallback;
     if (g4_q4_pool_multi_batch(model, down, count) != 0) {
         goto fallback;
     }
-    model->expert_down_epochs++;
+    if (owner) model->expert_down_epochs++;
     if (profile) {
         down_s = g4_now_s() - mark;
         context->model->prefill_detail.ffn_gate_up_s += gate_up_s;
@@ -9054,20 +9184,30 @@ static int g4_prefill_ffn_batch_prepare(G4PrefillFfnBatch *operation) {
         !operation->weights || !operation->group_gate ||
         !operation->group_up)
         return -1;
-    operation->model->prefill_ffn_arena_calls++;
+    if (salt_text_prefill_team_owner()) operation->model->prefill_ffn_arena_calls++;
     return 0;
+}
+
+static int g4_prefill_ffn_batch_dense(const G4PrefillFfnBatch *operation);
+
+static int g4_prefill_dense_once(void *opaque) {
+    return g4_prefill_ffn_batch_dense(opaque);
 }
 
 static int g4_prefill_ffn_batch_dense(
         const G4PrefillFfnBatch *operation) {
     SaltGemma4Text *model = operation->model;
     G4Layer *layer = operation->layer;
-    for (int token = 0; token < operation->batch; token++)
+    int rc = 0;
+    if (model->full_gpu_intent && salt_text_prefill_team_current())
+        return salt_text_prefill_team_once(g4_prefill_dense_once, (void *)operation);
+    if (salt_text_prefill_team_owner()) for (int token = 0; token < operation->batch; token++)
         if (salt_gemma4_rmsnorm(
                 operation->dense_inputs + (size_t)token * G4_HIDDEN,
                 operation->residuals + (size_t)token * G4_HIDDEN,
                 layer->pre_ffn_norm.values, G4_HIDDEN, G4_EPS, 1) != 0)
-            return -1;
+            { rc = -1; break; }
+    if (salt_text_prefill_team_sync(rc) != 0) return -1;
     if (model->full_gpu_intent && model->gpu_trunk_exact_views) {
         if (q_matvec_batch_exact_views(model, &layer->dense_gate,
                 operation->batch, operation->dense_inputs,
@@ -9092,10 +9232,11 @@ static int g4_prefill_ffn_batch_dense(
             operation->dense_inputs, operation->dense_gate,
             operation->dense_up) != 0)
         return -1;
-    for (size_t i = 0; i < operation->dense_count; i++)
+    if (salt_text_prefill_team_owner()) for (size_t i = 0; i < operation->dense_count; i++)
         operation->dense_chain[i] =
             salt_gemma4_gelu_tanh(operation->dense_gate[i]) *
             operation->dense_up[i];
+    if (salt_text_prefill_team_sync(0) != 0) return -1;
     return q_matvec_batch(model, &layer->dense_down, operation->batch,
         operation->dense_chain, operation->dense_outputs);
 }
@@ -9104,7 +9245,8 @@ static int g4_prefill_ffn_batch_route(
         const G4PrefillFfnBatch *operation) {
     SaltGemma4Text *model = operation->model;
     G4Layer *layer = operation->layer;
-    for (int token = 0; token < operation->batch; token++) {
+    int rc = 0;
+    if (salt_text_prefill_team_owner()) for (int token = 0; token < operation->batch; token++) {
         const float *residual =
             operation->residuals + (size_t)token * G4_HIDDEN;
         float *router_input =
@@ -9115,8 +9257,9 @@ static int g4_prefill_ffn_batch_route(
                 operation->routed_inputs + (size_t)token * G4_HIDDEN,
                 residual, layer->pre_ffn_norm_2.values,
                 G4_HIDDEN, G4_EPS, 1) != 0)
-            return -1;
+            { rc = -1; break; }
     }
+    if (salt_text_prefill_team_sync(rc) != 0) return -1;
     if (model->full_gpu_intent && !model->gpu_trunk_exact_views &&
             layer->router.bits == 8) {
         if (gpu_q8_matvec_batch(model, &layer->router, operation->batch,
@@ -9143,7 +9286,7 @@ static int g4_prefill_ffn_batch_route(
                         (size_t)token * G4_EXPERTS) != 0)
                 return -1;
     }
-    for (int token = 0; token < operation->batch; token++) {
+    if (salt_text_prefill_team_owner()) for (int token = 0; token < operation->batch; token++) {
         float *logits =
             operation->router_logits + (size_t)token * G4_EXPERTS;
         int *token_selected =
@@ -9153,13 +9296,13 @@ static int g4_prefill_ffn_batch_route(
         if (salt_gemma4_router_topk(logits,
                 layer->per_expert_scale.values, G4_EXPERTS, G4_TOPK,
                 token_selected, token_weights) != 0)
-            return -1;
+            { rc = -1; break; }
         sort_selection(token_selected, token_weights);
         route_observe(model, SALT_GEMMA4_ROUTE_PREFILL,
                       (uint64_t)(model->position + token),
                       operation->layer_index, token_selected);
     }
-    return 0;
+    return salt_text_prefill_team_sync(rc);
 }
 
 typedef struct G4PrefillExpertFlowCall {
@@ -9203,7 +9346,7 @@ static int g4_prefill_ffn_batch_experts(G4PrefillFfnBatch *operation) {
         &operation->group_job, &operation->group_ops,
         &operation->group_context,
     };
-    if (operation->model->prefill_expert_matrix_flow &&
+    if (!salt_text_prefill_team_current() && operation->model->prefill_expert_matrix_flow &&
         !operation->model->compute_pool.aflow_running) {
         opened_flow = 1;
         rc = salt_attn_pool_flow_run(&operation->model->compute_pool,
@@ -9267,7 +9410,7 @@ static int feed_forward_batch(SaltGemma4Text *model, G4Layer *layer,
 #endif
 /* SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1 */
         return -1;
-    profile = model->prefill_detail.enabled;
+    profile = model->prefill_detail.enabled && salt_text_prefill_team_owner();
     mark = profile ? g4_now_s() : 0.0;
     memset(&operation, 0, sizeof operation);
     operation.model = model;
@@ -9303,7 +9446,8 @@ static int feed_forward_batch(SaltGemma4Text *model, G4Layer *layer,
         model->prefill_detail.ffn_group_s += g4_now_s() - mark;
         mark = g4_now_s();
     }
-    if (g4_prefill_ffn_batch_combine(&operation) != 0)
+    if (salt_text_prefill_team_sync(salt_text_prefill_team_owner()
+            ? g4_prefill_ffn_batch_combine(&operation) : 0) != 0)
         goto done;
     if (profile)
         model->prefill_detail.ffn_combine_s += g4_now_s() - mark;
@@ -9333,11 +9477,12 @@ static int g4_prefill_attention(void *opaque, int layer, int start,
                                 int batch, const float *states,
                                 float *outputs) {
     SaltGemma4Text *model = (SaltGemma4Text *)opaque;
-    if (g4_trunk_layer_window_begin(model, layer) != 0)
+    if (salt_text_prefill_team_sync(salt_text_prefill_team_owner()
+            ? g4_trunk_layer_window_begin(model, layer) : 0) != 0)
         return step_fail("prefill-layer-window-bind", layer, start);
     if (prefill_attention_layer_batch(model, &model->layers[layer],
             states, start, batch, outputs) != 0) {
-        (void)g4_trunk_layer_window_end(model);
+        if (salt_text_prefill_team_owner()) (void)g4_trunk_layer_window_end(model);
         return step_fail("prefill-attention", layer, start);
     }
     return 0;
@@ -9347,17 +9492,20 @@ static int g4_prefill_ffn(void *opaque, int layer, int start, int batch,
                           const float *states, float *outputs) {
     SaltGemma4Text *model = (SaltGemma4Text *)opaque;
     G4Layer *gemma_layer = &model->layers[layer];
-    model->position = start + batch - 1;
+    if (salt_text_prefill_team_owner()) model->position = start + batch - 1;
+    if (salt_text_prefill_team_sync(0) != 0) return -1;
     int compute_rc = feed_forward_batch(model, gemma_layer, layer,
         states, batch, outputs);
-    int window_rc = g4_trunk_layer_window_end(model);
+    int window_rc = salt_text_prefill_team_sync(salt_text_prefill_team_owner()
+        ? g4_trunk_layer_window_end(model) : 0);
     if (compute_rc != 0)
         return step_fail("prefill-feed-forward-batch", layer,
                          model->position);
     if (window_rc != 0)
         return step_fail("prefill-layer-window-release", layer,
                          model->position);
-    if (g4_memory_budget_ok(model, "prefill-layer", layer) != 0)
+    if (salt_text_prefill_team_sync(salt_text_prefill_team_owner()
+            ? g4_memory_budget_ok(model, "prefill-layer", layer) : 0) != 0)
         return step_fail("prefill-memory-limit", layer, model->position);
     return 0;
 }
@@ -9414,19 +9562,21 @@ static const SaltTextPhaseLookaheadOps g4_prefill_decode_lookahead_ops = {
 static int g4_prefill_finish(void *opaque, const float *last_state,
                              float *logits) {
     SaltGemma4Text *model = (SaltGemma4Text *)opaque;
-    if (salt_gemma4_rmsnorm(model->final_state, last_state,
-            model->final_norm.values, G4_HIDDEN, G4_EPS, 1) != 0)
+    if (salt_text_prefill_team_sync(salt_text_prefill_team_owner()
+            ? salt_gemma4_rmsnorm(model->final_state, last_state,
+                model->final_norm.values, G4_HIDDEN, G4_EPS, 1) : 0) != 0)
         return step_fail("prefill-final-norm", G4_LAYERS,
                          model->position);
     if (q_matvec_operation(model, &model->embedding,
             model->final_state, logits) != 0) {
-        release_q_residency(&model->embedding);
+        if (salt_text_prefill_team_owner()) release_q_residency(&model->embedding);
         return step_fail("prefill-head", G4_LAYERS, model->position);
     }
-    if (!model->prefill_retain_layers)
+    if (salt_text_prefill_team_owner() && !model->prefill_retain_layers)
         release_q_residency(&model->embedding);
-    if (salt_gemma4_softcap(logits, G4_VOCAB, G4_LOGIT_CAP) != 0) {
-        if (model->prefill_retain_layers)
+    if (salt_text_prefill_team_sync(salt_text_prefill_team_owner()
+            ? salt_gemma4_softcap(logits, G4_VOCAB, G4_LOGIT_CAP) : 0) != 0) {
+        if (salt_text_prefill_team_owner() && model->prefill_retain_layers)
             release_q_residency(&model->embedding);
         return step_fail("prefill-final", G4_LAYERS, model->position);
     }
@@ -10017,6 +10167,31 @@ int salt_gemma4_text_prefill(SaltGemma4Text *model,
     ops.release_layer = g4_prefill_release;
     ops.finish = g4_prefill_finish;
     ops.publish_position = g4_prefill_publish;
+    {
+        const char *team = getenv("SALT_GEMMA_PREFILL_TEAM");
+        if (team && strcmp(team, "0") != 0) {
+            const char *recipe = getenv("SALT_GEMMA_PLATFORM_RECIPE");
+            int metal = model->full_gpu_intent && recipe &&
+                strcmp(recipe, "mac-metal") == 0 &&
+                !salt_gpu_cuda_present() && !salt_gpu_rocm_present();
+            if (strcmp(team, "1") != 0 || (model->full_gpu_intent && !metal) ||
+                model->nvfp4_mode || !model->compute_pool_ready ||
+                (plan.transaction_run && !metal) || plan.lookahead ||
+                model->embedding.bits != 4 || model->prefill_expert_matrix_flow)
+                return step_fail("prefill-team-admission", -1, start);
+            if (metal && (!model->gpu_trunk_exact_views ||
+                    model->gpu_expert_layer_view || model->fine_token_enabled ||
+                    model->prefill_operation_flow))
+                return step_fail("prefill-team-metal-policy", -1, start);
+            for (int layer = 0; layer < G4_LAYERS; layer++)
+                if (model->layers[layer].router.bits != 8)
+                    return step_fail("prefill-team-router", layer, start);
+            plan.team_state = &model->text_cpu.graph_state;
+            plan.team_run = g4_text_verify_parallel_run;
+            plan.team_context = model;
+            plan.team_workers = (uint32_t)model->compute_pool.apool_threads;
+        }
+    }
     rc = salt_text_prefill_execute(
         &plan, &ops, model, start, tokens, token_count, logits);
     if (rc != 0) {
@@ -10029,6 +10204,10 @@ int salt_gemma4_text_prefill(SaltGemma4Text *model,
         g4_emit_prefill_waterfall(
             "GEMMA4_PREFILL_WATERFALL", model, token_count,
             &profile, plan.resource_policy);
+    if (plan.team_state)
+        fprintf(stderr, "GEMMA4_PREFILL_TEAM workers=%u tokens=%d B=%d "
+            "pool_submissions=1 barriers=%u\n", plan.team_workers,
+            token_count, plan.max_batch, plan.team_state->barrier_epoch);
     return 0;
 }
 
@@ -10095,6 +10274,44 @@ int salt_gemma4_text_prefill_verify(SaltGemma4Text *model,
             "GEMMA4_DPR_VERIFY_WATERFALL", model, token_count,
             &profile, plan.resource_policy);
     return rc;
+}
+
+int salt_gemma4_text_reuse_prefix(SaltGemma4Text *model,
+                                  int requested_prefix) {
+    int retained = requested_prefix;
+    if (!model || !g4_text_state_aligned(model) ||
+        model->position > model->max_context || requested_prefix < 0 ||
+        requested_prefix > model->position || model->state_control.active ||
+        model->scheduler_controller.active ||
+        model->scheduler_controller.schedule_active ||
+        model->attention_plan_lease || model->route_observer ||
+        (model->text_program.ready &&
+         model->text_kv_state.transition_generation == UINT64_MAX))
+        return -1;
+    for (int layer = 0; layer < G4_LAYERS; layer++) {
+        const G4Layer *item = &model->layers[layer];
+        if (item->shared_position != 0 || item->proposal_active ||
+            item->kv_capacity < 1 || item->kv_dim < 1 ||
+            !item->key_cache || !item->value_cache ||
+            (!item->kv_ring && model->position > item->kv_capacity))
+            return -1;
+        /* A full extension retains the currently visible local window. For a
+         * rewind, conservatively require that every old local row still fits
+         * in the retained window (also safe for imported sliding-row state).
+         * A counter change cannot recover an overwritten earlier window. */
+        if (requested_prefix < model->position && !item->full_attention &&
+            (model->position > item->kv_capacity ||
+             model->position >= G4_SLIDING_WINDOW))
+            retained = 0;
+    }
+    if (retained != model->position &&
+        g4_gpu_kv_rewind(model, retained) != 0)
+        return -1;
+    /* This also invalidates target_projection and advances the canonical
+     * generation consumed by both native-token and compiled executors. Future
+     * rows overwrite the same seats before becoming visible; state export and
+     * proof already enumerate only active rows. */
+    return g4_text_state_publish(model, retained) == 0 ? retained : -1;
 }
 
 int salt_gemma4_text_rollback_position(SaltGemma4Text *model,

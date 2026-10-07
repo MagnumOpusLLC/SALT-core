@@ -1,8 +1,8 @@
 {
   "schema": "salt.public-formal-verification.v1",
   "method": "Nine historical public modules retain their original independent Docker results and unchanged input hashes. The later copied loader module was independently checked with TLC, an expected RED counterexample, and clean-fingerprint TLAPS. The exported runtime source has since been refreshed; these proof results were not rerun against its native code and are not native inference qualification.",
-  "source_manifest_sha256": "e5b4fe4af102464214a3611a1a653fcffb46cb5fa3985b09f087120132aac5ec",
-  "exported_runtime_commit": "ce0363260a488c96b951b4d826a188e1014575d4",
+  "source_manifest_sha256": "4836a215d4a32735f0072d1bbc1208e266471b230e907a99fefc233ec262b77f",
+  "exported_runtime_commit": "ca634c59d2632122c55f4a25ef86338d2144a697",
   "toolchain": {
     "tlapm_sha256": "f992e87324b6b166a60816c127d2bf628f6c74b08bdb33f66acf52e724888a1b",
     "tlapm_version": "1eabe97-dirty",

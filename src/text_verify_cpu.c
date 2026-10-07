@@ -221,6 +221,7 @@ static int cpu_tensor_requirement(const SaltTextTensorDesc *tensor,
                                   size_t *maximum) {
     const SaltTextTensorBackendOps *ops;
     size_t required;
+    if (maximum && salt_tensor_desc_absent(tensor)) return 0;
     if (!tensor || !maximum || !tensor->host_ops ||
         !(ops = tensor->host_ops->cpu) || !ops->fixed_scratch_requirement ||
         !ops->gather_rows || !ops->matvec)
@@ -459,6 +460,29 @@ int salt_text_verify_cpu_parallel_bind(
     return 0;
 }
 
+int salt_text_verify_cpu_scope_bind(
+        SaltTextVerifyCpuContext *context,
+        int (*parallel_scope)(void *, int (*)(void *), void *)) {
+    if (!context || !context->ready || !context->parallel_run ||
+        !context->parallel_context || !parallel_scope || context->parallel_scope ||
+        context->collective_enabled || context->submitted || context->submitted_generation != 0u)
+        return -1;
+    context->parallel_scope = parallel_scope;
+    return 0;
+}
+
+int salt_text_verify_cpu_collective_bind(SaltTextVerifyCpuContext *context) {
+    if (!context || !context->ready || !context->parallel_run ||
+        !context->parallel_context || !context->parallel_workers ||
+        context->collective_enabled || context->parallel_scope ||
+        context->submitted || context->submitted_generation != 0u ||
+        !context->program || !context->program->target_policy ||
+        context->program->target_policy->cpu_graph)
+        return -1;
+    context->collective_enabled = 1;
+    return 0;
+}
+
 static float *cpu_floats(SaltTextVerifyCpuContext *context, size_t offset) {
     return (float *)(void *)(context->arena + offset);
 }
@@ -673,12 +697,27 @@ static float cpu_bf16_mul(float left, float right) {
 static int cpu_rope(float *head, const SaltAttentionDesc *attention,
                     uint32_t position) {
     uint32_t half, pairs;
+    if (head && attention && attention->rope_kind == SALT_ROPE_NONE)
+        return attention->rope_dim == 0 ? 0 : -1;
     if (!head || !attention || attention->head_dim < 2 ||
         attention->rope_dim < 2 || attention->rope_base_dim < 2 ||
         !(attention->rope_theta > 0.0))
         return -1;
     half = (uint32_t)attention->head_dim / 2u;
     pairs = (uint32_t)attention->rope_dim / 2u;
+    if (attention->rope_kind == SALT_ROPE_PARTIAL_F32) {
+        /* Split only the rotary prefix; the unrotated suffix is untouched. */
+        for (uint32_t pair = 0; pair < pairs; pair++) {
+            float exponent = (float)(2u * pair) / (float)attention->rope_base_dim;
+            float angle = (float)position / salt_powf((float)attention->rope_theta, exponent);
+            float cosine = salt_cosf(angle), sine = salt_sinf(angle);
+            float left = head[pair], right = head[pairs + pair];
+            head[pair] = left * cosine - right * sine;
+            head[pairs + pair] = right * cosine + left * sine;
+            if (!isfinite(head[pair]) || !isfinite(head[pairs + pair])) return -1;
+        }
+        return 0;
+    }
     for (uint32_t column = 0; column < (uint32_t)attention->head_dim;
          column++) {
         if (!isfinite(head[column])) return -1;
@@ -712,6 +751,16 @@ static float cpu_activation(float value, SaltActivationKind activation) {
             coefficient * (value + 0.044715f * value * value * value)));
     }
     return value / (1.0f + salt_expf(-value));
+}
+
+static float cpu_gate_up(float gate, float up,
+                         SaltActivationKind activation, float limit) {
+    if (activation == SALT_ACT_SILU_CLAMPED) {
+        if (gate > limit) gate = limit;
+        if (up > limit) up = limit;
+        if (up < -limit) up = -limit;
+    }
+    return cpu_activation(gate, activation) * up;
 }
 
 
@@ -1003,9 +1052,9 @@ static int cpu_attention_cell(
                         (uint32_t)attention->head_dim,
                         context->program->descriptor->norm_epsilon, 1) != 0 ||
                     cpu_rope(key, attention, position) != 0 ||
-                    cpu_rmsnorm(value, value, NULL,
+                    (!attention->raw_values && cpu_rmsnorm(value, value, NULL,
                         (uint32_t)attention->head_dim,
-                        context->program->descriptor->norm_epsilon, 0) != 0)
+                        context->program->descriptor->norm_epsilon, 0) != 0))
                     return -1;
             }
         memcpy(tentative_keys + (size_t)first * compiled->kv_width,
@@ -1106,8 +1155,8 @@ static int cpu_attention_cell(
             attention_output + (size_t)first * layer->o.cols, count,
             destination + (size_t)first * layer->o.rows);
     case SALT_TEXT_CELL_ATTENTION_COMBINE:
-        if (cpu_gather_row_zero(context, &layer->post_attention_norm,
-                                tensor_row) != 0)
+        if (layer->plan->residual_postnorm && cpu_gather_row_zero(context,
+                &layer->post_attention_norm, tensor_row) != 0)
             return -1;
         for (uint32_t row = first; row < first + count; row++) {
             float *output = destination +
@@ -1116,7 +1165,7 @@ static int cpu_attention_cell(
                 (size_t)row * context->program->hidden;
             float *branch_row = branch +
                 (size_t)row * context->program->hidden;
-            if (cpu_rmsnorm(branch_row, branch_row, tensor_row,
+            if (layer->plan->residual_postnorm && cpu_rmsnorm(branch_row, branch_row, tensor_row,
                     context->program->hidden,
                     context->program->descriptor->norm_epsilon, 1) != 0)
                 return -1;
@@ -1152,10 +1201,10 @@ static int cpu_router_input(float *output, const float *input,
 
 static int cpu_router_topk(const float *logits, const float *scales,
                            uint32_t experts, uint32_t topk,
-                           int32_t *selected, float *weights) {
+                           int32_t *selected, float *weights, int rank_order) {
     float maximum = -INFINITY, all_sum = 0.0f, selected_sum = 0.0f;
     for (uint32_t expert = 0; expert < experts; expert++) {
-        if (!isfinite(logits[expert]) || !isfinite(scales[expert])) return -1;
+        if (!isfinite(logits[expert]) || (scales && !isfinite(scales[expert]))) return -1;
         if (logits[expert] > maximum) maximum = logits[expert];
     }
     for (uint32_t rank = 0; rank < topk; rank++) {
@@ -1187,7 +1236,8 @@ static int cpu_router_topk(const float *logits, const float *scales,
     if (!(selected_sum > 0.0f) || !isfinite(selected_sum)) return -1;
     for (uint32_t rank = 0; rank < topk; rank++)
         weights[rank] = (weights[rank] / selected_sum) *
-            scales[(uint32_t)selected[rank]];
+            (scales ? scales[(uint32_t)selected[rank]] : 1.0f);
+    if (rank_order) return 0;
     for (uint32_t left = 0; left < topk; left++)
         for (uint32_t right = left + 1u; right < topk; right++)
             if (selected[right] < selected[left]) {
@@ -1301,8 +1351,8 @@ static int cpu_ffn_cell(
     case SALT_TEXT_CELL_DENSE_ACTIVATION:
         for (uint32_t index = first * dense_width;
              index < (first + count) * dense_width; index++) {
-            destination[index] = cpu_activation(
-                dense_gate[index], plan->activation) * dense_up[index];
+            destination[index] = cpu_gate_up(dense_gate[index], dense_up[index],
+                plan->activation, plan->activation_limit);
             if (!isfinite(destination[index])) return -1;
         }
         return 0;
@@ -1311,6 +1361,13 @@ static int cpu_ffn_cell(
             dense_chain + (size_t)first * dense_width, count,
             destination + (size_t)first * hidden);
     case SALT_TEXT_CELL_ROUTER_INPUT:
+        if (!plan->router_rmsnorm) {
+            if (cpu_gather_row_zero(context, &layer->pre_ffn_norm_2, tensor_row) != 0)
+                return -1;
+            return cpu_rmsnorm_rows(destination + (size_t)first * hidden,
+                state_b + (size_t)first * hidden, tensor_row, count, hidden,
+                context->program->descriptor->norm_epsilon);
+        }
         if (cpu_gather_row_zero(context, &layer->router_scale,
                                 tensor_row) != 0)
             return -1;
@@ -1335,14 +1392,14 @@ static int cpu_ffn_cell(
     case SALT_TEXT_CELL_ROUTER_TOPK: {
         int32_t *expert_next = (int32_t *)(void *)tensor_row;
         if (destination != (float *)(void *)selected ||
-            cpu_gather_row_zero(context, &layer->per_expert_scale,
-                                tensor_row) != 0)
+            (!plan->router_rank_order && cpu_gather_row_zero(context,
+                &layer->per_expert_scale, tensor_row) != 0))
             return -1;
         for (uint32_t row = first; row < first + count; row++)
             if (cpu_router_topk(router_logits + (size_t)row * experts,
-                    tensor_row, experts, topk,
+                    plan->router_rank_order ? NULL : tensor_row, experts, topk,
                     selected + (size_t)row * topk,
-                    weights + (size_t)row * topk) != 0)
+                    weights + (size_t)row * topk, plan->router_rank_order) != 0)
                 return -1;
         if (first == 0 && count == candidate_count) {
             uint32_t jobs = candidate_count * topk;
@@ -1569,8 +1626,8 @@ static int cpu_ffn_cell(
         if (context->frontier_expert_layer == cell->layer) return 0;
         for (uint32_t index = first * expert_width;
              index < (first + count) * expert_width; index++) {
-            destination[index] = cpu_activation(
-                routed_gate[index], plan->activation) * routed_up[index];
+            destination[index] = cpu_gate_up(routed_gate[index], routed_up[index],
+                plan->activation, plan->activation_limit);
             if (!isfinite(destination[index])) return -1;
         }
         return 0;
@@ -1592,6 +1649,14 @@ static int cpu_ffn_cell(
         return 0;
     case SALT_TEXT_CELL_FFN_COMBINE: {
         float scalar = 1.0f;
+        if (!plan->residual_postnorm) {
+            if (plan->dense_intermediate || plan->final_layer_scale) return -1;
+            for (size_t i = (size_t)first * hidden; i < (size_t)(first + count) * hidden; i++) {
+                destination[i] = state_b[i] + routed_output[i];
+                if (!isfinite(destination[i])) return -1;
+            }
+            return 0;
+        }
         if (cpu_gather_row_zero(context, &layer->post_ffn_norm_1,
                                 tensor_row) != 0 ||
             cpu_rmsnorm_rows(combine_a + (size_t)first * hidden,
@@ -1674,12 +1739,12 @@ static int cpu_global_cell(
     case SALT_TEXT_CELL_LOGIT_SOFTCAP: {
         float cap = program->layers[program->layer_count - 1u].descriptor->
             plan->logit_softcap;
-        if (destination != position_logits || !(cap > 0.0f) || !isfinite(cap))
+        if (destination != position_logits || !(cap >= 0.0f) || !isfinite(cap))
             return -1;
         for (uint32_t index = first * program->vocabulary;
              index < (first + count) * program->vocabulary; index++) {
             if (!isfinite(destination[index])) return -1;
-            destination[index] = cap * salt_tanhf(destination[index] / cap);
+            if (cap > 0.0f) destination[index] = cap * salt_tanhf(destination[index] / cap);
         }
         return 0;
     }
@@ -1921,6 +1986,7 @@ typedef struct CpuFfnFrontierCall {
     SaltAreaFrontier *frontier;
     CpuFfnFrontierExpert experts[CPU_MAX_FFN_FRONTIER_EXPERTS];
     SaltActivationKind activation;
+    float activation_limit;
     uint32_t expert_count;
     uint32_t workers;
     uint32_t gate_tasks;
@@ -1937,8 +2003,8 @@ static int cpu_ffn_frontier_activate(CpuFfnFrontierCall *call,
         !entry->chain || entry->value_count == 0u)
         return -1;
     for (uint32_t index = 0u; index < entry->value_count; index++) {
-        float value = cpu_activation(entry->gate[index], call->activation) *
-            entry->up[index];
+        float value = cpu_gate_up(entry->gate[index], entry->up[index],
+            call->activation, call->activation_limit);
         if (!isfinite(value)) return -1;
         entry->chain[index] = value;
     }
@@ -2090,6 +2156,7 @@ static int cpu_ffn_frontier_execute(
     memset(&call, 0, sizeof call);
     call.frontier = &context->area_frontier;
     call.activation = layer->plan->activation;
+    call.activation_limit = layer->plan->activation_limit;
     call.expert_count = topk;
     call.workers = workers;
     call.gate_tasks = topk * workers;
@@ -2375,9 +2442,9 @@ static int cpu_finish_host_node(SaltTextVerifyCpuContext *context) {
     return ops->finish && seat ? ops->finish(seat) : -1;
 }
 
-static int cpu_interpret(SaltTextVerifyCpuContext *context,
+static int cpu_interpret_nodes(SaltTextVerifyCpuContext *context,
                          uint32_t source, const int32_t *tokens,
-                         uint32_t rows) {
+                         uint32_t rows, uint32_t output_rows) {
     const SaltTextVerifyProgram *program = context->program;
     int graph_enabled;
     uint32_t epoch = 0;
@@ -2448,6 +2515,15 @@ static int cpu_interpret(SaltTextVerifyCpuContext *context,
             goto fail;
         active_cpu.first = 0;
         active_cpu.count = actual;
+        if (cell->layer == UINT32_MAX &&
+            cell->kind >= SALT_TEXT_CELL_FINAL_NORM) {
+            active_cpu.first = rows - output_rows;
+            active_cpu.count = output_rows;
+            if (output_rows == 0u) {
+                if (cell->completion_epoch > epoch) epoch = cell->completion_epoch;
+                continue;
+            }
+        }
         uint64_t cell_started = context->profile_enabled ? cpu_now_ns() : 0;
         if (cpu_dispatch_cell(context, cell, source, tokens, rows,
                 active_cpu) != 0) {
@@ -2482,10 +2558,183 @@ fail:
     return -1;
 }
 
-static int cpu_submit(void *opaque, const SaltTextVerifyProgram *program,
+/* Collective attention consumes the identical head-fold and KV-view helpers.
+ * Only row/head ownership changes; no nested pool dispatch from a graph cell. */
+static int cpu_collective_attention(SaltTextVerifyCpuContext *c,
+        const SaltTextExecutionCell *cell, uint32_t worker) {
+    const SaltTextCompiledLayer *compiled = &c->program->layers[cell->layer];
+    const SaltTextLayerExecDesc *layer = compiled->descriptor;
+    const SaltAttentionDesc *attention = &layer->plan->attention;
+    SaltTextKvReadView keys, values;
+    SaltAttnKvSpan spans[SALT_ATTN_HEAD_MAX_SPANS];
+    const uint32_t *parents = NULL, *depths = NULL;
+    uint32_t rows = c->submitted_candidates, source = c->submitted_source_position;
+    size_t capacity = (size_t)c->program->maximum_candidates * compiled->kv_width;
+    int nspan = 0;
+    if (c->submitted_frontier) {
+        parents = (const uint32_t *)(const void *)(c->arena + c->program->layout.target_parent_rows);
+        depths = (const uint32_t *)(const void *)(c->arena + c->program->layout.target_depths);
+    }
+    if (salt_text_kv_read_view_init(&keys, &layer->kv->keys,
+            cpu_floats(c, compiled->tentative_key_offset), capacity, compiled->kv_width,
+            rows, source, parents, depths, compiled->kv_width) ||
+        salt_text_kv_read_view_init(&values, &layer->kv->values,
+            cpu_floats(c, compiled->tentative_value_offset), capacity, compiled->kv_width,
+            rows, source, parents, depths, compiled->kv_width)) return -1;
+    if (!c->submitted_frontier && rows == 1u) {
+        uint32_t first = 0u;
+        int rc;
+        if (attention->kind == SALT_ATTN_SLIDING && source + 1u > (uint32_t)attention->window)
+            first = source + 1u - (uint32_t)attention->window;
+        memset(spans, 0, sizeof spans);
+        rc = cpu_attention_linear_spans(&keys, &values, 0u, first,
+            source - first + 1u, compiled->kv_width, spans, &nspan);
+        if (rc < 0) return -1;
+        if (rc > 0) nspan = 0;
+    }
+    uint32_t work = rows * (uint32_t)attention->n_heads;
+    uint32_t active = c->parallel_workers > 1u && work >= c->parallel_workers
+        ? c->parallel_workers : 1u;
+    if (worker >= active) return 0;
+    uint32_t first = (uint32_t)((uint64_t)work * worker / active);
+    uint32_t end = (uint32_t)((uint64_t)work * (worker + 1u) / active);
+    float *scores = active == 1u
+        ? cpu_floats(c, c->program->layout.attention_scores)
+        : c->parallel_scores + (size_t)worker * c->parallel_score_stride;
+    for (uint32_t i = first; i < end; i++)
+        if (cpu_attention_head(c, compiled, &keys, &values, nspan ? spans : NULL,
+                nspan, source, i / (uint32_t)attention->n_heads,
+                i % (uint32_t)attention->n_heads, scores)) return -1;
+    return 0;
+}
+
+static int cpu_collective_cell(void *opaque, uint32_t node, uint32_t worker) {
+    SaltTextVerifyCpuContext *c = opaque;
+    const SaltTextVerifyProgram *p = c->program;
+    const SaltTextExecutionCell *cell = &p->dispatch.cells[node];
+    const SaltTextExecutionAssignment *a = &c->assignment_plan.assignments[node];
+    SaltTensorHostGraphState *g = &c->graph_state;
+    uint32_t rows = c->submitted_candidates, actual = rows, first = 0u;
+    uint32_t owner = node % c->parallel_workers;
+    int projection = cpu_graph_projection_kind(cell->kind) ||
+        cell->kind == SALT_TEXT_CELL_EXPERT_GATE || cell->kind == SALT_TEXT_CELL_EXPERT_DOWN;
+    if (cell->unit == SALT_TEXT_EXECUTION_JOBS) {
+        if (cell->layer >= p->layer_count) return -1;
+        actual = rows * (uint32_t)p->layers[cell->layer].descriptor->plan->top_k_experts;
+    }
+    if (actual > cell->logical_capacity || a->cpu.first != 0u || a->cpu.count < actual ||
+        a->gpu.count != 0u || !cell->destination_stride ||
+        cell->destination_offset >= p->layout.total_bytes ||
+        actual > (p->layout.total_bytes - cell->destination_offset) / cell->destination_stride)
+        return -1;
+    if (cell->layer == UINT32_MAX && cell->kind >= SALT_TEXT_CELL_FINAL_NORM) {
+        first = rows - c->collective_output_rows;
+        actual = c->collective_output_rows;
+        if (!actual) return 0;
+    }
+    if (cpu_graph_alias_kind(cell->kind)) return 0;
+    if (cell->kind == SALT_TEXT_CELL_ATTENTION_BODY)
+        return cpu_collective_attention(c, cell, worker);
+    if (!projection) {
+        /* Canonical serial folds retain one owner, distributed across nodes;
+         * no arithmetic is recreated and there is no coordinator mailbox. */
+        return worker == owner ? cpu_dispatch_cell(c, cell,
+            c->submitted_source_position,
+            (const int32_t *)(const void *)(c->arena + p->layout.candidate_token_ids),
+            rows, (SaltTextExecutionSlice){first, actual}) : 0;
+    }
+    if (worker == owner) {
+        c->collective_job_count = 0u;
+        c->collective_error = cpu_graph_build_jobs(c, cell, rows, first, actual,
+                                                  &c->collective_job_count);
+    }
+    salt_tensor_host_graph_barrier(g);
+    int prepare_error = c->collective_error;
+    uint32_t total = c->collective_job_count;
+    salt_tensor_host_graph_barrier(g);
+    if (prepare_error) return -1;
+    for (uint32_t done = 0u; done < total;) {
+        const SaltTensorHostNodeOps *ops;
+        uint32_t take;
+        if (worker == owner) {
+            SaltTensorHostNodePlan *plan = &c->graph_node_plan;
+            const SaltTensorHostBatch *job = c->node_jobs + done;
+            g->node_ops = NULL; g->node_seat = NULL;
+            c->collective_job_take = 0u;
+            memset(plan, 0, sizeof *plan);
+            ops = job->tensor->host_ops->cpu->retained_node;
+            c->collective_error = !ops || !ops->prepare || !ops->worker || !ops->finish;
+            if (!c->collective_error) {
+                c->collective_error = ops->prepare(job, total-done, rows,
+                    c->parallel_workers, c->tensor_scratch, c->tensor_scratch_bytes, plan);
+                if (!c->collective_error) {
+                    g->node_ops = ops; g->node_seat = c->tensor_scratch;
+                    c->collective_job_take = plan->consumed_jobs ? plan->consumed_jobs : total-done;
+                    if (!plan->active_workers || plan->active_workers > c->parallel_workers ||
+                        c->collective_job_take > total-done) c->collective_error = -1;
+                }
+            }
+        }
+        salt_tensor_host_graph_barrier(g);
+        take = c->collective_job_take;
+        ops = g->node_ops;
+        if (!c->collective_error && worker < c->graph_node_plan.active_workers &&
+            ops->worker(g->node_seat, worker) != 0)
+            __atomic_store_n(&g->failed, 1u, __ATOMIC_RELEASE);
+        salt_tensor_host_graph_barrier(g);
+        if (worker == owner) {
+            if (ops && ops->finish(g->node_seat) != 0) c->collective_error = -1;
+            g->node_ops = NULL; g->node_seat = NULL;
+        }
+        salt_tensor_host_graph_barrier(g);
+        int failed = c->collective_error || __atomic_load_n(&g->failed, __ATOMIC_ACQUIRE);
+        salt_tensor_host_graph_barrier(g);
+        if (failed) return -1;
+        done += take;
+    }
+    if (worker == owner) c->stats.projection_dispatches++;
+    return 0;
+}
+
+typedef struct CpuInterpretCall {
+    SaltTextVerifyCpuContext *context;
+    uint32_t source;
+    const int32_t *tokens;
+    uint32_t rows, output_rows;
+} CpuInterpretCall;
+
+static int cpu_interpret_scope(void *opaque) {
+    CpuInterpretCall *call = opaque;
+    return cpu_interpret_nodes(call->context, call->source, call->tokens,
+                               call->rows, call->output_rows);
+}
+
+static int cpu_interpret(SaltTextVerifyCpuContext *context,
+                         uint32_t source, const int32_t *tokens,
+                         uint32_t rows, uint32_t output_rows) {
+    CpuInterpretCall call = {context, source, tokens, rows, output_rows};
+    if (context->collective_enabled) {
+        SaltTensorHostGraphResult result;
+        context->collective_output_rows = output_rows;
+        context->coalescing_enabled = 0;
+        int rc = salt_tensor_host_graph_collective_execute(&context->graph_state,
+            context->program->dispatch.cell_count, cpu_collective_cell, context,
+            context->parallel_workers, context->parallel_run, context->parallel_context, &result);
+        context->stats.cpu_graph_sessions = 1u;
+        context->stats.cpu_graph_nodes = result.nodes_executed;
+        context->stats.cpu_graph_barriers = result.internal_barriers;
+        return rc;
+    }
+    return context->parallel_scope
+        ? context->parallel_scope(context->parallel_context,
+                                   cpu_interpret_scope, &call)
+        : cpu_interpret_scope(&call);
+}
+
+static int cpu_submit_output(void *opaque, const SaltTextVerifyProgram *program,
                       uint64_t generation, uint32_t source_position,
                       const int32_t *candidate_token_ids,
-                      uint32_t candidate_count) {
+                      uint32_t candidate_count, uint32_t output_rows) {
     SaltTextVerifyCpuContext *context =
         (SaltTextVerifyCpuContext *)opaque;
     uint64_t clear_started, setup_started;
@@ -2494,7 +2743,9 @@ static int cpu_submit(void *opaque, const SaltTextVerifyProgram *program,
         context->assignment_plan.program != program ||
         context->assignment_plan.execution_class != SALT_TEXT_EXECUTION_CPU_ONLY ||
         generation == 0 || !candidate_token_ids || candidate_count == 0 ||
-        candidate_count > program->maximum_candidates)
+        candidate_count > program->maximum_candidates || output_rows > candidate_count ||
+        (output_rows != candidate_count && program->target_policy &&
+         program->target_policy->cpu_graph))
         return -1;
     if (salt_text_attention_score_rows(program, source_position,
             candidate_count - 1u, &score_rows) != 0)
@@ -2528,13 +2779,23 @@ static int cpu_submit(void *opaque, const SaltTextVerifyProgram *program,
     context->stats.engine_submissions = 1u;
     context->stats.initial_transfer_bytes =
         (uint64_t)candidate_count * sizeof(int32_t);
+    context->stats.final_logits_transfer_bytes =
+        (uint64_t)output_rows * program->vocabulary * sizeof(float);
     if (context->profile_enabled)
         cpu_add_elapsed(&context->stats.cpu_target_setup_ns, setup_started);
     if (cpu_interpret(context, source_position,
             (const int32_t *)(const void *)(context->arena +
-                program->layout.candidate_token_ids), candidate_count) != 0)
+                program->layout.candidate_token_ids), candidate_count, output_rows) != 0)
         return -1;
     return 0;
+}
+
+static int cpu_submit(void *opaque, const SaltTextVerifyProgram *program,
+                      uint64_t generation, uint32_t source_position,
+                      const int32_t *candidate_token_ids,
+                      uint32_t candidate_count) {
+    return cpu_submit_output(opaque, program, generation, source_position,
+        candidate_token_ids, candidate_count, candidate_count);
 }
 
 static int cpu_submit_frontier(
@@ -2602,10 +2863,12 @@ static int cpu_submit_frontier(
     context->stats.initial_transfer_bytes =
         (uint64_t)frontier->node_count *
         (sizeof(int32_t) + 2u * sizeof(uint32_t));
+    context->stats.final_logits_transfer_bytes =
+        (uint64_t)frontier->node_count * program->vocabulary * sizeof(float);
     if (context->profile_enabled)
         cpu_add_elapsed(&context->stats.cpu_target_setup_ns, setup_started);
     return cpu_interpret(
-        context, source_position, tokens, frontier->node_count);
+        context, source_position, tokens, frontier->node_count, frontier->node_count);
 }
 
 static int cpu_finish(void *opaque, const SaltTextVerifyProgram *program,
@@ -2618,9 +2881,6 @@ static int cpu_finish(void *opaque, const SaltTextVerifyProgram *program,
         return -1;
     context->stats.completion_fences = 1u;
     context->stats.intermediate_host_publications = 0u;
-    context->stats.final_logits_transfer_bytes =
-        (uint64_t)context->submitted_candidates * program->vocabulary *
-        sizeof(float);
     view->canonical_base = context->arena;
     view->canonical_bytes = program->layout.total_bytes;
     *stats = context->stats;
@@ -2683,7 +2943,7 @@ static const SaltTextVerifyExecutorOps cpu_executor_ops = {
     cpu_resolve,
     cpu_scrub,
     cpu_submit,
-    NULL
+    cpu_submit_output
 };
 
 int salt_text_verify_cpu_executor_init(SaltTextVerifyExecutor *executor,

@@ -22,7 +22,8 @@ typedef enum SaltTensorEncoding {
     SALT_TENSOR_ENCODING_BF16 = 2,
     SALT_TENSOR_ENCODING_AFFINE_Q4 = 3,
     SALT_TENSOR_ENCODING_AFFINE_Q8 = 4,
-    SALT_TENSOR_ENCODING_NVFP4 = 5
+    SALT_TENSOR_ENCODING_NVFP4 = 5,
+    SALT_TENSOR_ENCODING_ROW_INT2 = 6
 } SaltTensorEncoding;
 
 /* Source ownership is independent from execution backend. STATIC names one
@@ -241,6 +242,9 @@ typedef struct SaltTensorHostBatch {
 typedef struct SaltTensorHostNodePlan {
     uint32_t active_workers;
     SaltAreaScanPlan area;
+    /* Optional bounded resource prefix; zero keeps the complete-job contract.
+     * The engine, not the binding, advances the remaining canonical jobs. */
+    uint32_t consumed_jobs;
 } SaltTensorHostNodePlan;
 
 struct SaltTensorHostNodeOps {
@@ -296,6 +300,10 @@ typedef struct SaltTensorHostGraphState {
     uint32_t active_workers;
     const SaltTensorHostNodeOps *node_ops;
     void *node_seat;
+    uint32_t barrier_arrived;
+    uint32_t barrier_epoch;
+    uint32_t collective_nodes;
+    int (*collective_cell)(void *context, uint32_t node, uint32_t worker);
 } SaltTensorHostGraphState;
 
 /* Execute one already-compiled span program through the caller's retained
@@ -305,6 +313,16 @@ typedef struct SaltTensorHostGraphState {
 int salt_tensor_host_graph_execute(
     SaltTensorHostGraphState *state,
     const SaltTensorHostGraphCallbacks *callbacks, void *context,
+    uint32_t worker_count, SaltTensorHostGraphParallelRun parallel_run,
+    void *parallel_context, SaltTensorHostGraphResult *result);
+
+/* All members of the existing pool traverse every immutable node themselves.
+ * A cell may use the shared graph barrier for preparation/consumer/retirement;
+ * it must drain those barriers on failure. No per-node pool submission. */
+void salt_tensor_host_graph_barrier(SaltTensorHostGraphState *state);
+int salt_tensor_host_graph_collective_execute(
+    SaltTensorHostGraphState *state, uint32_t node_count,
+    int (*cell)(void *context, uint32_t node, uint32_t worker), void *context,
     uint32_t worker_count, SaltTensorHostGraphParallelRun parallel_run,
     void *parallel_context, SaltTensorHostGraphResult *result);
 

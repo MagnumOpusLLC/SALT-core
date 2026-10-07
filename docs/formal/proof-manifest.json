@@ -2,9 +2,9 @@
   "schema": "salt.public-formal-proof-manifest.v1",
   "source_baseline": "d3a2037f404d520998ac2d3b2d182ca58f529c82",
   "source_timestamp": "2026-09-21T19:50:34-04:00",
-  "exported_runtime_commit": "ce0363260a488c96b951b4d826a188e1014575d4",
-  "exported_runtime_timestamp": "2026-10-02T10:58:17-04:00",
-  "scope": "Nine historical abstract modules pinned to the older source plus one later, independently checked supplemental loader module. Three mapped loader C files match the exported runtime; no complete current-runtime refinement or concrete KV bit-identity certificate.",
+  "exported_runtime_commit": "ca634c59d2632122c55f4a25ef86338d2144a697",
+  "exported_runtime_timestamp": "2026-10-06T23:47:09-04:00",
+  "scope": "Ten historical abstract modules retain their exact proof inputs and results. Runtime source has advanced separately; no current native-source refinement or concrete KV bit-identity certificate is asserted.",
   "supplemental_loader_source": {
     "proof_commit": "beab7291b7dd7ae11bb7d21ea0735e83ad7c0fa0",
     "proof_timestamp": "2026-10-02T10:49:29-04:00",

@@ -27,7 +27,7 @@ SPEC.loader.exec_module(projection_module)
 
 PRODUCTION_MANIFEST = Path("models/gemma4-26b-a4b/kv-cache-compat.json")
 PRODUCTION_PROJECTION = Path("models/gemma4-26b-a4b/kv-cache-compat-projection.json")
-EXPECTED_PRODUCTION = "d7e323dde7a7d336cd56c9879199c0ec7da99e243536afb0e5e776aaa31c88e6"
+EXPECTED_PRODUCTION = "36da7910335af449d03531ce73b8d539ba6550633118c26e7b54a015cfc89a98"
 BEGIN = b"# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1\n"
 END = b"# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1\n"
 
@@ -200,6 +200,18 @@ def self_contained_contract() -> None:
         projection.write_bytes(projection_raw)
 
         wrong = json.loads(projection_raw)
+        template = wrong["overrides"][0]
+        for count in (21, 128):
+            wrong["overrides"] = [dict(template, logical_path=f"source-{i:03}.c")
+                                  for i in range(count)]
+            projection.write_text(json.dumps(wrong))
+            assert len(projection_module._load_projection(projection, root)[1]["overrides"]) == count
+        wrong["overrides"].append(dict(template, logical_path="source-128.c"))
+        projection.write_text(json.dumps(wrong))
+        expect_error(lambda: projection_module._load_projection(projection, root),
+                     "compatibility projection overrides are malformed")
+
+        wrong = json.loads(projection_raw)
         wrong["compatibility_manifest"] = "other.json"
         projection.write_text(json.dumps(wrong))
         expect_error(
@@ -221,6 +233,9 @@ def production_contract() -> None:
     assert PRODUCTION_PROJECTION.as_posix() in dependencies
     assert "models/gemma4-26b-a4b/compat/v6/Makefile" in dependencies
     assert "models/gemma4-26b-a4b/compat/v6/src/tokenizer.c" in dependencies
+    assert "models/gemma4-26b-a4b/compat/v6/models/gemma4-26b-a4b/gemma4_text.h" in dependencies
+    assert dict(authority.file_sha256)["models/gemma4-26b-a4b/gemma4_text.h"] == \
+        "27f20d4b5c27250bd312b356289f2c2d40bd72c67518d219490ad771f6407dfd"
     assert dict(authority.file_sha256)["src/tokenizer.c"] == \
         "112a85f42cb752e16424abeb3bd6fd82b31b3fda20571e67af99e5af72f3c310"
     assert dict(authority.file_sha256)["Makefile"] == \

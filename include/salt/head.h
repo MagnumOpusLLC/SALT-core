@@ -13,6 +13,7 @@
 #include "salt/salt.h"
 
 #include <stdint.h>
+#include <math.h>
 
 typedef struct SaltHead {
     uint8_t *buf;           /* head.bin mmap'd/read whole */
@@ -72,6 +73,37 @@ void salt_apply_freq_penalty(float *logits, int V, const int *recent,
  * 0-2). Returns 0. */
 void salt_apply_presence_penalty(float *logits, int V, const int *recent,
                                  int n_recent, float pres_pen);
+
+/* Existing SALT generated-window repetition convention: divide each seen
+ * logit by penalty^count, forming the power with ordered binary32 multiplies.
+ * Both signs are divided, as in the historical Qwen path; this is NOT the
+ * sign-aware HF set-style convention. No allocation, RNG, or retained state.
+ * The caller supplies the bounded window and a private, existing logit seat.
+ * Invalid input is refused before any write. */
+#define SALT_REPETITION_MAX_WINDOW 64u
+static inline int salt_apply_repetition_penalty(
+        float *logits, int vocabulary, const int32_t *recent,
+        uint32_t count, float penalty) {
+    if (!logits || vocabulary < 1 || count > SALT_REPETITION_MAX_WINDOW ||
+        (count && !recent) || !isfinite(penalty) ||
+        penalty < 1.0f || penalty > 2.0f) return -1;
+    for (uint32_t i = 0; i < count; i++)
+        if (recent[i] < 0 || recent[i] >= vocabulary ||
+            !isfinite(logits[recent[i]])) return -1;
+    if (penalty == 1.0f) return 0;
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t earlier = 0, occurrences = 0;
+        for (; earlier < i; earlier++)
+            if (recent[earlier] == recent[i]) break;
+        if (earlier != i) continue;
+        for (uint32_t j = i; j < count; j++)
+            if (recent[j] == recent[i]) occurrences++;
+        float factor = penalty;
+        for (uint32_t n = 1; n < occurrences; n++) factor *= penalty;
+        logits[recent[i]] /= factor;
+    }
+    return 0;
+}
 
 /* Greedy: the argmax token id (the SALT_GREEDY sampling mode). */
 int salt_argmax(const float *logits, int V);

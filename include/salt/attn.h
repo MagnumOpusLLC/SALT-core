@@ -173,6 +173,12 @@ typedef struct SaltKvCache {
     void           *aflow_phase_arg;
     pthread_t       aflow_coordinator;
     uint64_t        aflow_sessions;
+    /* Optional graph-scoped team on this SAME resident pool. Phase payload
+     * stays in aflow_*; only parking metadata is additional. Atomic compiler
+     * adapters publish phases/completion, never floating-point reductions. */
+    int             ateam_mode;
+    int             ateam_sleepers;
+    int             ateam_join_sleeping;
     int             asoa_profile;
     uint32_t        asoa_peak_active;
     uint64_t        asoa_phase_actions;
@@ -234,6 +240,11 @@ int  salt_attn_pool_graph_end(SaltKvCache *c);
  * complete flow. The coordinator callback and every phase argument must remain
  * valid until this synchronous call returns. */
 int  salt_attn_pool_flow_run(SaltKvCache *c,
+                             int (*fn)(void *arg), void *arg);
+/* Same coordinator/phase contract as flow_run, but ready phases use atomic
+ * publication/completion rather than a mutex/condvar rendezvous per operator.
+ * Idle team members park using the existing pool condition variables. */
+int  salt_attn_pool_team_run(SaltKvCache *c,
                              int (*fn)(void *arg), void *arg);
 /* Execute one fixed-capacity W/F/Q scheduler inside one resident pool flow.
  * Every internal Q phase retains worker identity; the caller observes one

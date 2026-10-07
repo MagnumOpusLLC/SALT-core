@@ -1355,3 +1355,78 @@ void salt_simd_f8_matvec_bf16(
 
 int salt_simd_available(void) { return 0; }
 #endif
+
+/* INT2 loads, SALT's unfused eight-lane BF16 fold, and its bounded
+ * weight-stationary token-tile shape. No decoded payload or worker storage. */
+int salt_simd_int2_matvec_batch_rows(const uint8_t *values, const void *scales,
+    int rows, int cols, int batch, const float *inputs, float *outputs,
+    int first_row, int end_row) {
+#if defined(__aarch64__)
+    enum { TOKEN_TILE = 4 };
+    const int32_t shift_data[4] = {0, -2, -4, -6};
+    int32x4_t shifts = vld1q_s32(shift_data);
+    uint32x4_t mask = vdupq_n_u32(3u);
+    int32x4_t center = vdupq_n_s32(2);
+    if (!values || !scales || !inputs || !outputs || rows < 1 || cols < 1 ||
+        batch < 1 || first_row < 0 || end_row < first_row || end_row > rows)
+        return -1;
+    size_t stride = ((size_t)cols + 3u) / 4u;
+    for (int r = first_row; r < end_row; r++) {
+        const uint8_t *sp = (const uint8_t *)scales + (size_t)r * 4u;
+        uint32_t bits = (uint32_t)sp[0] | (uint32_t)sp[1] << 8 |
+            (uint32_t)sp[2] << 16 | (uint32_t)sp[3] << 24;
+        float scale;
+        memcpy(&scale, &bits, sizeof scale);
+        if (!isfinite(scale) || scale < 0.0f) return -1;
+    }
+    for (int r = first_row; r < end_row; r++) {
+        const uint8_t *wr = values + (size_t)r * stride;
+        const uint8_t *sp = (const uint8_t *)scales + (size_t)r * 4u;
+        uint32_t bits = (uint32_t)sp[0] | (uint32_t)sp[1] << 8 |
+            (uint32_t)sp[2] << 16 | (uint32_t)sp[3] << 24;
+        float scale;
+        memcpy(&scale, &bits, sizeof scale);
+        for (int b0 = 0; b0 < batch; b0 += TOKEN_TILE) {
+            int count = batch - b0 < TOKEN_TILE ? batch - b0 : TOKEN_TILE;
+            float32x4_t lo[TOKEN_TILE], hi[TOKEN_TILE];
+            for (int b = 0; b < TOKEN_TILE; b++) {
+                lo[b] = vdupq_n_f32(0.0f);
+                hi[b] = vdupq_n_f32(0.0f);
+            }
+            int c = 0;
+            for (; c + 7 < cols; c += 8) {
+                uint32x4_t q0 = vandq_u32(vshlq_u32(vdupq_n_u32(wr[c / 4]), shifts), mask);
+                uint32x4_t q1 = vandq_u32(vshlq_u32(vdupq_n_u32(wr[c / 4 + 1]), shifts), mask);
+                float32x4_t w0 = vmulq_n_f32(vcvtq_f32_s32(
+                    vsubq_s32(vreinterpretq_s32_u32(q0), center)), scale);
+                float32x4_t w1 = vmulq_n_f32(vcvtq_f32_s32(
+                    vsubq_s32(vreinterpretq_s32_u32(q1), center)), scale);
+                for (int b = 0; b < TOKEN_TILE; b++) if (b < count) {
+                    const float *x = inputs + (size_t)(b0 + b) * cols + c;
+                    lo[b] = vaddq_f32(lo[b], vmulq_f32(w0, vld1q_f32(x)));
+                    hi[b] = vaddq_f32(hi[b], vmulq_f32(w1, vld1q_f32(x + 4)));
+                }
+            }
+            for (int b = 0; b < count; b++) {
+                float32x2_t sum2 = vadd_f32(vget_low_f32(lo[b]), vget_high_f32(lo[b]));
+                sum2 = vadd_f32(sum2, vadd_f32(vget_low_f32(hi[b]), vget_high_f32(hi[b])));
+                float sum = vget_lane_f32(sum2, 0) + vget_lane_f32(sum2, 1);
+                const float *x = inputs + (size_t)(b0 + b) * cols;
+                for (int tail = c; tail < cols; tail++) {
+                    int code = (wr[tail / 4] >> (2 * (tail % 4))) & 3;
+                    float weight = (float)(code - 2) * scale;
+                    float product = weight * x[tail];
+                    sum += product;
+                }
+                if (!isfinite(sum)) return -1;
+                outputs[(size_t)(b0 + b) * rows + r] = sum;
+            }
+        }
+    }
+    return 0;
+#else
+    (void)values; (void)scales; (void)rows; (void)cols; (void)batch;
+    (void)inputs; (void)outputs; (void)first_row; (void)end_row;
+    return 1;
+#endif
+}

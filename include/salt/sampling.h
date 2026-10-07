@@ -24,4 +24,13 @@ int salt_sampler_select(const SaltSamplerConfig *config,
                         const float *logits, int count,
                         uint64_t position, int *token_out);
 
+/* Opt-in nucleus filter. Full-vocabulary mass is evaluated before top-k and
+ * temperature, matching the published Maple MLX filter order. The smallest
+ * descending prefix reaching p is retained, intersected with top-k; ties use
+ * lowest token ID. p=1 is exactly the existing path. Range (0,1]. Uses the
+ * existing bounded candidate seats and counter draw; no new allocation. */
+int salt_sampler_select_top_p(const SaltSamplerConfig *config,
+                              const float *logits, int count, float top_p,
+                              uint64_t position, int *token_out);
+
 #endif
