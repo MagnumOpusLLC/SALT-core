@@ -3,6 +3,7 @@
 #include "salt/attn_batch.h"
 #include "salt/attn.h"
 #include "salt/bitmath.h"
+#include "salt/text_exec.h"
 #include "thread-lifecycle.h"
 
 #include <limits.h>
@@ -131,6 +132,15 @@ int salt_attention_batch_run(const SaltAttentionBatchJob *job, int threads) {
         job->start_position + job->batch > 8 * job->pool->max_tokens)
         return -1;
     pool_run.workers = workers;
+    if (salt_text_prefill_team_current()) {
+        const SaltTextPrefillTeam *team = salt_text_prefill_team_current();
+        int rc = threads > (int)team->workers ? -1 : 0;
+        if (!rc && team->worker < (uint32_t)threads) {
+            (void)attention_worker(&workers[team->worker]);
+            rc = workers[team->worker].failed;
+        }
+        return salt_text_prefill_team_sync(rc);
+    }
     if (salt_attn_pool_run_n(job->pool, threads,
             attention_pool_worker, &pool_run) != 0)
         return -1;

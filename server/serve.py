@@ -59,8 +59,12 @@ def build_parser():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--port", type=int, default=8080)
     p.add_argument("--host", default="127.0.0.1")
-    p.add_argument("--backend", choices=("qwen", "gemma4"), default="qwen",
+    p.add_argument("--backend", choices=("qwen", "gemma4", "maple"), default="qwen",
                    help="model execution backend (default: qwen)")
+    p.add_argument("--maple-package", default=None)
+    p.add_argument("--maple-runner", default=None)
+    p.add_argument("--maple-context", type=int, default=None)
+    p.add_argument("--maple-batch", type=int, default=None)
     p.add_argument("--salt", default=CFG.get("SALT_BIN", "./salt"),
                    help="engine binary (default ./salt)")
     p.add_argument("--model", default=None,
@@ -127,6 +131,9 @@ def build_parser():
     p.add_argument("--gemma-text-build-receipt", default=None)
     p.add_argument("--gemma-multimodal-build-receipt", default=None)
     p.add_argument("--gemma-server-build-receipt", default=None)
+    p.add_argument("--gemma-session-mode", choices=("stateful", "openai"),
+                   default=os.environ.get("GEMMA4_SESSION_MODE", "stateful"),
+                   help="stateful live conversation or complete-request OpenAI prefix reuse")
     p.add_argument("--gemma-shared-kv", default=None,
                    help="operator-owned immutable G4KVC006 prefix")
     p.add_argument("--gemma-mentor-root", default=None,
@@ -1206,6 +1213,13 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     global ARGS
     ARGS = build_parser().parse_args()
+    if ARGS.backend == "maple":
+        from maple_backend import serve_from_args
+        try:
+            return serve_from_args(ARGS)
+        except (ValueError, RuntimeError, OSError) as exc:
+            print(f"[maple-serve] setup failed: {exc}", file=sys.stderr, flush=True)
+            return 2
     if ARGS.model is None:
         ARGS.model = ("gemma-4-26b-a4b-it"
                       if ARGS.backend == "gemma4" else MODEL_ID)

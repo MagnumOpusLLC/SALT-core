@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sched.h>
 
 static int multiply_u64(uint64_t a, uint64_t b, uint64_t *out) {
     if (!out || (a != 0 && b > UINT64_MAX / a)) return -1;
@@ -32,7 +33,7 @@ int salt_tensor_storage_validate(const SaltTensorStorageSpec *storage,
         storage->source_class > SALT_TENSOR_SOURCE_SELECTED ||
         storage->resource_kind > SALT_TENSOR_RESOURCE_SHARED ||
         storage->encoding < SALT_TENSOR_ENCODING_F32 ||
-        storage->encoding > SALT_TENSOR_ENCODING_NVFP4 ||
+        storage->encoding > SALT_TENSOR_ENCODING_ROW_INT2 ||
         (storage->flags & ~(uint32_t)(SALT_TENSOR_STORAGE_OPTIONAL_BIAS |
                                      SALT_TENSOR_STORAGE_DECODED_F32)) != 0 ||
         multiply_u64(rows, cols, &elements) != 0)
@@ -88,6 +89,17 @@ int salt_tensor_storage_validate(const SaltTensorStorageSpec *storage,
             return -1;
         break;
     }
+    case SALT_TENSOR_ENCODING_ROW_INT2:
+        if (multiply_u64(rows, ((uint64_t)cols + 3u) / 4u,
+                         &expected_values) != 0 ||
+            storage->value_bytes != expected_values ||
+            storage->scale_bytes != (uint64_t)rows * 4u ||
+            storage->group_size != cols || storage->flags != 0 ||
+            !range_valid(storage->value_offset, storage->value_bytes) ||
+            !range_valid(storage->scale_offset, storage->scale_bytes) ||
+            storage->bias_bytes || storage->auxiliary_bytes ||
+            storage->auxiliary_2_bytes) return -1;
+        break;
     case SALT_TENSOR_ENCODING_NVFP4:
         if (cols % 16u != 0 || storage->group_size != 16u ||
             elements % 16u != 0 ||
@@ -783,6 +795,57 @@ int salt_tensor_host_graph_execute(
         ? 0u : callbacks->node_count - parallel_nodes;
     result->internal_barriers = state->failed ? 0u : parallel_nodes;
     return state->failed ? -1 : 0;
+}
+
+void salt_tensor_host_graph_barrier(SaltTensorHostGraphState *state) {
+    uint32_t epoch = __atomic_load_n(&state->barrier_epoch, __ATOMIC_ACQUIRE);
+    if (__atomic_add_fetch(&state->barrier_arrived, 1u, __ATOMIC_ACQ_REL)
+            == state->workers) {
+        __atomic_store_n(&state->barrier_arrived, 0u, __ATOMIC_RELAXED);
+        __atomic_store_n(&state->barrier_epoch, epoch + 1u, __ATOMIC_RELEASE);
+    } else {
+        unsigned spins = 0;
+        while (__atomic_load_n(&state->barrier_epoch, __ATOMIC_ACQUIRE) == epoch)
+            if (++spins == 4096u) { sched_yield(); spins = 0; }
+    }
+}
+
+static void tensor_host_graph_collective_worker(int worker, void *opaque) {
+    SaltTensorHostGraphState *state = opaque;
+    /* Each physical worker owns this loop, not a function-pointer mailbox. */
+    for (uint32_t node = 0; node < state->collective_nodes; node++) {
+        int rc = state->collective_cell(state->context, node, (uint32_t)worker);
+        if (rc != 0) __atomic_store_n(&state->failed, 1u, __ATOMIC_RELEASE);
+        salt_tensor_host_graph_barrier(state);
+        rc = (int)__atomic_load_n(&state->failed, __ATOMIC_ACQUIRE);
+        /* All members observe this node's outcome before the next node can
+         * publish another failure. */
+        salt_tensor_host_graph_barrier(state);
+        if (rc) break;
+    }
+}
+
+int salt_tensor_host_graph_collective_execute(
+        SaltTensorHostGraphState *state, uint32_t node_count,
+        int (*cell)(void *, uint32_t, uint32_t), void *context,
+        uint32_t worker_count, SaltTensorHostGraphParallelRun parallel_run,
+        void *parallel_context, SaltTensorHostGraphResult *result) {
+    if (result) memset(result, 0, sizeof *result);
+    if (!state || !node_count || !cell || !context || !worker_count ||
+        worker_count > 32u || !parallel_run || !parallel_context || !result)
+        return -1;
+    memset(state, 0, sizeof *state);
+    state->context = context;
+    state->workers = worker_count;
+    state->collective_nodes = node_count;
+    state->collective_cell = cell;
+    if (parallel_run(parallel_context, (int)worker_count,
+            tensor_host_graph_collective_worker, state) != 0 || state->failed)
+        return -1;
+    result->nodes_executed = node_count;
+    result->spans_executed = node_count;
+    result->internal_barriers = state->barrier_epoch;
+    return 0;
 }
 
 int salt_tensor_program_execute(

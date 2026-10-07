@@ -7,6 +7,8 @@
 #include <string.h>
 
 #define FIXTURE_VOCAB 900
+#define AGENT_CALL "<|tool_call>call:multiply{a:37,b:19}<tool_call|>"
+#define AGENT_ANSWER "The result is 703."
 
 struct SaltGemma4Text {
     int position;
@@ -23,6 +25,8 @@ struct SaltGemma4Text {
     SaltTextProjectionWindow scheduler_projection;
     SaltTextTokenEpochController scheduler_controller;
     int proof_state;
+    int agent_fixture;
+    int agent_next;
 };
 
 struct SaltGemma4Vision {
@@ -42,6 +46,7 @@ SaltGemma4Text *salt_gemma4_text_load(FILE *binding, int max_context,
     model = (SaltGemma4Text *)calloc(1, sizeof *model);
     if (!model) return NULL;
     model->max_context = max_context;
+    model->agent_fixture = getenv("SALT_AGENT_INTEGRATION_FIXTURE") != NULL;
     if ((prefill_text && *prefill_text && (!prefill_end || *prefill_end)) ||
         prefill < 1 || prefill > 4096) {
         free(model);
@@ -76,7 +81,59 @@ const char *salt_gemma4_text_expert_cache_mode(
 int salt_gemma4_text_encode(const SaltGemma4Text *model, const char *text,
                             int *tokens, int token_capacity) {
     (void)model;
-    if (!text || !*text || !tokens || token_capacity < 3) return -1;
+    if (!text || !*text || !tokens || token_capacity < 1) return -1;
+    if (model && model->agent_fixture) {
+        /* Synthetic tokenizer/model ONLY. The production C controller still
+         * owns journal matching, prefix admission, yield, replay and COMMIT.
+         * Recognize generated fixture pieces so a resubmitted assistant turn
+         * has the same token identity as the fixture's original output. */
+        static const char *pieces[] = {
+            AGENT_CALL, AGENT_ANSWER, "<|tool_response>", "<turn|>"
+        };
+        static const int ids[] = {818, 819, 50, 106};
+        SaltGemma4Text *fixture = (SaltGemma4Text *)model;
+        const char *cursor = text;
+        int count = 0;
+        fixture->agent_next = strstr(text, "declaration:multiply") &&
+            !strstr(text, "response:multiply") ? 818 : 819;
+        while (*cursor) {
+            size_t piece;
+            if (count >= token_capacity) return -1;
+            for (piece = 0; piece < sizeof ids / sizeof ids[0]; piece++) {
+                size_t length = strlen(pieces[piece]);
+                if (!strncmp(cursor, pieces[piece], length)) {
+                    tokens[count++] = ids[piece];
+                    cursor += length;
+                    break;
+                }
+            }
+            if (piece == sizeof ids / sizeof ids[0])
+                tokens[count++] = 200 + (unsigned char)*cursor++;
+        }
+        return count;
+    }
+    /* Explicit fixture-only IDs exercise native journal matching. Ordinary
+     * fixture prompts retain the original three-token encoding. */
+    if (!strncmp(text, "ids:", 4u)) {
+        const char *cursor = text + 4;
+        int count = 0;
+        do {
+            char *end = NULL;
+            long id;
+            if (*cursor < '0' || *cursor > '9' || count >= token_capacity)
+                return -1;
+            id = strtol(cursor, &end, 10);
+            if (!end || end == cursor || id < 0 ||
+                (id >= FIXTURE_VOCAB && id != 258880) ||
+                (*end != ',' && *end != '\0'))
+                return -1;
+            tokens[count++] = (int)id;
+            if (*end == '\0') return count;
+            cursor = end + 1;
+        } while (*cursor);
+        return -1;
+    }
+    if (token_capacity < 3) return -1;
     tokens[0] = 10; tokens[1] = 11; tokens[2] = 12;
     return 3;
 }
@@ -85,6 +142,20 @@ int salt_gemma4_text_decode(const SaltGemma4Text *model, const int *tokens,
                             int token_count, char *text, int text_capacity) {
     static const char value[] = "ok";
     (void)model; (void)tokens;
+    if (model && model->agent_fixture) {
+        size_t used = 0;
+        if (!tokens || !text || token_count < 0 || text_capacity < 1) return -1;
+        for (int i = 0; i < token_count; i++) {
+            const char *piece = tokens[i] == 818 ? AGENT_CALL :
+                tokens[i] == 819 ? AGENT_ANSWER : "";
+            size_t length = strlen(piece);
+            if (length >= (size_t)text_capacity - used) return -1;
+            memcpy(text + used, piece, length);
+            used += length;
+        }
+        text[used] = '\0';
+        return (int)used;
+    }
     if (!text || text_capacity < 3 || token_count < 0) return -1;
     if (token_count == 0) return 0;
     memcpy(text, value, sizeof value - 1u);
@@ -130,7 +201,16 @@ int salt_gemma4_text_step(SaltGemma4Text *model, int token, float *logits) {
     model->scheduler_state.position = (uint32_t)model->position;
     if (logits) {
         for (int i = 0; i < FIXTURE_VOCAB; i++) logits[i] = -1000.0f;
+        if (model->agent_fixture) {
+            logits[token == 818 ? 50 : token == 819 ? 106 :
+                   model->agent_next] = 1.0f;
+            return 0;
+        }
         logits[token == 818 ? 106 : 818] = 1.0f;
+        if (token == 17) logits[817] = 0.75f;
+        if (token == 49) logits[50] = 2.0f;
+        if (token == 100) logits[101] = 2.0f;
+        if (token >= 101 && token <= 105) logits[token + 1] = 2.0f;
     }
     return 0;
 }
@@ -207,7 +287,17 @@ int salt_gemma4_text_prefill(SaltGemma4Text *model,
         if (tokens[i] < 0 || tokens[i] >= FIXTURE_VOCAB) return -1;
     model->position += token_count;
     for (int i = 0; i < FIXTURE_VOCAB; i++) logits[i] = -1000.0f;
+    if (model->agent_fixture) {
+        int last = tokens[token_count - 1];
+        logits[last == 818 ? 50 : last == 819 ? 106 :
+               model->agent_next] = 1.0f;
+        model->scheduler_state.position = (uint32_t)model->position;
+        return 0;
+    }
     logits[tokens[token_count - 1] == 818 ? 106 : 818] = 1.0f;
+    if (tokens[token_count - 1] == 17) logits[817] = 0.75f;
+    if (tokens[token_count - 1] == 49) logits[50] = 2.0f;
+    if (tokens[token_count - 1] == 100) logits[101] = 2.0f;
     model->scheduler_state.position = (uint32_t)model->position;
     return 0;
 }
@@ -220,8 +310,8 @@ int salt_gemma4_text_prefill_image(SaltGemma4Text *model,
                                    int image_feature_tokens,
                                    float *logits) {
     (void)tokens; (void)mm_token_type; (void)image_features;
-    (void)image_feature_tokens;
-    if (!model || token_count < 1 || !logits) return -1;
+    if (!model || token_count < 1 || !logits || model->position != 0 ||
+        image_feature_tokens != 1) return -1;
     model->position += token_count;
     for (int i = 0; i < FIXTURE_VOCAB; i++) logits[i] = -1000.0f;
     logits[818] = 1.0f;
@@ -307,6 +397,29 @@ int salt_gemma4_text_target_epoch(
     return salt_gemma4_text_target_block(
         model, route_token_ids, candidate_count, parent_logits,
         &result->target);
+}
+
+int salt_gemma4_text_reuse_prefix(SaltGemma4Text *model,
+                                  int requested_prefix) {
+    int retained;
+    if (!model || requested_prefix < 0 || requested_prefix > model->position ||
+        model->position < 0 || model->position > model->max_context ||
+        model->scheduler_state.position != (uint32_t)model->position ||
+        model->state_control.active || model->scheduler_controller.active ||
+        model->scheduler_controller.schedule_active ||
+        model->route_observer || model->attention_plan_lease ||
+        model->scheduler_state.transition_generation == UINT64_MAX)
+        return -1;
+    /* Model-adapter stand-in only, not proof of physical ring preservation. */
+    retained = requested_prefix < model->position && model->position >= 1024
+        ? 0 : requested_prefix;
+    fprintf(stderr, "GEMMA4_FIXTURE_REUSE old=%d requested=%d retained=%d\n",
+        model->position, requested_prefix, retained);
+    model->position = retained;
+    model->scheduler_state.position = (uint32_t)retained;
+    model->scheduler_state.transition_generation++;
+    memset(&model->scheduler_projection, 0, sizeof model->scheduler_projection);
+    return retained;
 }
 
 int salt_gemma4_text_rollback_position(SaltGemma4Text *model,
@@ -721,10 +834,11 @@ int salt_gemma4_vision_forward(SaltGemma4Vision *model,
                                float *features,
                                int feature_token_capacity,
                                char *error, size_t error_size) {
-    (void)model; (void)patches; (void)positions_xy; (void)padding;
-    (void)n_patches; (void)features; (void)feature_token_capacity;
+    (void)patches; (void)positions_xy; (void)padding;
     (void)error; (void)error_size;
-    return -1;
+    /* One explicitly mocked feature; not real vision arithmetic. */
+    return model && n_patches == 1 && features && feature_token_capacity >= 1
+        ? 1 : -1;
 }
 
 int salt_gemma4_ppm_to_patches(const char *path, int max_soft_tokens,
@@ -735,11 +849,17 @@ int salt_gemma4_ppm_to_patches(const char *path, int max_soft_tokens,
                                int *valid_soft_tokens,
                                int *width, int *height,
                                char *error, size_t error_size) {
-    (void)path; (void)max_soft_tokens; (void)patches;
-    (void)positions_xy; (void)padding; (void)n_patches;
-    (void)valid_soft_tokens; (void)width; (void)height;
     (void)error; (void)error_size;
-    return -1;
+    /* Explicit no-file fixture names only; preserve failure for other paths.
+     * No pixel/patch payload storage is needed by the mocked forward. */
+    if (!path || (strcmp(path, "fixture-image-a") &&
+                  strcmp(path, "fixture-image-b")) || max_soft_tokens < 1 ||
+        !patches || !positions_xy || !padding || !n_patches ||
+        !valid_soft_tokens || !width || !height)
+        return -1;
+    *patches = NULL; *positions_xy = NULL; *padding = NULL;
+    *n_patches = 1; *valid_soft_tokens = 1; *width = 1; *height = 1;
+    return 0;
 }
 
 void salt_gemma4_free_patches(float *patches, int *positions_xy,

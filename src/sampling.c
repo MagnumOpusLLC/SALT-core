@@ -14,12 +14,13 @@ static uint64_t sampler_counter_draw(uint64_t seed, uint64_t position) {
     return value ^ (value >> 31);
 }
 
-int salt_sampler_select(const SaltSamplerConfig *config,
-                        const float *logits, int count,
-                        uint64_t position, int *token_out) {
+static int sampler_select(const SaltSamplerConfig *config,
+                           const float *logits, int count, float top_p,
+                           uint64_t position, int *token_out) {
     float maximum;
     int best = 0;
-    if (!config || !logits || count < 1 || !token_out || !isfinite(logits[0]))
+    if (!config || !logits || count < 1 || !token_out || !isfinite(logits[0]) ||
+        !isfinite(top_p) || top_p <= 0.0f || top_p > 1.0f)
         return -1;
     maximum = logits[0];
     for (int token = 1; token < count; token++) {
@@ -61,6 +62,26 @@ int salt_sampler_select(const SaltSamplerConfig *config,
         }
         if (candidate_count < 1u) return -1;
         maximum = candidate_logits[0];
+        if (top_p < 1.0f) {
+            double mass = 0.0, prefix = 0.0, threshold;
+            /* Only k candidates can survive the subsequent top-k operation.
+             * Their cutoff still uses ALL vocabulary mass, not top-k mass.
+             * No full-vocabulary sort, scratch array, or modified logits. */
+            for (int token = 0; token < count; token++) {
+                float weight = salt_expf(logits[token] - maximum);
+                if (!isfinite(weight) || weight < 0.0f) return -1;
+                mass += (double)weight;
+            }
+            if (!(mass > 0.0) || !isfinite(mass)) return -1;
+            threshold = (double)top_p * mass;
+            for (uint32_t candidate = 0; candidate < candidate_count; candidate++) {
+                prefix += (double)salt_expf(candidate_logits[candidate] - maximum);
+                if (prefix >= threshold) {
+                    candidate_count = candidate + 1u;
+                    break;
+                }
+            }
+        }
         selected = candidate_ids[0];
         for (uint32_t candidate = 0; candidate < candidate_count; candidate++) {
             float weight = salt_expf(
@@ -85,4 +106,16 @@ int salt_sampler_select(const SaltSamplerConfig *config,
         return 0;
     }
     return -1;
+}
+
+int salt_sampler_select(const SaltSamplerConfig *config,
+                        const float *logits, int count,
+                        uint64_t position, int *token_out) {
+    return sampler_select(config, logits, count, 1.0f, position, token_out);
+}
+
+int salt_sampler_select_top_p(const SaltSamplerConfig *config,
+                              const float *logits, int count, float top_p,
+                              uint64_t position, int *token_out) {
+    return sampler_select(config, logits, count, top_p, position, token_out);
 }

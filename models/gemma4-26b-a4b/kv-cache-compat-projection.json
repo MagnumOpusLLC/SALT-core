@@ -7,21 +7,42 @@
       "snapshot_path": "models/gemma4-26b-a4b/compat/v6/Makefile",
       "snapshot_sha256": "f34e7285395963b84600379f3a3a1065c3f1d5d38dc8d04c2f7776b07fb8e212",
       "live_projection": "pin-live-source-v1",
-      "live_sha256": "493aabb7dcc7bb2426c310044b6aa167e3797114dfbf99993bb3735809d898d9"
+      "live_sha256": "44234c3c0ae3502ee754e87bee84f2763e27bd380f53e0d29d360997f664c30a"
+    },
+    {
+      "logical_path": "include/salt/model.h",
+      "snapshot_path": "models/gemma4-26b-a4b/compat/v6/include/salt/model.h",
+      "snapshot_sha256": "a4d9b4a4e36034167f4f1d6cdecdf9d097cb10ed26273c224dc30e6b687026bf",
+      "live_projection": "pin-live-source-v1",
+      "live_sha256": "c53187f6236867b064c87ee99c9b7ad3900ef239eaa06c184499cf26ff154049"
+    },
+    {
+      "logical_path": "include/salt/text_exec.h",
+      "snapshot_path": "models/gemma4-26b-a4b/compat/v6/include/salt/text_exec.h",
+      "snapshot_sha256": "fde0cf2cf7ac3087d0ca97461ec559e116ce66203f589336bb465c64d7991701",
+      "live_projection": "pin-live-source-v1",
+      "live_sha256": "6f8792a904ea2ae7fc22d30d02501c22ac8d010602263007b73c8a7f800c2849"
     },
     {
       "logical_path": "models/gemma4-26b-a4b/gemma4_text.c",
       "snapshot_path": "models/gemma4-26b-a4b/compat/v6/models/gemma4-26b-a4b/gemma4_text.c",
       "snapshot_sha256": "2276829cd1e01df341577ea3e1b0227e2c54b171174ea3c74098d2543c3b6952",
       "live_projection": "pin-live-source-v1",
-      "live_sha256": "6e486b795c8c16d43bcd60b7a981c88e5287dd3b95b8a3bc633e1071e281b0f4"
+      "live_sha256": "7936f38aab2aa88338d5bd63b5e0bbfc1e19a4594d918a7ce7786238707769ee"
+    },
+    {
+      "logical_path": "models/gemma4-26b-a4b/gemma4_text.h",
+      "snapshot_path": "models/gemma4-26b-a4b/compat/v6/models/gemma4-26b-a4b/gemma4_text.h",
+      "snapshot_sha256": "27f20d4b5c27250bd312b356289f2c2d40bd72c67518d219490ad771f6407dfd",
+      "live_projection": "pin-live-source-v1",
+      "live_sha256": "e264434b24e6b65aad48e485165d95a1f649f04f8884c544555c7ce1735d376b"
     },
     {
       "logical_path": "models/gemma4-26b-a4b/server.c",
       "snapshot_path": "models/gemma4-26b-a4b/compat/v6/models/gemma4-26b-a4b/server.c",
       "snapshot_sha256": "2a725507b84562a9bd0bbde21b7c7f1a2aff61be585fb54df10f0924344cfd83",
       "live_projection": "pin-live-source-v1",
-      "live_sha256": "2154c12ed4e6bd6eb205f6da4901d15085943d6959bab67e35690ba2397a1870"
+      "live_sha256": "3cadd2e5e952cbd0c00a5bf95600e59598b73e789047c2e7d961c8b5d372a6cd"
     },
     {
       "logical_path": "models/gemma4-26b-a4b/server.config",
@@ -29,6 +50,13 @@
       "snapshot_sha256": "d302c130e4b722a3aa0b7cacc02e0fcd27204e70aec89e9cc451b5f17b1c224c",
       "live_projection": "strip-physical-build-blocks-v1",
       "physical_blocks_sha256": "7c791756b848373cd3854bf0bd20e2d37ccb8148ed4e29e4365842aa5538f633"
+    },
+    {
+      "logical_path": "models/registry.c",
+      "snapshot_path": "models/gemma4-26b-a4b/compat/v6/models/registry.c",
+      "snapshot_sha256": "40d1ffbd0ca54c954072e379479e6f0fc7e19929fec30551a666aafb95a1974e",
+      "live_projection": "pin-live-source-v1",
+      "live_sha256": "f52a39e5dee0c188ea22ddc261f770a3dbfee3562231349a0109281b3b7e29c6"
     },
     {
       "logical_path": "server/gemma4-launch.sh",
@@ -41,8 +69,8 @@
       "logical_path": "server/gemma4_backend.py",
       "snapshot_path": "models/gemma4-26b-a4b/compat/v6/server/gemma4_backend.py",
       "snapshot_sha256": "361facedbc836412b3423eee3fea0261aeec01fdec3dc0ba061c7961ceaa7562",
-      "live_projection": "strip-physical-build-blocks-v1",
-      "physical_blocks_sha256": "7b9a4d4ddf140148f2bb2bc93fe604593125e9b9b8c1cf326eabe579e023a5f1"
+      "live_projection": "pin-live-source-v1",
+      "live_sha256": "8cf078321786632df6e13d39172b3a3ea394c4a34e2c3fdc8b6d312356a61221"
     },
     {
       "logical_path": "server/gemma4_compat.py",
@@ -55,8 +83,43 @@
       "logical_path": "server/serve.py",
       "snapshot_path": "models/gemma4-26b-a4b/compat/v6/server/serve.py",
       "snapshot_sha256": "2cafc3835c8a9f8f1006223262751ea00b79a981d66a88350ebc1e70508b7c8e",
-      "live_projection": "strip-physical-build-blocks-v1",
-      "physical_blocks_sha256": "01242c4ab1dcd6e4445133ad9662c26518524c6ab6b05557443c093e0292a70c"
+      "live_projection": "pin-live-source-v1",
+      "live_sha256": "c34c3c9383e27a8bcc356df1cbb6a1c2a475902492651d59b69032665cc09c47"
+    },
+    {
+      "logical_path": "src/attn_batch.c",
+      "snapshot_path": "models/gemma4-26b-a4b/compat/v6/src/attn_batch.c",
+      "snapshot_sha256": "fc2f17eecba2d8b7fa62e4b9fc3bf196d8981308bac6eed0c3c732b67cbe691d",
+      "live_projection": "pin-live-source-v1",
+      "live_sha256": "f26070861db2c38d33f5139590e06a80dc53efa63c542c51542e09dbfef0e676"
+    },
+    {
+      "logical_path": "src/model.c",
+      "snapshot_path": "models/gemma4-26b-a4b/compat/v6/src/model.c",
+      "snapshot_sha256": "dd927e289ce8f11db7822744a6a03a81353e6e7164510e3d4f7129342fca1521",
+      "live_projection": "pin-live-source-v1",
+      "live_sha256": "8f9069b62e8d6e3cfaa18ff740df4b1abe1afa60cb32b2bc4707104525643a5b"
+    },
+    {
+      "logical_path": "src/moe_group.c",
+      "snapshot_path": "models/gemma4-26b-a4b/compat/v6/src/moe_group.c",
+      "snapshot_sha256": "1cb248dc3d894c4553d4a090e5fa2c9378b759612936203118cb32c77f639b45",
+      "live_projection": "pin-live-source-v1",
+      "live_sha256": "189986506d1c2cc381396671f65484e2ba22044107ea41a599b09f35e00ec11c"
+    },
+    {
+      "logical_path": "src/simd.c",
+      "snapshot_path": "models/gemma4-26b-a4b/compat/v6/src/simd.c",
+      "snapshot_sha256": "253646500a9a944d814bd7a988150a32240e7b41eb47ed0bf8353a84f22bcc15",
+      "live_projection": "pin-live-source-v1",
+      "live_sha256": "163d08671bac085c71e955a4a8640a8ff46adda6db66b678be7d567189e39776"
+    },
+    {
+      "logical_path": "src/text_exec.c",
+      "snapshot_path": "models/gemma4-26b-a4b/compat/v6/src/text_exec.c",
+      "snapshot_sha256": "631e7c3f6f951535da5f6c95c1e9536f3effd1bc79ca9bbfaa3b70061a199ed2",
+      "live_projection": "pin-live-source-v1",
+      "live_sha256": "57e949a500f0cdd70a7afd480262f8e8b754b83cf2d3c346bab9d66f93800aba"
     },
     {
       "logical_path": "src/tokenizer.c",

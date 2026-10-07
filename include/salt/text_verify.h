@@ -979,6 +979,13 @@ typedef struct SaltTextScheduleRequest {
     /* Optional committed prompt/session tokens preceding output_ids. */
     const int32_t *history_ids;
     uint32_t history_count;
+    /* Request-scoped sampled decode only. Zero/one preserve the old path.
+     * Historical SALT per-occurrence division over the last 64 generated IDs;
+     * prompt history is deliberately excluded. Uses scratch_logits, not KV. */
+    float repetition_penalty;
+    /* Zero-initialized/off or one preserves existing sampling. (0,1) enables
+     * full-vocabulary nucleus before top-k/temperature; no DPR cache reuse. */
+    float top_p;
 } SaltTextScheduleRequest;
 
 typedef struct SaltTextScheduleResult {
@@ -1177,6 +1184,11 @@ typedef struct SaltTextVerifyCpuContext {
     float *parallel_scores;
     size_t parallel_score_stride;
     uint32_t parallel_workers;
+    /* Optional startup-bound whole-program physical scope. It runs the SAME
+     * interpreter once on an existing pool coordinator; nested parallel_run
+     * calls remain exact operator phases, never another state authority. */
+    int (*parallel_scope)(void *parallel_context,
+                           int (*interpret)(void *), void *call);
     uint64_t submitted_generation;
     uint32_t submitted_source_position;
     uint32_t submitted_candidates;
@@ -1191,6 +1203,12 @@ typedef struct SaltTextVerifyCpuContext {
     uint32_t graph_span_capacity;
     uint32_t graph_span_count;
     uint32_t graph_workers;
+    int collective_enabled;
+    uint32_t collective_output_rows;
+    uint32_t collective_job_count;
+
+    uint32_t collective_job_take;
+    int collective_error;
     SaltTextTouchedSpan touched_spans[SALT_TEXT_MAX_TOUCHED_SPANS];
     uint32_t touched_span_count;
     uint64_t touched_span_bytes;
@@ -1215,6 +1233,11 @@ int salt_text_verify_cpu_parallel_bind(
     size_t parallel_score_stride, uint32_t parallel_workers);
 int salt_text_verify_cpu_profile_set(
     SaltTextVerifyCpuContext *context, int enabled);
+int salt_text_verify_cpu_scope_bind(
+    SaltTextVerifyCpuContext *context,
+    int (*parallel_scope)(void *parallel_context,
+                           int (*interpret)(void *), void *call));
+int salt_text_verify_cpu_collective_bind(SaltTextVerifyCpuContext *context);
 int salt_text_verify_cpu_executor_init(SaltTextVerifyExecutor *executor,
                                        SaltTextVerifyCpuContext *context);
 

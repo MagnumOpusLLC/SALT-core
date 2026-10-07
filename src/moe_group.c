@@ -1,4 +1,5 @@
 #include "salt/moe_group.h"
+#include "salt/text_exec.h"
 
 #include <math.h>
 #include <stddef.h>
@@ -18,6 +19,8 @@ int salt_moe_group_execute(const SaltMoEGroupJob *job,
     SaltMoEGroupScratch *scratch;
     int rc = -1, release_failed = 0, used_count = 0;
     int acquire_batch = 0, run_batch = 0;
+    int owner = salt_text_prefill_team_owner();
+    int team = salt_text_prefill_team_current() != NULL;
     if (!job || !ops || !context || !job->selected || !job->weights ||
         !job->inputs || !job->outputs ||
         (!ops->acquire && !ops->acquire_many) ||
@@ -47,6 +50,7 @@ int salt_moe_group_execute(const SaltMoEGroupJob *job,
         if (run_batch > job->n_experts) run_batch = job->n_experts;
     }
     scratch = job->scratch;
+    if (team && !ops->run_many) return -1;
     if (!scratch || !scratch->used || !scratch->acquired ||
         !scratch->leases || !scratch->expert_ids ||
         !scratch->group_inputs || !scratch->group_outputs ||
@@ -71,6 +75,7 @@ int salt_moe_group_execute(const SaltMoEGroupJob *job,
     group_inputs = scratch->group_inputs;
     group_outputs = scratch->group_outputs;
     selection_outputs = scratch->selection_outputs;
+    if (owner) {
     memset(used, 0, (size_t)job->n_experts);
     memset(acquired, 0, (size_t)job->n_experts);
     memset(leases, 0, (size_t)job->n_experts * sizeof(void *));
@@ -81,10 +86,10 @@ int salt_moe_group_execute(const SaltMoEGroupJob *job,
             int expert = job->selected[selection];
             if (expert < 0 || expert >= job->n_experts ||
                 !isfinite(job->weights[selection]))
-                goto done;
+                goto acquired_done;
             for (int prior = 0; prior < rank; prior++)
                 if (job->selected[(size_t)token * job->topk + prior] == expert)
-                    goto done;
+                    goto acquired_done;
             used[expert] = 1;
         }
     }
@@ -108,24 +113,36 @@ int salt_moe_group_execute(const SaltMoEGroupJob *job,
                 leases[expert] = batch_leases[i];
                 acquired[expert] = 1;
             }
-            if (!block_ok) goto done;
+            if (!block_ok) goto acquired_done;
         }
     } else {
         for (int i = 0; i < used_count; i++) {
             int expert = expert_ids[i];
             if (ops->acquire(context, expert, &leases[expert]) != 0 ||
                 !leases[expert])
-                goto done;
+                goto acquired_done;
             acquired[expert] = 1;
         }
     }
+    rc = 0;
+    }
+acquired_done:
+    if (salt_text_prefill_team_sync(owner ? rc : 0) != 0) {
+        rc = -1;
+        goto done;
+    }
+    used_count = 0;
+    for (int expert = 0; expert < job->n_experts; expert++)
+        if (used[expert]) used_count++;
+    rc = -1;
     if (ops->run_many) {
         if (run_batch > used_count) run_batch = used_count;
         for (int first = 0; first < used_count; first += run_batch) {
             int count = used_count - first;
             int rows = 0;
+            int group_rc = 0;
             if (count > run_batch) count = run_batch;
-            for (int i = 0; i < count; i++) {
+            if (owner) for (int i = 0; i < count; i++) {
                 int expert = expert_ids[first + i];
                 int group = 0;
                 for (int token = 0; token < job->batch; token++)
@@ -137,16 +154,18 @@ int salt_moe_group_execute(const SaltMoEGroupJob *job,
                                (size_t)job->hidden * sizeof(float));
                         group++;
                     }
-                if (group < 1) goto done;
+                if (group < 1) { group_rc = -1; break; }
                 run_groups[i] = group;
                 run_leases[i] = leases[expert];
                 rows += group;
             }
-            if (ops->run_many(context, expert_ids + first, run_leases,
-                    run_groups, count, group_inputs, group_outputs) != 0)
+            if (salt_text_prefill_team_sync(group_rc) != 0) goto done;
+            group_rc = ops->run_many(context, expert_ids + first, run_leases,
+                    run_groups, count, group_inputs, group_outputs);
+            if (salt_text_prefill_team_sync(group_rc) != 0)
                 goto done;
             rows = 0;
-            for (int i = 0; i < count; i++) {
+            if (owner) for (int i = 0; i < count; i++) {
                 int expert = expert_ids[first + i];
                 int group = 0;
                 for (int token = 0; token < job->batch; token++)
@@ -161,6 +180,7 @@ int salt_moe_group_execute(const SaltMoEGroupJob *job,
                     }
                 rows += run_groups[i];
             }
+            if (salt_text_prefill_team_sync(0) != 0) goto done;
         }
     } else for (int expert = 0; expert < job->n_experts; expert++) {
         int group = 0;
@@ -188,6 +208,7 @@ int salt_moe_group_execute(const SaltMoEGroupJob *job,
                 group++;
             }
     }
+    if (owner) {
     memset(job->outputs, 0, bh * sizeof(float));
     for (int token = 0; token < job->batch; token++) {
         float *output = job->outputs + (size_t)token * job->hidden;
@@ -200,14 +221,15 @@ int salt_moe_group_execute(const SaltMoEGroupJob *job,
                 output[d] += expert_output[d] * weight;
         }
     }
+    }
     rc = 0;
 
 done:
-    if (acquired)
+    if (owner && acquired)
         for (int expert = 0; expert < job->n_experts; expert++)
             if (acquired[expert] &&
                 ops->release(context, expert, leases[expert]) != 0)
                 release_failed = 1;
     if (release_failed) rc = -1;
-    return rc;
+    return salt_text_prefill_team_sync(rc);
 }

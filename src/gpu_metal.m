@@ -816,7 +816,8 @@ static const char *_batch_src2 =
     "    float4 s4=float4(0.0f);s4+=a0;s4+=a1;s4+=a2;s4+=a3;s4+=a4;s4+=a5;s4+=a6;s4+=a7;\n"
     "    float2 tt=s4.xy+s4.zw;yj[r]=tt.x+tt.y;\n"
     "}\n"
-    "struct SelectedResources { array<device const uchar *,512> resource [[id(0)]]; };\n"
+    "#ifdef SALT_METAL_SELECTED_CAPACITY\n"
+    "struct SelectedResources { array<device const uchar *,SALT_METAL_SELECTED_CAPACITY> resource [[id(0)]]; };\n"
     "kernel void q4selected(\n"
     "    constant SelectedResources &resources [[buffer(0)]],device const float *x [[buffer(1)]],\n"
     "    device float *ys [[buffer(2)]],device const ulong4 *desc [[buffer(3)]],\n"
@@ -826,6 +827,7 @@ static const char *_batch_src2 =
     "{\n"
     "    uint r=pos.x,token=pos.y,di=pos.z;if(di>=ndesc)return;ulong4 d=desc[di*3u],db=desc[di*3u+1u],dc=desc[di*3u+2u];\n"
     "    uint R=uint(db.y),C=uint(db.z),B=uint(db.w);if(r>=R||token>=B)return;uint slot=uint(dc.x);ulong payload=0u;if(dc.y!=0u){uint logical=uint(dc.z)+uint(selected[dc.w+token]);int mapped=logical_slots[logical];if(mapped<0){atomic_store_explicit(status,2u,memory_order_relaxed);return;}slot=uint(mapped);payload=payload_offsets[logical];}\n"
+    "    if(slot>=SALT_METAL_SELECTED_CAPACITY){atomic_store_explicit(status,2u,memory_order_relaxed);return;}\n"
     "    device const uchar *base=resources.resource[slot];device const uchar *vr=base+payload+d.x,*sr=base+payload+d.y,*br=base+payload+db.x;\n"
     "    device const float *xj=x+d.z+ulong(token)*C;device float *yj=ys+d.w+ulong(token)*R;\n"
     "    float4 a0=float4(0.0f),a1=float4(0.0f),a2=float4(0.0f),a3=float4(0.0f);\n"
@@ -864,6 +866,7 @@ static const char *_batch_src2 =
     "{\n"
     "    uint r=pos.x,task=pos.y,ndesc=counts.x,ntasks=counts.y;if(task>=ntasks)return;uint2 work=tasks[task];uint di=work.x,token=work.y;if(di>=ndesc)return;ulong4 d=desc[di*3u],db=desc[di*3u+1u],dc=desc[di*3u+2u];\n"
     "    uint R=uint(db.y),C=uint(db.z),B=uint(db.w);if(r>=R||token>=B)return;if(dc.y!=0u){atomic_store_explicit(status,2u,memory_order_relaxed);return;}uint slot=uint(dc.x);ulong payload=0u;\n"
+    "    if(slot>=SALT_METAL_SELECTED_CAPACITY){atomic_store_explicit(status,2u,memory_order_relaxed);return;}\n"
     "    device const uchar *base=resources.resource[slot];device const uchar *vr=base+payload+d.x,*sr=base+payload+d.y,*br=base+payload+db.x;\n"
     "    device const float *xj=x+d.z+ulong(token)*C;device float *yj=ys+d.w+ulong(token)*R;\n"
     "    float4 a0=float4(0.0f),a1=float4(0.0f),a2=float4(0.0f),a3=float4(0.0f);\n"
@@ -893,6 +896,7 @@ static const char *_batch_src2 =
     "    float4 s4=float4(0.0f);s4+=a0;s4+=a1;s4+=a2;s4+=a3;s4+=a4;s4+=a5;s4+=a6;s4+=a7;\n"
     "    float2 tt=s4.xy+s4.zw;yj[r]=tt.x+tt.y;\n"
     "}\n"
+    "#endif\n"
     "kernel void q4warpbatch(\n"
     "    device const uchar *vals [[buffer(0)]], device const uchar *scales [[buffer(1)]],\n"
     "    device const uchar *biases [[buffer(2)]], device const float *x [[buffer(3)]],\n"
@@ -933,6 +937,7 @@ static id<MTLComputePipelineState> _bselected_pso;
 static id<MTLComputePipelineState> _bselected_ragged_pso;
 static id<MTLArgumentEncoder> _selected_arg_encoder;
 static id<MTLBuffer> _selected_args, _selected_desc;
+static int _selected_argument_capacity;
 static id<MTLBuffer> _selected_task_map;
 static id<MTLArgumentEncoder> _wave_selected_arg_encoder;
 static id<MTLBuffer> _wave_selected_args, _selected_logical_slots;
@@ -1025,45 +1030,80 @@ typedef struct MetalSelectedTask {
     uint32_t token;
 } MetalSelectedTask;
 
-static int metal_selected_resources_prepare(void) {
-    if (_selected_arg_encoder && _selected_args && _selected_desc &&
-        _selected_task_map && _wave_selected_arg_encoder &&
-        _wave_selected_args)
+static int metal_selected_capacity_valid(int capacity, int logical_capacity,
+                                         size_t max_buffer_length) {
+    if (capacity < 1 || logical_capacity < 1 || logical_capacity > INT32_MAX ||
+        (size_t)capacity > SIZE_MAX / sizeof(MetalSelectedCacheResource) ||
+        (size_t)capacity > max_buffer_length / sizeof(uint64_t) ||
+        (size_t)logical_capacity > NSUIntegerMax / sizeof(int32_t) ||
+        (size_t)logical_capacity > max_buffer_length / sizeof(int32_t) ||
+        (size_t)logical_capacity > max_buffer_length / sizeof(uint32_t))
         return 0;
-    metal_release(_selected_arg_encoder); _selected_arg_encoder = nil;
-    metal_release(_selected_args); _selected_args = nil;
-    metal_release(_selected_desc); _selected_desc = nil;
-    metal_release(_selected_task_map); _selected_task_map = nil;
-    metal_release(_wave_selected_arg_encoder);
-    _wave_selected_arg_encoder = nil;
-    metal_release(_wave_selected_args); _wave_selected_args = nil;
+    return 1;
+}
+
+/* Only the startup cache count may fix this layout. Generic batch setup must
+ * not create it first, and replay must never replace its buffers/pipelines. */
+static int metal_selected_resources_prepare(int capacity) {
+    if (_selected_argument_capacity)
+        return capacity == _selected_argument_capacity ? 0 : -1;
+    if (!_dev || capacity < 1 ||
+        [_dev argumentBuffersSupport] != MTLArgumentBuffersTier2)
+        return -1;
     @autoreleasepool {
         NSError *error = nil;
-        id<MTLLibrary> library = metal_library_for_source(_batch_src2, &error);
+        MTLCompileOptions *options = [MTLCompileOptions new];
+        metal_exact_math(options);
+        options.preprocessorMacros = @{
+            @"SALT_METAL_SELECTED_CAPACITY": @(capacity),
+        };
+        /* An offline library has no authenticated capacity specialization. */
+        id<MTLLibrary> library = [_dev newLibraryWithSource:
+            [NSString stringWithUTF8String:_batch_src2]
+            options:options error:&error];
+        [options release];
         if (!library) return -1;
         id<MTLFunction> function =
             [library newFunctionWithName:@"q4selected"];
+        id<MTLFunction> ragged_function =
+            [library newFunctionWithName:@"q4selectedragged"];
         [library release];
-        if (!function) return -1;
+        if (!function || !ragged_function) {
+            metal_release(function); metal_release(ragged_function);
+            return -1;
+        }
+        id<MTLComputePipelineState> pipeline =
+            [_dev newComputePipelineStateWithFunction:function error:&error];
+        id<MTLComputePipelineState> ragged_pipeline =
+            [_dev newComputePipelineStateWithFunction:ragged_function
+                                               error:&error];
         id<MTLArgumentEncoder> encoder =
             [function newArgumentEncoderWithBufferIndex:0];
         id<MTLArgumentEncoder> wave_encoder =
             [function newArgumentEncoderWithBufferIndex:0];
         [function release];
-        id<MTLBuffer> arguments = encoder
-            ? [_dev newBufferWithLength:encoder.encodedLength
-                                 options:MTLResourceStorageModeShared] : nil;
-        id<MTLBuffer> wave_arguments = wave_encoder
-            ? [_dev newBufferWithLength:wave_encoder.encodedLength
-                                 options:MTLResourceStorageModeShared] : nil;
+        [ragged_function release];
+        NSUInteger argument_bytes = [encoder encodedLength];
+        if (!pipeline || !ragged_pipeline || !encoder || !wave_encoder ||
+            argument_bytes == 0 || argument_bytes > [_dev maxBufferLength] ||
+            argument_bytes != [wave_encoder encodedLength]) {
+            metal_release(pipeline); metal_release(ragged_pipeline);
+            metal_release(encoder); metal_release(wave_encoder);
+            return -1;
+        }
+        id<MTLBuffer> arguments = [_dev newBufferWithLength:argument_bytes
+            options:MTLResourceStorageModeShared];
+        id<MTLBuffer> wave_arguments = [_dev newBufferWithLength:argument_bytes
+            options:MTLResourceStorageModeShared];
         id<MTLBuffer> descriptors = [_dev newBufferWithLength:
             METAL_SELECTED_DESC_BYTES options:MTLResourceStorageModeShared];
         id<MTLBuffer> tasks = [_dev newBufferWithLength:
             (NSUInteger)METAL_SELECTED_TASK_CAPACITY *
                 sizeof(MetalSelectedTask)
             options:MTLResourceStorageModeShared];
-        if (!encoder || !wave_encoder || !arguments || !wave_arguments ||
-            !descriptors || !tasks) {
+        if (!arguments || !wave_arguments || !descriptors || !tasks) {
+            metal_release(pipeline);
+            metal_release(ragged_pipeline);
             metal_release(encoder);
             metal_release(wave_encoder);
             metal_release(arguments);
@@ -1072,6 +1112,8 @@ static int metal_selected_resources_prepare(void) {
             metal_release(tasks);
             return -1;
         }
+        _bselected_pso = pipeline;
+        _bselected_ragged_pso = ragged_pipeline;
         _selected_arg_encoder = encoder;
         _selected_args = arguments;
         _selected_desc = descriptors;
@@ -1081,20 +1123,21 @@ static int metal_selected_resources_prepare(void) {
         [_selected_arg_encoder setArgumentBuffer:_selected_args offset:0];
         [_wave_selected_arg_encoder setArgumentBuffer:
             _wave_selected_args offset:0];
+        _selected_argument_capacity = capacity;
     }
     return 0;
 }
 
 int salt_gpu_selected_resources_prepare(int capacity, int logical_capacity) {
-    if (!_dev || capacity < 1 || capacity > 512 || logical_capacity < 1 ||
-        logical_capacity > INT32_MAX || batch_pipeline_prepare() != 0)
+    if (!_dev || !metal_selected_capacity_valid(capacity, logical_capacity,
+            (size_t)[_dev maxBufferLength]) ||
+        [_dev argumentBuffersSupport] != MTLArgumentBuffersTier2)
         return -1;
     if (_selected_cache_resources)
         return capacity == _selected_cache_capacity &&
+            capacity == _selected_argument_capacity &&
             logical_capacity == _selected_logical_capacity ? 0 : -1;
-    if ((size_t)capacity > SIZE_MAX / sizeof *_selected_cache_resources ||
-        (size_t)logical_capacity > NSUIntegerMax / sizeof(int32_t))
-        return -1;
+    if (batch_pipeline_prepare() != 0) return -1;
     _selected_cache_resources = (MetalSelectedCacheResource *)calloc(
         (size_t)capacity, sizeof *_selected_cache_resources);
     _selected_logical_slots = [_dev newBufferWithLength:
@@ -1105,7 +1148,8 @@ int salt_gpu_selected_resources_prepare(int capacity, int logical_capacity) {
         options:MTLResourceStorageModeShared];
     if (!_selected_cache_resources || !_selected_logical_slots ||
         !_selected_logical_payload_offsets || ![_selected_logical_slots contents] ||
-        ![_selected_logical_payload_offsets contents]) {
+        ![_selected_logical_payload_offsets contents] ||
+        metal_selected_resources_prepare(capacity) != 0) {
         free(_selected_cache_resources);
         _selected_cache_resources = NULL;
         metal_release(_selected_logical_slots);
@@ -1238,8 +1282,7 @@ static int metal_session_buffers_prepare(void) {
     if (!_q8_y)
         _q8_y = [_dev newBufferWithLength:METAL_SESSION_Y_BYTES
                                    options:MTLResourceStorageModeShared];
-    if (!_desc || !_q8_x || !_q8_y ||
-        (_offline_library && metal_selected_resources_prepare() != 0))
+    if (!_desc || !_q8_x || !_q8_y)
         return -1;
     _desc_len = METAL_SESSION_DESC_BYTES;
     return 0;
@@ -1947,17 +1990,12 @@ static int metal_tiled_configure(void) {
 }
 
 static int batch_pipeline_prepare(void) {
-    if (metal_tiled_configure() != 0 ||
-        metal_selected_resources_prepare() != 0) return -1;
-    if (_bpso2 && _bweight_pso && _bcoalesced_pso && _bselected_pso &&
-        _bselected_ragged_pso && _btiled_pso &&
-        _selected_arg_encoder && _selected_args && _selected_desc && _bqueue2)
+    if (metal_tiled_configure() != 0) return -1;
+    if (_bpso2 && _bweight_pso && _bcoalesced_pso && _btiled_pso && _bqueue2)
         return 0;
     metal_release(_bpso2); _bpso2 = nil;
     metal_release(_bweight_pso); _bweight_pso = nil;
     metal_release(_bcoalesced_pso); _bcoalesced_pso = nil;
-    metal_release(_bselected_pso); _bselected_pso = nil;
-    metal_release(_bselected_ragged_pso); _bselected_ragged_pso = nil;
     metal_release(_btiled_pso); _btiled_pso = nil;
     metal_release(_bqueue2); _bqueue2 = nil;
     @autoreleasepool {
@@ -1974,24 +2012,17 @@ static int batch_pipeline_prepare(void) {
             [lib newFunctionWithName:@"q4weightstationary"];
         id<MTLFunction> coalesced_fn =
             [lib newFunctionWithName:@"q4coalesced"];
-        id<MTLFunction> selected_fn =
-            [lib newFunctionWithName:@"q4selected"];
-        id<MTLFunction> selected_ragged_fn =
-            [lib newFunctionWithName:@"q4selectedragged"];
         id<MTLFunction> tiled_fn = [lib newFunctionWithName:@"q4warpbatch"];
-        if (!fn || !weight_fn || !coalesced_fn || !selected_fn ||
-            !selected_ragged_fn || !tiled_fn) {
+        if (!fn || !weight_fn || !coalesced_fn || !tiled_fn) {
             fprintf(stderr,
                 "gpu-metal: batch function lookup failed base=%d weight=%d "
-                "coalesced=%d selected=%d ragged=%d tiled=%d names=%s\n",
+                "coalesced=%d tiled=%d names=%s\n",
                 fn != nil, weight_fn != nil, coalesced_fn != nil,
-                selected_fn != nil, selected_ragged_fn != nil,
                 tiled_fn != nil,
                 [[[lib functionNames] componentsJoinedByString:@","] UTF8String]);
             [lib release];
             metal_release(fn); metal_release(weight_fn);
             metal_release(coalesced_fn);
-            metal_release(selected_fn); metal_release(selected_ragged_fn);
             metal_release(tiled_fn);
             return -1;
         }
@@ -2002,22 +2033,14 @@ static int batch_pipeline_prepare(void) {
             [_dev newComputePipelineStateWithFunction:weight_fn error:&err];
         id<MTLComputePipelineState> coalesced_pso =
             [_dev newComputePipelineStateWithFunction:coalesced_fn error:&err];
-        id<MTLComputePipelineState> selected_pso =
-            [_dev newComputePipelineStateWithFunction:selected_fn error:&err];
-        id<MTLComputePipelineState> selected_ragged_pso =
-            [_dev newComputePipelineStateWithFunction:selected_ragged_fn
-                                                error:&err];
         id<MTLComputePipelineState> tiled_pso =
             [_dev newComputePipelineStateWithFunction:tiled_fn error:&err];
         [fn release];
         [weight_fn release];
         [coalesced_fn release];
-        [selected_fn release];
-        [selected_ragged_fn release];
         [tiled_fn release];
         id<MTLCommandQueue> queue = [_dev newCommandQueue];
-        if (!pso || !weight_pso || !coalesced_pso || !selected_pso ||
-            !selected_ragged_pso || !tiled_pso || !queue ||
+        if (!pso || !weight_pso || !coalesced_pso || !tiled_pso || !queue ||
             tiled_pso.threadExecutionWidth != 32 ||
             (_tiled_simdgroups > 0 &&
              tiled_pso.maxTotalThreadsPerThreadgroup <
@@ -2027,8 +2050,6 @@ static int batch_pipeline_prepare(void) {
             metal_release(pso);
             metal_release(weight_pso);
             metal_release(coalesced_pso);
-            metal_release(selected_pso);
-            metal_release(selected_ragged_pso);
             metal_release(tiled_pso);
             metal_release(queue);
             return -1;
@@ -2036,8 +2057,6 @@ static int batch_pipeline_prepare(void) {
         _bpso2 = pso;
         _bweight_pso = weight_pso;
         _bcoalesced_pso = coalesced_pso;
-        _bselected_pso = selected_pso;
-        _bselected_ragged_pso = selected_ragged_pso;
         _btiled_pso = tiled_pso;
         _bqueue2 = queue;
     }
@@ -3277,8 +3296,9 @@ int salt_gpu_q4_moe_chain_selected(const SaltGpuMoeExpert *experts, int count,
     unsigned long long detail_id = 0;
     if (!experts || count < 1 || count > 128 || hidden < 1 || routed < 1 ||
         (hidden & 31) != 0 || (routed & 31) != 0 || !inputs || !outputs ||
-        !gate_scratch || !up_scratch || batch_pipeline_prepare() != 0 ||
-        metal_ops_prepare() != 0 || !_wave_selected_args)
+        !gate_scratch || !up_scratch || !_selected_cache_resources ||
+        !_bselected_pso || !_wave_selected_args ||
+        batch_pipeline_prepare() != 0 || metal_ops_prepare() != 0)
         return -1;
     if (detail) {
         detail_id = ++detail_sequence;
@@ -3564,6 +3584,7 @@ static int salt_gpu_free_impl(void) {
     metal_release(_wave_selected_arg_encoder);
     _wave_selected_arg_encoder = nil;
     metal_release(_wave_selected_args); _wave_selected_args = nil;
+    _selected_argument_capacity = 0;
     metal_release(_selected_logical_slots); _selected_logical_slots = nil;
     metal_release(_selected_logical_payload_offsets);
     _selected_logical_payload_offsets = nil;

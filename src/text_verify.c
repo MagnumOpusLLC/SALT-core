@@ -1,4 +1,5 @@
 #include "salt/text_verify.h"
+#include "salt/head.h"
 
 #include <errno.h>
 #include <limits.h>
@@ -513,6 +514,9 @@ static int tensor_absent(const SaltTextTensorDesc *tensor) {
 
 static int tensor_resolves(const SaltTextModelExecDesc *descriptor,
                            const SaltTextTensorDesc *tensor) {
+    /* Required tensors are checked by shape; an optional absent cell has no
+     * resource to resolve. Absence must be the complete zero descriptor. */
+    if (descriptor && tensor_absent(tensor)) return 1;
     int valid = descriptor && tensor &&
         salt_tensor_storage_resolves(&tensor->storage,
             descriptor->tensor_resources,
@@ -788,24 +792,36 @@ static int descriptor_summary(const SaltTextModelExecDesc *descriptor,
             plan->attention.n_heads % plan->attention.n_kv_heads != 0 ||
             plan->attention.head_dim < 2 ||
             plan->attention.head_dim % 2 != 0 ||
-            plan->attention.rope_dim < 2 ||
+            plan->attention.rope_dim < 0 ||
             plan->attention.rope_dim > plan->attention.head_dim ||
             plan->attention.rope_dim % 2 != 0 ||
             plan->attention.rope_base_dim < plan->attention.rope_dim ||
             plan->attention.rope_base_dim > plan->attention.head_dim ||
-            plan->attention.rope_kind == SALT_ROPE_NONE ||
+            (plan->attention.rope_kind == SALT_ROPE_NONE &&
+             plan->attention.rope_dim != 0) ||
+            (plan->attention.rope_kind != SALT_ROPE_NONE &&
+             plan->attention.rope_dim < 2) ||
+            plan->attention.rope_kind > SALT_ROPE_PARTIAL_F32 ||
             !(plan->attention.rope_theta > 0.0) ||
             !isfinite(plan->attention.rope_theta) ||
             !isfinite(plan->attention.score_scale) ||
             (plan->attention.kind == SALT_ATTN_SLIDING &&
              plan->attention.window < 1) ||
-            plan->dense_intermediate < 1 || plan->n_experts < 1 ||
+            plan->dense_intermediate < 0 || plan->n_experts < 1 ||
             plan->top_k_experts < 1 ||
             plan->top_k_experts > plan->n_experts ||
-            plan->expert_intermediate < 1 || !plan->router_rmsnorm ||
-            !plan->parallel_dense_routed || !plan->residual_postnorm ||
+            plan->expert_intermediate < 1 ||
+            !readiness_bit(plan->router_rmsnorm) ||
+            !readiness_bit(plan->residual_postnorm) ||
+            !readiness_bit(plan->router_rank_order) ||
+            !readiness_bit(plan->attention.raw_values) ||
+            plan->parallel_dense_routed != (plan->dense_intermediate > 0) ||
+            (plan->activation == SALT_ACT_SILU_CLAMPED &&
+             (!(plan->activation_limit > 0.0f) || !isfinite(plan->activation_limit))) ||
             (plan->activation != SALT_ACT_GELU_TANH &&
-             plan->activation != SALT_ACT_SILU) ||
+             plan->activation != SALT_ACT_SILU &&
+             plan->activation != SALT_ACT_SILU_CLAMPED) ||
+            !(plan->logit_softcap >= 0.0f) || !isfinite(plan->logit_softcap) ||
             layer->expert_count != (uint32_t)plan->n_experts ||
             !layer->experts ||
             width_product(plan->attention.n_heads,
@@ -824,15 +840,15 @@ static int descriptor_summary(const SaltTextModelExecDesc *descriptor,
                                  (uint32_t)model->hidden)) ||
             !tensor_shape(&layer->o, (uint32_t)model->hidden,
                           query_width) ||
-            !tensor_shape(&layer->dense_gate,
+            !(plan->dense_intermediate == 0 ? tensor_absent(&layer->dense_gate) : tensor_shape(&layer->dense_gate,
                           (uint32_t)plan->dense_intermediate,
-                          (uint32_t)model->hidden) ||
-            !tensor_shape(&layer->dense_up,
+                          (uint32_t)model->hidden)) ||
+            !(plan->dense_intermediate == 0 ? tensor_absent(&layer->dense_up) : tensor_shape(&layer->dense_up,
                           (uint32_t)plan->dense_intermediate,
-                          (uint32_t)model->hidden) ||
-            !tensor_shape(&layer->dense_down,
+                          (uint32_t)model->hidden)) ||
+            !(plan->dense_intermediate == 0 ? tensor_absent(&layer->dense_down) : tensor_shape(&layer->dense_down,
                           (uint32_t)model->hidden,
-                          (uint32_t)plan->dense_intermediate) ||
+                          (uint32_t)plan->dense_intermediate)) ||
             !tensor_shape(&layer->router, (uint32_t)plan->n_experts,
                           (uint32_t)model->hidden) ||
             !tensor_shape(&layer->pre_attention_norm, 1u,
@@ -841,22 +857,23 @@ static int descriptor_summary(const SaltTextModelExecDesc *descriptor,
                           (uint32_t)attention->head_dim) ||
             !tensor_shape(&layer->k_norm, 1u,
                           (uint32_t)attention->head_dim) ||
-            !tensor_shape(&layer->post_attention_norm, 1u,
-                          (uint32_t)model->hidden) ||
-            !tensor_shape(&layer->pre_ffn_norm_1, 1u,
-                          (uint32_t)model->hidden) ||
+            !(plan->residual_postnorm ? tensor_shape(&layer->post_attention_norm, 1u,
+                          (uint32_t)model->hidden) : tensor_absent(&layer->post_attention_norm)) ||
+            !(plan->dense_intermediate ? tensor_shape(&layer->pre_ffn_norm_1, 1u,
+                          (uint32_t)model->hidden) : tensor_absent(&layer->pre_ffn_norm_1)) ||
             !tensor_shape(&layer->pre_ffn_norm_2, 1u,
                           (uint32_t)model->hidden) ||
-            !tensor_shape(&layer->post_ffn_norm_1, 1u,
-                          (uint32_t)model->hidden) ||
-            !tensor_shape(&layer->post_ffn_norm_2, 1u,
-                          (uint32_t)model->hidden) ||
-            !tensor_shape(&layer->post_ffn_norm, 1u,
-                          (uint32_t)model->hidden) ||
-            !tensor_shape(&layer->router_scale, 1u,
-                          (uint32_t)model->hidden) ||
-            !tensor_shape(&layer->per_expert_scale, 1u,
-                          (uint32_t)plan->n_experts) ||
+            !(plan->residual_postnorm ? tensor_shape(&layer->post_ffn_norm_1, 1u,
+                          (uint32_t)model->hidden) : tensor_absent(&layer->post_ffn_norm_1)) ||
+            !(plan->residual_postnorm ? tensor_shape(&layer->post_ffn_norm_2, 1u,
+                          (uint32_t)model->hidden) : tensor_absent(&layer->post_ffn_norm_2)) ||
+            !(plan->residual_postnorm ? tensor_shape(&layer->post_ffn_norm, 1u,
+                          (uint32_t)model->hidden) : tensor_absent(&layer->post_ffn_norm)) ||
+            !(plan->router_rmsnorm ? tensor_shape(&layer->router_scale, 1u,
+                          (uint32_t)model->hidden) : tensor_absent(&layer->router_scale)) ||
+            !(plan->router_rank_order ? tensor_absent(&layer->per_expert_scale) :
+              tensor_shape(&layer->per_expert_scale, 1u,
+                          (uint32_t)plan->n_experts)) ||
             !(plan->final_layer_scale
                   ? tensor_shape(&layer->layer_scalar, 1u, 1u)
                   : tensor_absent(&layer->layer_scalar)) ||
@@ -931,6 +948,7 @@ static int descriptor_summary(const SaltTextModelExecDesc *descriptor,
                 (attention->shared_kv_projection ? 22u : 23u))
             return -1;
         cell_count += attention->shared_kv_projection ? 22u : 23u;
+        if (plan->dense_intermediate == 0) cell_count -= 5u;
         if (checked_mul(candidates, (size_t)kv_width, &layer_tentative) != 0 ||
             checked_mul(layer_tentative, 2u * sizeof(float),
                         &layer_tentative) != 0 ||
@@ -1151,6 +1169,7 @@ int salt_text_verify_program_compile(
                base + 5u, base + 6u, layout.state_b,
                (size_t)descriptor->model->hidden * sizeof(float), 0);
         base += 6u;
+        if (plan->dense_intermediate > 0)
         APPEND(SALT_TEXT_CELL_DENSE_NORM, SALT_TEXT_EXECUTION_ROWS,
                maximum_candidates, layer_index, base, base + 1u,
                layout.normalized,
@@ -1163,6 +1182,7 @@ int salt_text_verify_program_compile(
                maximum_candidates, layer_index, base, base + 1u,
                layout.combine_a,
                (size_t)descriptor->model->hidden * sizeof(float), 0);
+        if (plan->dense_intermediate > 0) {
         APPEND(SALT_TEXT_CELL_DENSE_GATE, SALT_TEXT_EXECUTION_ROWS,
                maximum_candidates, layer_index, base + 1u, base + 2u,
                layout.dense_gate,
@@ -1171,10 +1191,12 @@ int salt_text_verify_program_compile(
                maximum_candidates, layer_index, base + 1u, base + 2u,
                layout.dense_up,
                (size_t)plan->dense_intermediate * sizeof(float), 0);
+        }
         APPEND(SALT_TEXT_CELL_ROUTER_PROJECTION, SALT_TEXT_EXECUTION_ROWS,
                maximum_candidates, layer_index, base + 1u, base + 2u,
                layout.router_logits,
                (size_t)plan->n_experts * sizeof(float), 0);
+        if (plan->dense_intermediate > 0)
         APPEND(SALT_TEXT_CELL_DENSE_ACTIVATION, SALT_TEXT_EXECUTION_ROWS,
                maximum_candidates, layer_index, base + 2u, base + 3u,
                layout.dense_chain,
@@ -1183,6 +1205,7 @@ int salt_text_verify_program_compile(
                maximum_candidates, layer_index, base + 2u, base + 3u,
                layout.selected_experts,
                (size_t)plan->top_k_experts * sizeof(int32_t), 0);
+        if (plan->dense_intermediate > 0)
         APPEND(SALT_TEXT_CELL_DENSE_DOWN, SALT_TEXT_EXECUTION_ROWS,
                maximum_candidates, layer_index, base + 3u, base + 4u,
                layout.dense_output,
@@ -3263,8 +3286,23 @@ static int schedule_emit(const SaltTextSchedulerBindings *b,
 static int schedule_sample(const SaltTextSchedulerBindings *b,
                            const SaltTextScheduleRequest *q,
                            SaltTextScheduleResult *r, int *token) {
-    int rc = salt_sampler_select(&q->sampler, q->logits,
-        (int)b->generation.program->vocabulary, schedule_position(b), token);
+    const float *logits = q->logits;
+    if (q->repetition_penalty > 1.0f && r->output_count > 0u) {
+        uint32_t count = r->output_count;
+        if (count > SALT_REPETITION_MAX_WINDOW) count = SALT_REPETITION_MAX_WINDOW;
+        memcpy(q->scratch_logits, q->logits,
+            (size_t)b->generation.program->vocabulary * sizeof(float));
+        if (salt_apply_repetition_penalty(q->scratch_logits,
+                (int)b->generation.program->vocabulary,
+                q->output_ids + r->output_count - count, count,
+                q->repetition_penalty) != 0) return -1;
+        logits = q->scratch_logits;
+    }
+    int rc = q->top_p > 0.0f && q->top_p < 1.0f
+        ? salt_sampler_select_top_p(&q->sampler, logits,
+            (int)b->generation.program->vocabulary, q->top_p, schedule_position(b), token)
+        : salt_sampler_select(&q->sampler, logits,
+            (int)b->generation.program->vocabulary, schedule_position(b), token);
     if (rc == 0 && q->sampler.abi != SALT_SAMPLER_GREEDY_V1)
         r->sampler_draws++;
     return rc;
@@ -3796,6 +3834,19 @@ int salt_text_scheduler_run(SaltTextTokenEpochController *controller,
         return -1;
     dpr = b->dpr && b->dpr->mode != SALT_DPR_OFF;
     if (dpr && q->sampler.abi != SALT_SAMPLER_GREEDY_V1) return -1;
+    if (!isfinite(q->top_p) || q->top_p < 0.0f || q->top_p > 1.0f ||
+        (dpr && q->top_p > 0.0f && q->top_p < 1.0f)) return -1;
+    if (!isfinite(q->repetition_penalty) || q->repetition_penalty < 0.0f ||
+        (q->repetition_penalty > 0.0f && q->repetition_penalty < 1.0f) ||
+        q->repetition_penalty > 2.0f) return -1;
+    if (q->repetition_penalty > 1.0f) {
+        uintptr_t raw = (uintptr_t)q->logits, scratch = (uintptr_t)q->scratch_logits;
+        size_t bytes;
+        if (dpr || q->sampler.abi != SALT_SAMPLER_TEMPERATURE_COUNTER_V1) return -1;
+        bytes = (size_t)b->generation.program->vocabulary * sizeof(float);
+        if (bytes / sizeof(float) != b->generation.program->vocabulary) return -1;
+        if ((raw >= scratch ? raw - scratch : scratch - raw) < bytes) return -1;
+    }
     if (salt_text_token_epoch_init(controller) != 0) return -1;
     controller->scheduler = b;
     controller->schedule_active = 1;

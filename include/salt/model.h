@@ -22,13 +22,15 @@ typedef enum {
 typedef enum {
     SALT_ACT_NONE = 0,
     SALT_ACT_SILU = 1,
-    SALT_ACT_GELU_TANH = 2
+    SALT_ACT_GELU_TANH = 2,
+    SALT_ACT_SILU_CLAMPED = 3
 } SaltActivationKind;
 
 typedef enum {
     SALT_ROPE_NONE = 0,
     SALT_ROPE_DEFAULT = 1,
-    SALT_ROPE_PROPORTIONAL = 2
+    SALT_ROPE_PROPORTIONAL = 2,
+    SALT_ROPE_PARTIAL_F32 = 3
 } SaltRopeKind;
 
 typedef struct {
@@ -44,6 +46,7 @@ typedef struct {
     int shared_kv_projection;
     double rope_theta;
     float score_scale;
+    int raw_values; /* zero preserves the established value RMSNorm contract */
 } SaltAttentionDesc;
 
 typedef struct {
@@ -62,6 +65,8 @@ typedef struct {
     int n_eos;
     SaltAttentionDesc sliding;
     SaltAttentionDesc full;
+    float activation_limit;
+    int router_rank_order;
 } SaltTextGraphDesc;
 
 typedef struct {
@@ -92,6 +97,8 @@ typedef struct {
     int tied_embeddings;
     int vision_bidirectional_local;
     float logit_softcap;
+    float activation_limit;
+    int router_rank_order;
 } SaltTextLayerPlan;
 
 typedef struct {

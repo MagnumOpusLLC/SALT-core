@@ -313,13 +313,22 @@ def main() -> None:
         ),
         "include_usage must be a boolean",
     )
-    for field in ("tool_choice", "logit_bias"):
+    for field in ("logit_bias",):
         expect_request_error(
             lambda field=field: module.Gemma4Backend._validate_request_schema(
                 {"messages": [], field: {}}, endpoint="chat",
             ),
             "unsupported Chat fields",
         )
+    expect_request_error(
+        lambda: module.Gemma4Backend._validate_request_schema(
+            {"messages": [], "tool_choice": {}}, endpoint="chat",
+        ),
+        "invalid named function tool_choice",
+    )
+    module.Gemma4Backend._validate_request_schema(
+        {"messages": [], "tools": [], "tool_choice": "none"}, endpoint="chat",
+    )
     expect_request_error(
         lambda: module.Gemma4Backend._validate_request_schema(
             {"input": "x", "text": {"format": {"type": "json_schema"}}},

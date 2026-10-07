@@ -344,7 +344,7 @@ def test_gemma_platform_recipes():
     metal = load_engine_config(
         str(ROOT / "engine.config"), model_dir=model_dir, recipe="mac-metal",
     )
-    # The selected Metal recipe uses literal zero for its current fetch policy.
+    # Pin the exported merged recipe, not an earlier physical policy.
     assert metal["SALT_FETCH_TOUCH_BYTES"] == "0", metal
     assert metal["SALT_GPU_TRUNK_LAYER_VIEW"] == "0", metal
     assert metal["SALT_GPU_TRUNK_SHARED_POOL"] == "1", metal

@@ -8,6 +8,54 @@
 #include <string.h>
 #include <time.h>
 
+/* Same compiler TLS adapter as the C99 persistent pool; no allocation. */
+static __thread const SaltTextPrefillTeam *text_prefill_team;
+
+const SaltTextPrefillTeam *salt_text_prefill_team_current(void) {
+    return text_prefill_team;
+}
+
+int salt_text_prefill_team_owner(void) {
+    return !text_prefill_team || text_prefill_team->worker == 0u;
+}
+
+int salt_text_prefill_team_sync(int status) {
+    const SaltTextPrefillTeam *team = text_prefill_team;
+    int failed;
+    if (!team) return status;
+    if (status) __atomic_store_n(&team->graph->failed, 1u, __ATOMIC_RELEASE);
+    salt_tensor_host_graph_barrier(team->graph);
+    failed = (int)__atomic_load_n(&team->graph->failed, __ATOMIC_ACQUIRE);
+    salt_tensor_host_graph_barrier(team->graph);
+    return failed ? -1 : 0;
+}
+
+int salt_text_prefill_team_once(int (*operation)(void *), void *context) {
+    const SaltTextPrefillTeam *team = text_prefill_team;
+    int rc = 0;
+    if (!operation || !context) return salt_text_prefill_team_sync(-1);
+    if (!team) return operation(context);
+    if (team->worker == 0u) {
+        /* Inside this complete physical operation, existing single-owner
+         * preparation/retirement runs normally, not as nested team barriers. */
+        text_prefill_team = NULL;
+        rc = operation(context);
+        text_prefill_team = team;
+    }
+    return salt_text_prefill_team_sync(rc);
+}
+
+int salt_text_prefill_team_slice(int workers,
+        void (*operation)(int, void *), void *context) {
+    const SaltTextPrefillTeam *team = text_prefill_team;
+    if (!team || !operation || !context || workers < 1 ||
+        (uint32_t)workers > team->workers)
+        return salt_text_prefill_team_sync(-1);
+    if (team->worker < (uint32_t)workers)
+        operation((int)team->worker, context);
+    return salt_text_prefill_team_sync(0);
+}
+
 static double text_now_s(void) {
     struct timespec time_value;
     if (clock_gettime(CLOCK_MONOTONIC, &time_value) != 0) return 0.0;
@@ -203,9 +251,11 @@ static int text_prefill_prepare_next_step(
 static int text_prefill_embed_step(
         SaltTextPrefillExecution *execution, int batch) {
     double start = execution->profile ? text_now_s() : 0.0;
-    if (execution->ops->embed(execution->context,
+    int rc = 0;
+    if (salt_text_prefill_team_owner()) rc = execution->ops->embed(execution->context,
             execution->tokens + execution->completed, batch,
-            execution->states) != 0)
+            execution->states);
+    if (salt_text_prefill_team_sync(rc) != 0)
         return -1;
     if (execution->profile)
         execution->profile->embed_s += text_now_s() - start;
@@ -237,7 +287,7 @@ static int text_prefill_feed_forward_step(
 static void text_prefill_release_step(
         SaltTextPrefillExecution *execution, int layer, int layer_rc) {
     double start = execution->profile ? text_now_s() : 0.0;
-    if (execution->ops->release_layer &&
+    if (salt_text_prefill_team_owner() && execution->ops->release_layer &&
             (layer_rc != 0 || execution->plan->resource_policy ==
                 SALT_TEXT_RELEASE_PER_LAYER)) {
         execution->ops->release_layer(execution->context, layer);
@@ -248,6 +298,7 @@ static void text_prefill_release_step(
     }
     if (execution->profile)
         execution->profile->release_s += text_now_s() - start;
+    (void)salt_text_prefill_team_sync(0);
 }
 
 static int text_prefill_finish_batch_step(
@@ -293,10 +344,12 @@ static int text_prefill_finish_step(SaltTextPrefillExecution *execution) {
 static int text_prefill_publish_step(SaltTextPrefillExecution *execution) {
     double start = execution->profile ? text_now_s() : 0.0;
     int position = execution->start_position + execution->token_count;
-    if (execution->ops->publish_position(
-            execution->context, position) != 0)
+    int rc = 0;
+    if (salt_text_prefill_team_owner()) rc = execution->ops->publish_position(
+            execution->context, position);
+    if (salt_text_prefill_team_sync(rc) != 0)
         return -1;
-    if (execution->plan->lookahead &&
+    if (salt_text_prefill_team_owner() && execution->plan->lookahead &&
             execution->plan->lookahead->status ==
                 SALT_TEXT_LOOKAHEAD_PREPARED) {
         if (execution->plan->lookahead->request.result_position !=
@@ -368,9 +421,13 @@ static void text_prefill_advance(SaltTextPrefillExecution *execution) {
         execution->phase = TEXT_PREFILL_CHUNK_BEGIN;
         return;
     case TEXT_PREFILL_NEXT_PREPARE:
-        execution->phase = text_prefill_prepare_next_step(execution) == 0
+        {
+        int rc = salt_text_prefill_team_owner()
+            ? text_prefill_prepare_next_step(execution) : 0;
+        execution->phase = salt_text_prefill_team_sync(rc) == 0
             ? TEXT_PREFILL_PUBLISH : TEXT_PREFILL_FAILED;
         return;
+        }
     case TEXT_PREFILL_FINAL_FINISH:
         execution->phase = text_prefill_finish_step(execution) == 0
             ? TEXT_PREFILL_NEXT_PREPARE : TEXT_PREFILL_FAILED;
@@ -394,12 +451,36 @@ static int text_prefill_run(void *opaque) {
            execution->phase != TEXT_PREFILL_FAILED)
         text_prefill_advance(execution);
     if (execution->phase == TEXT_PREFILL_DONE) return 0;
-    if (execution->plan->lookahead &&
+    if (salt_text_prefill_team_owner() && execution->plan->lookahead &&
             text_phase_lookahead_active(execution->plan->lookahead) &&
             salt_text_phase_lookahead_cancel(
                 execution->plan->lookahead) != 0)
         return -1;
     return -1;
+}
+
+static int text_prefill_collective(void *opaque, uint32_t node, uint32_t worker) {
+    SaltTextPrefillExecution execution = *(SaltTextPrefillExecution *)opaque;
+    SaltTextPrefillTeam lane = {
+        execution.plan->team_state, worker, execution.plan->team_workers,
+    };
+    int rc;
+    (void)node;
+    if (text_prefill_team) return -1;
+    if (worker != 0u) execution.profile = NULL;
+    text_prefill_team = &lane;
+    rc = text_prefill_run(&execution);
+    text_prefill_team = NULL;
+    return rc;
+}
+
+static int text_prefill_collective_run(void *opaque) {
+    SaltTextPrefillExecution *execution = opaque;
+    const SaltTextPrefillPlan *plan = execution->plan;
+    SaltTensorHostGraphResult result;
+    return salt_tensor_host_graph_collective_execute(plan->team_state, 1u,
+        text_prefill_collective, execution, plan->team_workers,
+        plan->team_run, plan->team_context, &result);
 }
 
 int salt_text_prefill_execute(const SaltTextPrefillPlan *plan,
@@ -424,7 +505,16 @@ int salt_text_prefill_execute(const SaltTextPrefillPlan *plan,
     if (text_prefill_prepare(&execution) != 0)
         return -1;
     if (profile) profile->setup_s += text_now_s() - wall_start;
-    rc = plan->transaction_run
+    if (plan->team_state) {
+        if (plan->position_logits || plan->lookahead ||
+            !plan->team_run || !plan->team_context || !plan->team_workers ||
+            plan->team_workers > 32u)
+            return -1;
+        rc = plan->transaction_run
+            ? plan->transaction_run(plan->transaction_context,
+                text_prefill_collective_run, &execution)
+            : text_prefill_collective_run(&execution);
+    } else rc = plan->transaction_run
         ? plan->transaction_run(plan->transaction_context,
               text_prefill_run, &execution)
         : text_prefill_run(&execution);

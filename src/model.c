@@ -100,7 +100,11 @@ static int attention_valid(const SaltAttentionDesc *a) {
         a->rope_dim % 2 != 0 || a->rope_base_dim < a->rope_dim ||
         a->rope_base_dim > a->head_dim ||
         (a->rope_kind != SALT_ROPE_DEFAULT &&
-         a->rope_kind != SALT_ROPE_PROPORTIONAL) ||
+         a->rope_kind != SALT_ROPE_PROPORTIONAL &&
+         a->rope_kind != SALT_ROPE_PARTIAL_F32 &&
+         a->rope_kind != SALT_ROPE_NONE) ||
+        (a->rope_kind == SALT_ROPE_NONE && a->rope_dim != 0) ||
+        (a->raw_values != 0 && a->raw_values != 1) ||
         !(a->rope_theta > 0.0) || !isfinite(a->rope_theta) ||
         !(a->score_scale > 0.0f) || !isfinite(a->score_scale))
         return 0;
@@ -132,16 +136,21 @@ int salt_model_text_layer_plan(const SaltModelDesc *m, int layer,
         !(g = m->text_graph) || !bool_field(m->runtime_ready) ||
         m->hidden < 1 || m->n_experts < 1 || m->topk < 1 ||
         m->topk > m->n_experts || m->moe_inter < 1 ||
-        g->dense_intermediate < 1 ||
+        g->dense_intermediate < 0 ||
+        (g->dense_intermediate == 0 && g->parallel_dense_routed) ||
         (g->expert_activation != SALT_ACT_SILU &&
-         g->expert_activation != SALT_ACT_GELU_TANH) ||
+         g->expert_activation != SALT_ACT_GELU_TANH &&
+         g->expert_activation != SALT_ACT_SILU_CLAMPED) ||
+        (g->expert_activation == SALT_ACT_SILU_CLAMPED &&
+         (!(g->activation_limit > 0.0f) || !isfinite(g->activation_limit))) ||
+        !bool_field(g->router_rank_order) ||
         !bool_field(g->router_rmsnorm) ||
         !bool_field(g->parallel_dense_routed) ||
         !bool_field(g->residual_postnorm) ||
         !bool_field(g->final_layer_scale) ||
         !bool_field(g->tied_embeddings) ||
         !bool_field(g->vision_bidirectional_local) ||
-        !(g->logit_softcap > 0.0f) || !isfinite(g->logit_softcap) ||
+        !(g->logit_softcap >= 0.0f) || !isfinite(g->logit_softcap) ||
         g->n_eos < 1 || g->n_eos > 4)
         return -1;
     for (int i = 0; i < g->n_eos; i++)
@@ -165,6 +174,8 @@ int salt_model_text_layer_plan(const SaltModelDesc *m, int layer,
     plan.tied_embeddings = g->tied_embeddings;
     plan.vision_bidirectional_local = g->vision_bidirectional_local;
     plan.logit_softcap = g->logit_softcap;
+    plan.activation_limit = g->activation_limit;
+    plan.router_rank_order = g->router_rank_order;
     *out = plan;
     return 0;
 }

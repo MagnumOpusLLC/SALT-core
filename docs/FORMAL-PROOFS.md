@@ -14,15 +14,16 @@ KV/state bit identity are separate evidence classes.
 The first nine proof models retain their historical runtime source baseline
 `d3a2037f404d520998ac2d3b2d182ca58f529c82`
 (**2026-09-21 19:50:34 −04:00**). The exported runtime source is now
-`ce0363260a488c96b951b4d826a188e1014575d4`
-(**2026-10-02 10:58:17 −04:00**). The supplemental loader proof was copied from
+`ca634c59d2632122c55f4a25ef86338d2144a697`
+(**2026-10-06T23:47:09-04:00**). The supplemental loader proof was copied from
 `beab7291b7dd7ae11bb7d21ea0735e83ad7c0fa0`
 (**2026-10-02 10:49:29 −04:00**) and manually maps three loader paths in
 `9f5c1e0b26059e79f557e4c5a5994579e4634aec`
-(**2026-10-02 08:25:11 −04:00**); those three C files are byte-identical in
-the exported runtime. The manifest pins both runtime and proof sources
-separately. The other nine proofs were **not** requalified against the new
-runtime source.
+(**2026-10-02 08:25:11 −04:00**). That source correspondence remains historical;
+the later runtime refresh is not a new loader or engine proof. The manifest
+pins runtime and proof sources separately. The ten abstract proof inputs and
+their historical results are unchanged and were **not** requalified against
+the new runtime source.
 
 ## Included modules
 

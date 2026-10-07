@@ -6,6 +6,7 @@
 #include "salt/moe.h"
 #include "salt/bitmath.h"
 #include "salt/simd.h"
+#include "compiler.h"
 
 #include <math.h>
 #include <limits.h>
@@ -430,8 +431,150 @@ static void attn_pool_graph_worker(int tid, void *opaque) {
     }
 }
 
+SALT_THREAD_LOCAL SaltKvCache *attn_team_pool;
+SALT_THREAD_LOCAL int attn_team_tid;
+SALT_THREAD_LOCAL int attn_team_in_phase;
+
+/* SC publication plus SC park registration prevents the lost-wakeup case:
+ * either the publisher sees a sleeper, or that sleeper sees the new phase
+ * on its mutex-protected second check and never waits. No dynamic storage. */
+static void attn_team_wake(SaltKvCache *c) {
+    if (__atomic_load_n(&c->ateam_sleepers, __ATOMIC_SEQ_CST) != 0) {
+        pthread_mutex_lock(&c->amu);
+        pthread_cond_broadcast(&c->acv_flow_work);
+        pthread_mutex_unlock(&c->amu);
+    }
+}
+
+static uint64_t attn_team_next(SaltKvCache *c, uint64_t seen) {
+    uint64_t phase;
+    for (unsigned spin = 0; spin < 4096u; spin++) {
+        phase = __atomic_load_n(&c->aflow_phase, __ATOMIC_SEQ_CST);
+        if (phase != seen) return phase;
+    }
+    pthread_mutex_lock(&c->amu);
+    __atomic_add_fetch(&c->ateam_sleepers, 1, __ATOMIC_SEQ_CST);
+    while ((phase = __atomic_load_n(&c->aflow_phase, __ATOMIC_SEQ_CST)) == seen)
+        pthread_cond_wait(&c->acv_flow_work, &c->amu);
+    __atomic_sub_fetch(&c->ateam_sleepers, 1, __ATOMIC_SEQ_CST);
+    pthread_mutex_unlock(&c->amu);
+    return phase;
+}
+
+static void attn_team_profile_action(SaltKvCache *c, double begin) {
+    if (c->asoa_profile) {
+        double elapsed = attn_soa_now_s() - begin;
+        pthread_mutex_lock(&c->amu);
+        c->asoa_worker_action_sum_s += elapsed;
+        if (elapsed > c->asoa_phase_worker_max_s)
+            c->asoa_phase_worker_max_s = elapsed;
+        pthread_mutex_unlock(&c->amu);
+    }
+}
+
+static void attn_pool_team_worker(int tid, SaltKvCache *c) {
+    uint64_t seen = 0;
+    attn_team_pool = c;
+    attn_team_tid = tid;
+    attn_team_in_phase = 0;
+    if (tid == 0) {
+        int result;
+        pthread_mutex_lock(&c->amu);
+        c->aflow_coordinator = pthread_self();
+        pthread_mutex_unlock(&c->amu);
+        result = c->aflow_coordinator_fn(c->aflow_coordinator_arg);
+        /* Every synchronous phase has drained before returning, including
+         * failure. Stop is another publication, never an early worker exit. */
+        __atomic_store_n(&c->aflow_phase, UINT64_MAX, __ATOMIC_SEQ_CST);
+        attn_team_wake(c);
+        pthread_mutex_lock(&c->amu);
+        c->aflow_result = result;
+        c->aflow_stop = 1;
+        pthread_mutex_unlock(&c->amu);
+    } else {
+        for (;;) {
+            uint64_t phase = attn_team_next(c, seen);
+            double started;
+            if (phase == UINT64_MAX) break;
+            seen = phase;
+            started = c->asoa_profile ? attn_soa_now_s() : 0.0;
+            if (tid < c->aflow_phase_active) {
+                attn_team_in_phase = 1;
+                c->aflow_phase_fn(tid, c->aflow_phase_arg);
+                attn_team_in_phase = 0;
+                attn_team_profile_action(c, started);
+            }
+            /* Inactive members acknowledge too: the next phase must not
+             * overwrite shared descriptors while any member can read them. */
+            if (__atomic_add_fetch(&c->aflow_phase_done, 1, __ATOMIC_SEQ_CST)
+                    == c->apool_threads - 1 &&
+                __atomic_load_n(&c->ateam_join_sleeping, __ATOMIC_SEQ_CST)) {
+                pthread_mutex_lock(&c->amu);
+                pthread_cond_signal(&c->acv_flow);
+                pthread_mutex_unlock(&c->amu);
+            }
+        }
+    }
+    attn_team_pool = NULL;
+    attn_team_in_phase = 0;
+}
+
+static int attn_pool_team_phase(SaltKvCache *c, int nactive,
+        void (*fn)(int, void *), void *arg) {
+    uint64_t phase;
+    double started;
+    if (attn_team_pool != c || attn_team_tid != 0 || attn_team_in_phase ||
+        !fn || nactive < 1 || nactive > c->apool_threads)
+        return -1;
+    phase = __atomic_load_n(&c->aflow_phase, __ATOMIC_SEQ_CST);
+    if (phase >= UINT64_MAX - 1u) return -1;
+    c->aflow_phase_fn = fn;
+    c->aflow_phase_arg = arg;
+    c->aflow_phase_active = nactive;
+    __atomic_store_n(&c->aflow_phase_done, 0, __ATOMIC_SEQ_CST);
+    if (c->asoa_profile) c->asoa_phase_worker_max_s = 0.0;
+    attn_soa_count(c->asoa_profile, &c->asoa_phase_actions, 1);
+    attn_soa_count(c->asoa_profile, &c->asoa_worker_actions, (uint64_t)(unsigned)nactive);
+    attn_soa_count(c->asoa_profile, &c->asoa_worker_slot_capacity,
+                   (uint64_t)(unsigned)c->apool_threads);
+    attn_soa_count(c->asoa_profile, &c->asoa_worker_slot_headroom,
+                   (uint64_t)(unsigned)(c->apool_threads - nactive));
+    if (c->asoa_profile && (uint32_t)nactive > c->asoa_peak_active)
+        c->asoa_peak_active = (uint32_t)nactive;
+    __atomic_store_n(&c->aflow_phase, phase + 1u, __ATOMIC_SEQ_CST);
+    attn_team_wake(c);
+    started = c->asoa_profile ? attn_soa_now_s() : 0.0;
+    attn_team_in_phase = 1;
+    fn(0, arg);
+    attn_team_in_phase = 0;
+    attn_team_profile_action(c, started);
+    for (unsigned spin = 0; spin < 4096u; spin++)
+        if (__atomic_load_n(&c->aflow_phase_done, __ATOMIC_SEQ_CST)
+                == c->apool_threads - 1) break;
+    if (__atomic_load_n(&c->aflow_phase_done, __ATOMIC_SEQ_CST)
+            != c->apool_threads - 1) {
+        pthread_mutex_lock(&c->amu);
+        __atomic_store_n(&c->ateam_join_sleeping, 1, __ATOMIC_SEQ_CST);
+        while (__atomic_load_n(&c->aflow_phase_done, __ATOMIC_SEQ_CST)
+                != c->apool_threads - 1)
+            pthread_cond_wait(&c->acv_flow, &c->amu);
+        __atomic_store_n(&c->ateam_join_sleeping, 0, __ATOMIC_SEQ_CST);
+        pthread_mutex_unlock(&c->amu);
+    }
+    if (c->asoa_profile)
+        c->asoa_worker_critical_s += c->asoa_phase_worker_max_s;
+    c->aflow_phase_fn = NULL;
+    c->aflow_phase_arg = NULL;
+    c->aflow_phase_active = 0;
+    return 0;
+}
+
 static void attn_pool_flow_worker(int tid, void *opaque) {
     SaltKvCache *c = (SaltKvCache *)opaque;
+    if (__atomic_load_n(&c->ateam_mode, __ATOMIC_ACQUIRE)) {
+        attn_pool_team_worker(tid, c);
+        return;
+    }
     pthread_cond_t *phase_cv = &c->acv_flow_work;
     uint64_t seen = 0;
     if (tid == 0) {
@@ -565,6 +708,9 @@ int salt_attn_pool_init(SaltKvCache *c) {
     c->arunning = 0;
     c->ath_count = 0;
     if (pthread_mutex_init(&c->amu, NULL) != 0) return -1;
+    c->ateam_mode = 0;
+    c->ateam_sleepers = 0;
+    c->ateam_join_sleeping = 0;
     if (pthread_cond_init(&c->acv_work, NULL) != 0) {
         pthread_mutex_destroy(&c->amu);
         return -1;
@@ -716,6 +862,8 @@ int salt_attn_pool_run_n(SaltKvCache *c, int nactive,
     if (!c || !c->apool_sync_init || !c->ath || !fn || nactive < 1 ||
         nactive > c->apool_threads)
         return -1;
+    if (__atomic_load_n(&c->ateam_mode, __ATOMIC_ACQUIRE))
+        return attn_pool_team_phase(c, nactive, fn, arg);
     if (nactive == 1 && c->aflow_running && !c->aflow_stop &&
         pthread_equal(c->aflow_coordinator, pthread_self())) {
         double action_started = c->asoa_profile ? attn_soa_now_s() : 0.0;
@@ -926,8 +1074,8 @@ int salt_attn_pool_graph_end(SaltKvCache *c) {
     return 0;
 }
 
-int salt_attn_pool_flow_run(SaltKvCache *c,
-                            int (*fn)(void *arg), void *arg) {
+static int attn_pool_flow_run(SaltKvCache *c,
+                              int (*fn)(void *arg), void *arg, int team) {
     double lock_started, wait_started;
     int result;
     if (!c || !fn || !c->apool_sync_init || !c->ath ||
@@ -958,6 +1106,9 @@ int salt_attn_pool_flow_run(SaltKvCache *c,
     c->aflow_phase_fn = NULL;
     c->aflow_phase_arg = NULL;
     c->afn = attn_pool_flow_worker;
+    __atomic_store_n(&c->ateam_sleepers, 0, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&c->ateam_join_sleeping, 0, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&c->ateam_mode, team, __ATOMIC_RELEASE);
     c->aarg = c;
     c->aactive = c->apool_threads;
     c->adone = 0;
@@ -977,6 +1128,7 @@ int salt_attn_pool_flow_run(SaltKvCache *c,
             c->asoa_flow_wait_s += attn_soa_now_s() - wait_started;
     }
     result = c->aflow_result;
+    __atomic_store_n(&c->ateam_mode, 0, __ATOMIC_RELEASE);
     c->afn = NULL;
     c->aarg = NULL;
     c->aactive = 0;
@@ -994,6 +1146,17 @@ int salt_attn_pool_flow_run(SaltKvCache *c,
     c->aflow_phase_arg = NULL;
     pthread_mutex_unlock(&c->amu);
     return result;
+}
+
+int salt_attn_pool_flow_run(SaltKvCache *c,
+                            int (*fn)(void *arg), void *arg) {
+    return attn_pool_flow_run(c, fn, arg, 0);
+}
+
+int salt_attn_pool_team_run(SaltKvCache *c,
+                            int (*fn)(void *arg), void *arg) {
+    if (attn_team_pool) return -1;
+    return attn_pool_flow_run(c, fn, arg, 1);
 }
 
 typedef struct AttnWfqCall {

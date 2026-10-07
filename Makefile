@@ -81,7 +81,7 @@ HDR = include/salt/salt.h include/salt/kernels.h include/salt/moe.h \
       src/compiler.h src/thread-lifecycle.h src/text_verify_internal.h \
       src/sha256.h
 MODEL_REGISTRY_SRC = src/model.c models/registry.c \
-      models/qwen36/model.c models/gemma4-26b-a4b/src/model.c
+      models/qwen36/model.c models/gemma4-26b-a4b/src/model.c models/maple-preview/model.c
 QWEN36_MODEL_SRC = models/qwen36/moe.c models/qwen36/attn.c \
       models/qwen36/deltachunk.c models/qwen36/layer.c
 QWEN36_MODEL_HDR = models/qwen36/attn.h models/qwen36/deltachunk.h
@@ -90,12 +90,14 @@ SRC = src/cfg.c src/st.c src/trunk.c src/cache.c src/router.c src/mem.c \
       src/attn_batch.c src/moe_group.c src/text_exec.c src/text_token.c \
       src/area_scan.c src/tensorops.c src/text_verify.c src/text_verify_cpu.c \
       src/head.c src/tokenizer.c src/bitmath.c src/sampling.c \
-      src/quant.c $(MODEL_REGISTRY_SRC) src/state.c $(QWEN36_MODEL_SRC) \
+      src/quant.c src/int2.c $(MODEL_REGISTRY_SRC) src/state.c $(QWEN36_MODEL_SRC) \
       models/gemma4-26b-a4b/src/gemma4.c src/gpu_pool.c \
       src/gpu_resource.c src/gpu_layer.c src/dpr.c src/dpr_store.c \
       src/dpr_stats.c src/sha256.c $(GPU_SRC)
 
 all: salt gemma4-server
+
+include models/maple-preview/build.mk
 
 salt: models/qwen36/main.c $(SRC) $(HDR) $(QWEN36_MODEL_HDR) $(GPU_OBJ)
 	$(CC) $(CFLAGS) $(INC) -DSALT_GIT=\"$(shell git rev-parse --short HEAD 2>/dev/null)\" -o $@ models/qwen36/main.c $(filter-out %.m %.mm $(GPU_OBJ),$(SRC)) $(GPU_OBJ) -lm $(GPU_LIBS)
@@ -837,6 +839,8 @@ test-spectrum-gpu-telemetry:
 
 test-public-smoke:
 	env -u PYTHONPATH "$(GEMMA4_E2E_PYTHON)" tools/test/engine-config-test.py
+	env -u PYTHONPATH "$(GEMMA4_E2E_PYTHON)" tools/test/gemma4-tools-test.py
+	env -u PYTHONPATH "$(GEMMA4_E2E_PYTHON)" tools/test/gpu-metal-selected-capacity-test.py
 	env -u PYTHONPATH "$(GEMMA4_E2E_PYTHON)" tools/test/gemma4-kv-compat-projection-test.py --production
 	env -u PYTHONPATH "$(GEMMA4_E2E_PYTHON)" tools/test/gemma4-kv-compat-test.py
 	env -u PYTHONPATH "$(GEMMA4_E2E_PYTHON)" tools/test/gpu-residency-source-test.py

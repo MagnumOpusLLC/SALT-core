@@ -3,6 +3,40 @@
 This index separates current authority from scoped evidence, formal models,
 closed work-order records, future backlog, and historical material.
 
+## Current runtime export
+
+The curated runtime was refreshed from merged private `main`
+`ca634c59d2632122c55f4a25ef86338d2144a697`
+(**2026-10-06T23:47:09-04:00**). The runtime pin in
+[`formal/proof-manifest.json`](formal/proof-manifest.json) is separate from its
+unchanged historical proof inputs/results. Older revision stamps and experiment
+reports are historical, not qualification of this refreshed tree.
+
+Gemma now supports a bounded Chat Completions function-tool contract, client-side
+tool execution/results, SSE and usage. Add `--gemma-session-mode openai` to the
+normal [`server/serve-launch.sh`](../server/serve-launch.sh) command for clients
+that send complete `messages` and current tool declarations on each request.
+The default remains stateful. Exact compatible live prefixes are reused; unsafe
+ring rewinds and image inputs cold-refill. Unkeyed repeats generate again;
+explicit idempotency keys request bounded result replay. Tools require DPR off;
+strict schemas, built-in tools and Codex's Responses contract remain unsupported.
+This is not universal OpenAI or official-agent-client certification.
+
+Metal expert descriptor capacity follows the admitted startup cache rather than
+a fixed 512-slot ceiling. The current
+[`rocm` recipe](../models/gemma4-26b-a4b/configs/rocm/engine.config) reserves
+3.5 decimal GB for device experts, retains its 3-GB host expert cache and uses an
+8-GB host-RSS ceiling. Host/device slot coupling still limits effective expert
+retention; arena reservation is not a guarantee of independent retained capacity.
+
+The experimental CPU-only Maple INT2 model, quant support and server adapter are
+included as current registry/build dependencies. Use its
+[`setup.py`](../models/maple-preview/setup.py) and explicit `make maple-server`
+entry with operator-owned package paths; this is not a new production-readiness
+or source-model-fidelity claim. The public `make test` remains a small smoke
+suite, including tool-schema and Metal-capacity contracts. Private agent-harness
+fixtures, qualification output and operational logs are not exported.
+
 ## Start here
 
 - [`FORMAL-PROOFS.md`](FORMAL-PROOFS.md) — curated TLA+/TLAPS sources,

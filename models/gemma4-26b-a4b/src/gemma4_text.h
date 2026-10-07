@@ -267,6 +267,15 @@ int salt_gemma4_text_prefill_verify(SaltGemma4Text *model,
 int salt_gemma4_text_rollback_position(SaltGemma4Text *model,
                                        int new_position);
 
+/* Full-input serving only, at an idle committed boundary with no shared prefix.
+ * The caller proves exact token-prefix provenance and computes at least one
+ * suffix row for fresh logits. Return actual retained prefix (0 for safe cold
+ * fallback), or -1 on invalid state/backend failure. Changes visibility and
+ * generation only: no KV copy, hash, materialization, allocation or scrub.
+ * Unlike target rollback, a rewind into overwritten local-ring history is a
+ * cold miss, never a reconstruction from stale seats. */
+int salt_gemma4_text_reuse_prefix(SaltGemma4Text *model, int requested_prefix);
+
 /* Execute an exact one-image prompt as a layer-major prefill. The prompt must
  * contain one contiguous run of mm_token_type==1 placeholders, bracketed by
  * the pinned <|image> / <image|> token IDs, and image_features must contain

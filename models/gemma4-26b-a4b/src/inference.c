@@ -1,4 +1,6 @@
 /* Persistent Gemma 4 native inference/session controller, protocol V3.
+ * TURN_V4 adds request-scoped tool yield; response frames remain unchanged.
+ * TURN_V5 adds standalone full input with exact live text-prefix reuse.
  *
  * Python authenticates and passes the immutable resource map, startup policy,
  * and session commands. This C process owns the complete persistent inference
@@ -39,7 +41,7 @@
 #define G4_MAX_SOFT_TOKENS 70
 #define G4_KV_BYTES_PER_TOKEN 450560
 
-#define G4_PROTOCOL 3
+#define G4_PROTOCOL 5
 #define G4_SHA256_HEX 64
 #define G4_JOURNAL_CAPACITY 256
 #define G4_RESPONSE_TOKEN_BYTES 64u
@@ -269,6 +271,82 @@ static int parse_positive(const char *value, int *out) {
     if (!end || *end || parsed < 1 || parsed > INT_MAX) return -1;
     *out = (int)parsed;
     return 0;
+}
+
+/* Reconstruct only the current committed path, not a history proposal. Each
+ * newer interval replaces the older suffix from position_before onward. Walk
+ * backwards through those intervals without copying a second token history.
+ * Imported/missing or multimodal provenance is deliberately a cold miss. */
+static int journal_input_prefix(const G4CommitRecord *journal, int count,
+                                int position, const int *ids, int tokens) {
+    int end = position;
+    int matched;
+    if (!journal || !ids || count < 1 || count > G4_JOURNAL_CAPACITY ||
+        position < 1 || position > g_context || tokens < 1 ||
+        tokens > g_context || !journal[count - 1].used ||
+        journal[count - 1].position_after != position ||
+        g_journal_arena.prompt_used > g_journal_arena.prompt_capacity ||
+        g_journal_arena.output_used > g_journal_arena.output_capacity)
+        return 0;
+    /* No saved parent logits: always compute at least the final input row. */
+    matched = tokens - 1 < position ? tokens - 1 : position;
+    for (int i = count - 1; i >= 0 && end > 0; i--) {
+        const G4CommitRecord *r = &journal[i];
+        int span;
+        if (!r->used || r->position_before < 0 ||
+            r->position_after < r->position_before ||
+            r->position_after > g_context)
+            return 0;
+        if (r->position_before >= end) continue;
+        span = r->position_after - r->position_before;
+        if (r->position_after < end || r->image_tokens != 0 ||
+            r->prompt_tokens < 1 || r->prompt_tokens > span ||
+            r->output_steps < 1 || r->output_steps > span - r->prompt_tokens ||
+            (r->synthetic_close != 0 && r->synthetic_close != 1) ||
+            span - r->prompt_tokens - r->output_steps != r->synthetic_close ||
+            r->prompt_offset > g_journal_arena.prompt_used ||
+            (size_t)r->prompt_tokens >
+                g_journal_arena.prompt_used - r->prompt_offset ||
+            r->output_offset > g_journal_arena.output_used ||
+            (size_t)r->output_steps >
+                g_journal_arena.output_used - r->output_offset)
+            return 0;
+        for (int row = r->position_before; row < end && row < matched; row++) {
+            int offset = row - r->position_before;
+            int token;
+            if (offset < r->prompt_tokens)
+                token = g_journal_arena.prompt_ids[r->prompt_offset +
+                    (size_t)offset];
+            else if (offset - r->prompt_tokens < r->output_steps)
+                token = g_journal_arena.output_ids[r->output_offset +
+                    (size_t)(offset - r->prompt_tokens)];
+            else
+                token = 106; /* The only synthetic close appended by finish. */
+            if (ids[row] != token) matched = row;
+        }
+        end = r->position_before;
+    }
+    return end == 0 ? matched : 0;
+}
+
+/* Reserve the complete P, not just the candidate suffix: the model may safely
+ * refuse retained rows after START and cold-refill. No new result store. */
+static int journal_input_room(int count, int tokens, int output_limit) {
+    /* decode() uses the startup response buffer even for a smaller request O;
+     * reserve that complete bound rather than assume a per-token byte limit. */
+    size_t response_bound = (size_t)g_output_limit * G4_RESPONSE_TOKEN_BYTES +
+        G4_RESPONSE_OVERHEAD;
+    return count >= 0 && count < G4_JOURNAL_CAPACITY && tokens > 0 &&
+        output_limit > 0 &&
+        g_journal_arena.prompt_used <= g_journal_arena.prompt_capacity &&
+        g_journal_arena.output_used <= g_journal_arena.output_capacity &&
+        g_journal_arena.response_used <= g_journal_arena.response_capacity &&
+        (size_t)tokens <=
+            g_journal_arena.prompt_capacity - g_journal_arena.prompt_used &&
+        (size_t)output_limit <=
+            g_journal_arena.output_capacity - g_journal_arena.output_used &&
+        response_bound <=
+            g_journal_arena.response_capacity - g_journal_arena.response_used;
 }
 
 static int parse_epoch(const char *value, unsigned long long *out) {
@@ -600,6 +678,31 @@ static int prefill_ordinary_measured(SaltGemma4Text *model,
     return rc;
 }
 
+/* Full-input reuse can leave a singleton suffix (or singleton final chunk).
+ * Use the existing known-token executor for that row; batch-only phase
+ * realizations need not admit B1. Ordinary V3/V4 PREFILL remains unchanged. */
+static int prefill_input_measured(SaltGemma4Text *model,
+                                  const int *tokens, int token_count,
+                                  float *logits) {
+    int capacity = salt_gemma4_text_prefill_chunk_capacity(model);
+    int bulk, rc = 0;
+    uint64_t start, end;
+    if (capacity < 1 || token_count < 1) return -1;
+    if (capacity > 1 && token_count % capacity != 1)
+        return prefill_ordinary_measured(model, tokens, token_count, logits);
+    bulk = capacity > 1 ? token_count - 1 : 0;
+    if (bulk && prefill_ordinary_measured(model, tokens, bulk, logits) != 0)
+        return -1;
+    start = monotonic_ns();
+    for (int row = bulk; row < token_count; row++) {
+        rc = salt_gemma4_text_consume_known(model, tokens[row], logits);
+        if (rc != 0) break;
+    }
+    end = monotonic_ns();
+    if (start && end >= start) g_dpr_waterfall.prefill_ordinary_ns += end - start;
+    return rc;
+}
+
 static int prefill_parent_dpr(
         SaltGemma4Text *model, const int *tokens, int token_count,
         float *logits, const SaltDprStore *store,
@@ -863,9 +966,12 @@ static int parse_turn_header(
         uint32_t *sampler_abi,
         uint32_t *temperature_bits,
         uint64_t *sampler_seed,
-        uint32_t *sampler_top_k) {
+        uint32_t *sampler_top_k,
+        int *tool_mode, int *input_mode) {
     unsigned long long raw_position, raw_prompt, raw_image;
     unsigned long long raw_output, raw_proof, raw_seed;
+    unsigned long long raw_tool_mode = 0;
+    unsigned long long raw_input_mode = 0;
     unsigned int raw_sampler, raw_temperature, raw_top_k;
     float temperature;
     char extra;
@@ -875,36 +981,124 @@ static int parse_turn_header(
         !history_turns || !position || !client_request_sha256 ||
         !request_sha256 || !prompt_bytes || !image_path_bytes ||
         !output_limit || !proof_state || !sampler_abi ||
-        !temperature_bits || !sampler_seed || !sampler_top_k)
+        !temperature_bits || !sampler_seed || !sampler_top_k || !tool_mode ||
+        !input_mode)
         return -1;
-    if (sscanf(line,
-            "SALT_GEMMA4_TURN_V3 request=%llu session_epoch=%llu "
-            "turn_id=%llu history_turns=%llu position=%llu "
-            "prompt_bytes=%llu image_path_bytes=%llu "
-            "output_limit=%llu proof_state=%llu sampler_abi=%u "
-            "temperature_bits=%8x seed=%llu top_k=%u "
-            "client_request_sha256=%64s request_sha256=%64s %c",
-            request_id, session_epoch, turn_id, history_turns,
-            &raw_position, &raw_prompt, &raw_image, &raw_output, &raw_proof,
-            &raw_sampler, &raw_temperature, &raw_seed, &raw_top_k,
-            client_request_sha256, request_sha256, &extra) != 15)
-        return -1;
-    n = snprintf(canonical, sizeof canonical,
-            "SALT_GEMMA4_TURN_V3 request=%llu session_epoch=%llu "
-            "turn_id=%llu history_turns=%llu position=%llu "
-            "prompt_bytes=%llu image_path_bytes=%llu "
-            "output_limit=%llu proof_state=%llu sampler_abi=%u "
-            "temperature_bits=%08x seed=%llu top_k=%u "
-            "client_request_sha256=%s request_sha256=%s\n",
-            *request_id, *session_epoch, *turn_id, *history_turns,
-            raw_position, raw_prompt, raw_image, raw_output, raw_proof,
-            raw_sampler, raw_temperature, raw_seed, raw_top_k,
-            client_request_sha256, request_sha256);
+    if (!strncmp(line, "SALT_GEMMA4_TURN_V5 ",
+                 sizeof "SALT_GEMMA4_TURN_V5 " - 1u)) {
+        if (sscanf(line,
+                "SALT_GEMMA4_TURN_V5 request=%llu session_epoch=%llu "
+                "turn_id=%llu history_turns=%llu position=%llu "
+                "prompt_bytes=%llu image_path_bytes=%llu "
+                "output_limit=%llu proof_state=%llu sampler_abi=%u "
+                "temperature_bits=%8x seed=%llu top_k=%u "
+                "tool_mode=%llu input_mode=%llu "
+                "client_request_sha256=%64s request_sha256=%64s %c",
+                request_id, session_epoch, turn_id, history_turns,
+                &raw_position, &raw_prompt, &raw_image, &raw_output, &raw_proof,
+                &raw_sampler, &raw_temperature, &raw_seed, &raw_top_k,
+                &raw_tool_mode, &raw_input_mode, client_request_sha256,
+                request_sha256, &extra) == 17) {
+            n = snprintf(canonical, sizeof canonical,
+                "SALT_GEMMA4_TURN_V5 request=%llu session_epoch=%llu "
+                "turn_id=%llu history_turns=%llu position=%llu "
+                "prompt_bytes=%llu image_path_bytes=%llu "
+                "output_limit=%llu proof_state=%llu sampler_abi=%u "
+                "temperature_bits=%08x seed=%llu top_k=%u "
+                "tool_mode=%llu input_mode=%llu "
+                "client_request_sha256=%s request_sha256=%s\n",
+                *request_id, *session_epoch, *turn_id, *history_turns,
+                raw_position, raw_prompt, raw_image, raw_output, raw_proof,
+                raw_sampler, raw_temperature, raw_seed, raw_top_k,
+                raw_tool_mode, raw_input_mode,
+                client_request_sha256, request_sha256);
+        } else {
+            /* V5 without sampler fields selects request-local greedy. */
+            raw_sampler = G4_SAMPLER_GREEDY_V1;
+            raw_temperature = 0u; raw_seed = 0u; raw_top_k = 1u;
+            if (sscanf(line,
+                "SALT_GEMMA4_TURN_V5 request=%llu session_epoch=%llu "
+                "turn_id=%llu history_turns=%llu position=%llu "
+                "prompt_bytes=%llu image_path_bytes=%llu "
+                "output_limit=%llu proof_state=%llu "
+                "tool_mode=%llu input_mode=%llu "
+                "client_request_sha256=%64s request_sha256=%64s %c",
+                request_id, session_epoch, turn_id, history_turns,
+                &raw_position, &raw_prompt, &raw_image, &raw_output, &raw_proof,
+                &raw_tool_mode, &raw_input_mode, client_request_sha256,
+                request_sha256, &extra) != 13)
+                return -1;
+            n = snprintf(canonical, sizeof canonical,
+                "SALT_GEMMA4_TURN_V5 request=%llu session_epoch=%llu "
+                "turn_id=%llu history_turns=%llu position=%llu "
+                "prompt_bytes=%llu image_path_bytes=%llu "
+                "output_limit=%llu proof_state=%llu "
+                "tool_mode=%llu input_mode=%llu "
+                "client_request_sha256=%s request_sha256=%s\n",
+                *request_id, *session_epoch, *turn_id, *history_turns,
+                raw_position, raw_prompt, raw_image, raw_output, raw_proof,
+                raw_tool_mode, raw_input_mode,
+                client_request_sha256, request_sha256);
+        }
+        if (raw_input_mode != 1u) return -1;
+    } else if (!strncmp(line, "SALT_GEMMA4_TURN_V4 ",
+                 sizeof "SALT_GEMMA4_TURN_V4 " - 1u)) {
+        if (sscanf(line,
+                "SALT_GEMMA4_TURN_V4 request=%llu session_epoch=%llu "
+                "turn_id=%llu history_turns=%llu position=%llu "
+                "prompt_bytes=%llu image_path_bytes=%llu "
+                "output_limit=%llu proof_state=%llu sampler_abi=%u "
+                "temperature_bits=%8x seed=%llu top_k=%u tool_mode=%llu "
+                "client_request_sha256=%64s request_sha256=%64s %c",
+                request_id, session_epoch, turn_id, history_turns,
+                &raw_position, &raw_prompt, &raw_image, &raw_output, &raw_proof,
+                &raw_sampler, &raw_temperature, &raw_seed, &raw_top_k,
+                &raw_tool_mode, client_request_sha256, request_sha256,
+                &extra) != 16)
+            return -1;
+        n = snprintf(canonical, sizeof canonical,
+                "SALT_GEMMA4_TURN_V4 request=%llu session_epoch=%llu "
+                "turn_id=%llu history_turns=%llu position=%llu "
+                "prompt_bytes=%llu image_path_bytes=%llu "
+                "output_limit=%llu proof_state=%llu sampler_abi=%u "
+                "temperature_bits=%08x seed=%llu top_k=%u tool_mode=%llu "
+                "client_request_sha256=%s request_sha256=%s\n",
+                *request_id, *session_epoch, *turn_id, *history_turns,
+                raw_position, raw_prompt, raw_image, raw_output, raw_proof,
+                raw_sampler, raw_temperature, raw_seed, raw_top_k,
+                raw_tool_mode, client_request_sha256, request_sha256);
+    } else {
+        /* Keep the legacy V3 wire format and default close policy unchanged. */
+        if (sscanf(line,
+                "SALT_GEMMA4_TURN_V3 request=%llu session_epoch=%llu "
+                "turn_id=%llu history_turns=%llu position=%llu "
+                "prompt_bytes=%llu image_path_bytes=%llu "
+                "output_limit=%llu proof_state=%llu sampler_abi=%u "
+                "temperature_bits=%8x seed=%llu top_k=%u "
+                "client_request_sha256=%64s request_sha256=%64s %c",
+                request_id, session_epoch, turn_id, history_turns,
+                &raw_position, &raw_prompt, &raw_image, &raw_output, &raw_proof,
+                &raw_sampler, &raw_temperature, &raw_seed, &raw_top_k,
+                client_request_sha256, request_sha256, &extra) != 15)
+            return -1;
+        n = snprintf(canonical, sizeof canonical,
+                "SALT_GEMMA4_TURN_V3 request=%llu session_epoch=%llu "
+                "turn_id=%llu history_turns=%llu position=%llu "
+                "prompt_bytes=%llu image_path_bytes=%llu "
+                "output_limit=%llu proof_state=%llu sampler_abi=%u "
+                "temperature_bits=%08x seed=%llu top_k=%u "
+                "client_request_sha256=%s request_sha256=%s\n",
+                *request_id, *session_epoch, *turn_id, *history_turns,
+                raw_position, raw_prompt, raw_image, raw_output, raw_proof,
+                raw_sampler, raw_temperature, raw_seed, raw_top_k,
+                client_request_sha256, request_sha256);
+    }
     memcpy(&temperature, &raw_temperature, sizeof temperature);
     if (n < 0 || (size_t)n >= sizeof canonical || strcmp(line, canonical) ||
         raw_position > INT_MAX || raw_prompt > G4_MAX_PROMPT_BYTES ||
         raw_image > G4_MAX_IMAGE_PATH || raw_output < 1 ||
         raw_output > (unsigned long long)g_output_limit || raw_proof > 1 ||
+        raw_tool_mode > 1 ||
         !is_sha256_hex(client_request_sha256) ||
         !is_sha256_hex(request_sha256) ||
         !((raw_sampler == G4_SAMPLER_GREEDY_V1 &&
@@ -923,6 +1117,8 @@ static int parse_turn_header(
     *temperature_bits = (uint32_t)raw_temperature;
     *sampler_seed = (uint64_t)raw_seed;
     *sampler_top_k = (uint32_t)raw_top_k;
+    *tool_mode = (int)raw_tool_mode;
+    *input_mode = (int)raw_input_mode;
     return 0;
 }
 static int parse_replay_header(
@@ -1813,6 +2009,10 @@ static int serve_loop(SaltGemma4Text *text_model,
         int position_after, synthetic_close = 0;
         int request_output_limit = g_output_limit;
         int request_proof_state = 0;
+        int request_tool_mode = 0;
+        int request_input_mode = 0;
+        int input_prefix = 0, recycle_journal = 0;
+        int prefill_count = 0;
         uint32_t request_sampler_abi = G4_SAMPLER_GREEDY_V1;
         uint32_t request_temperature_bits = 0;
         uint64_t request_sampler_seed = 0;
@@ -2118,9 +2318,10 @@ static int serve_loop(SaltGemma4Text *text_model,
                 &prompt_bytes, &image_path_bytes, &request_output_limit,
                 &request_proof_state, &request_sampler_abi,
                 &request_temperature_bits, &request_sampler_seed,
-                &request_sampler_top_k) != 0 ||
+                &request_sampler_top_k, &request_tool_mode,
+                &request_input_mode) != 0 ||
             request_id != expected_request || prompt_bytes < 1) {
-            fputs("gemma4 persistent server: malformed TURN_V3 header\n", stderr);
+            fputs("gemma4 persistent server: malformed TURN_V3/V4/V5 header\n", stderr);
             goto done;
         }
         g_proof_state = g_process_proof_state || request_proof_state;
@@ -2167,7 +2368,7 @@ static int serve_loop(SaltGemma4Text *text_model,
                 goto done;
             continue;
         }
-        if (journal_count >= G4_JOURNAL_CAPACITY) {
+        if (!request_input_mode && journal_count >= G4_JOURNAL_CAPACITY) {
             if (emit_reject(request_id, "journal_full",
                     "native result journal is full") != 0)
                 goto done;
@@ -2182,7 +2383,17 @@ static int serve_loop(SaltGemma4Text *text_model,
                 goto done;
             continue;
         }
-        if (image_path_bytes && position_before != 0) {
+        if (request_input_mode &&
+            (memchr(prompt, 0, prompt_bytes) ||
+             g_dpr_mode != SALT_DPR_OFF ||
+             g_dpr_attention_enabled || g_mindset_end != 0 ||
+             salt_gemma4_text_shared_position(text_model) != 0)) {
+            if (emit_reject(request_id, "input_mode_unsupported",
+                    "full input requires NUL-free text, DPR off and no protected/shared prefix") != 0)
+                goto done;
+            continue;
+        }
+        if (image_path_bytes && !request_input_mode && position_before != 0) {
             if (emit_reject(request_id, "image_position",
                     "images are supported only on the first persistent turn") != 0)
                 goto done;
@@ -2191,13 +2402,26 @@ static int serve_loop(SaltGemma4Text *text_model,
         prompt_count = salt_gemma4_text_encode(
             text_model, prompt, prompt_ids, g_context);
         if (prompt_count < 1 ||
-            position_before + prompt_count + request_output_limit + 1 >
-                g_context) {
+            (int64_t)(request_input_mode ? 0 : position_before) +
+                prompt_count + request_output_limit + 1 > g_context) {
             if (emit_reject(request_id, "context_limit",
                     "persistent session configured context/output limit exceeded; "
                     "factual clear or reset required") != 0)
                 goto done;
             continue;
+        }
+        prefill_count = prompt_count;
+        if (request_input_mode) {
+            /* Placeholder IDs never authenticate image-conditioned KV. Image
+             * inputs always cold-refill; the journal walk also rejects a text
+             * prefix whose current path includes an image-bearing record. */
+            input_prefix = image_path_bytes ? 0 :
+                journal_input_prefix(journal, journal_count,
+                    position_before, prompt_ids, prompt_count);
+            recycle_journal = !journal_input_room(journal_count,
+                prompt_count, request_output_limit);
+            /* Dropping provenance requires a new complete cold root record. */
+            if (recycle_journal) input_prefix = 0;
         }
         if (image_path_bytes && prompt_count >
                 salt_gemma4_text_prefill_chunk_capacity(text_model)) {
@@ -2262,43 +2486,57 @@ static int serve_loop(SaltGemma4Text *text_model,
             image_tokens = actual_features;
             salt_gemma4_free_patches(patches, positions, padding);
             patches = NULL; positions = NULL; padding = NULL;
-            if (emit_start(request_id, turn_id, position_before,
-                           prompt_count, image_tokens,
-                           request_output_limit) != 0)
-                goto done;
-            started = 1;
-            if (g_dpr_attention_enabled &&
-                salt_gemma4_text_route_observer_begin(
-                    text_model, &hot_route_observer) != 0) {
-                emit_fatal(request_id, "hot_route",
-                           "route observer admission failed");
+        }
+        /* Image preparation/placeholder equality and all admission remain
+         * read-only with respect to live text KV. START reports old T and full
+         * P; both modalities change position only beyond this boundary. */
+        if (emit_start(request_id, turn_id, position_before,
+                       prompt_count, image_tokens, request_output_limit) != 0)
+            goto done;
+        started = 1;
+        if (request_input_mode) {
+            int retained = salt_gemma4_text_reuse_prefix(text_model,
+                input_prefix);
+            if (retained < 0 || retained > input_prefix ||
+                salt_gemma4_text_position(text_model) != retained) {
+                emit_fatal(request_id, "input_prefix",
+                           "full-input retained position update failed");
                 goto done;
             }
-            hot_route_observer_active = g_dpr_attention_enabled;
+            input_prefix = retained;
+            position_before = retained;
+            prefill_count = prompt_count - retained;
+            if (recycle_journal) {
+                /* Retire results only beyond START. Payload bytes remain
+                 * in the same bounded seats and are overwritten on commit. */
+                journal_count = 0;
+                g_journal_arena.prompt_used = 0;
+                g_journal_arena.output_used = 0;
+                g_journal_arena.response_used = 0;
+            }
+        }
+        if (g_dpr_attention_enabled &&
+            salt_gemma4_text_route_observer_begin(
+                text_model, &hot_route_observer) != 0) {
+            emit_fatal(request_id, "hot_route",
+                       "route observer admission failed");
+            goto done;
+        }
+        hot_route_observer_active = g_dpr_attention_enabled;
+        if (image_path_bytes) {
             if (salt_gemma4_text_prefill_image(
                     text_model, prompt_ids, mm_types, prompt_count,
-                    features, actual_features, logits) != 0) {
+                    features, image_tokens, logits) != 0) {
                 emit_fatal(request_id, "image_prefill",
                            "image text-state prefill failed");
                 goto done;
             }
             free(features); features = NULL;
         } else {
-            if (emit_start(request_id, turn_id, position_before,
-                           prompt_count, 0, request_output_limit) != 0)
-                goto done;
-            started = 1;
-            if (g_dpr_attention_enabled &&
-                salt_gemma4_text_route_observer_begin(
-                    text_model, &hot_route_observer) != 0) {
-                emit_fatal(request_id, "hot_route",
-                           "route observer admission failed");
-                goto done;
-            }
-            hot_route_observer_active = g_dpr_attention_enabled;
             if ((g_dpr_mode == SALT_DPR_OFF &&
-                 prefill_ordinary_measured(
-                    text_model, prompt_ids, prompt_count, logits) != 0) ||
+                 (request_input_mode ? prefill_input_measured : prefill_ordinary_measured)(
+                    text_model, prompt_ids + input_prefix,
+                    prefill_count, logits) != 0) ||
                 (g_dpr_mode != SALT_DPR_OFF &&
                  prefill_parent_dpr(
                     text_model, prompt_ids, prompt_count, logits,
@@ -2340,8 +2578,8 @@ static int serve_loop(SaltGemma4Text *text_model,
         scheduler.request.output_ids = (int32_t *)output_ids;
         scheduler.request.output_limit = (uint32_t)request_output_limit;
         scheduler.request.close_token = 106;
-        /* Parent cache route: this turn's committed prompt tokens precede the
-         * outputs. Borrowed view; the engine copies nothing. */
+        /* Parent proposal route sees the entire supplied input, even when its
+         * physical PREFILL reused rows. Borrowed view; no history copy. */
         scheduler.request.history_ids = (const int32_t *)prompt_ids;
         scheduler.request.history_count = (uint32_t)prompt_count;
         if (salt_text_scheduler_run(scheduler.controller, &scheduler.request,
@@ -2379,6 +2617,12 @@ static int serve_loop(SaltGemma4Text *text_model,
             emit_fatal(request_id, "final_decode", "final decode failed");
             goto done;
         }
+        /* The existing finish consumes the pending stop token and appends a
+         * close only when it differs. An opted-in tool yield commits 50 without
+         * closing the assistant turn with 106. All other stops/caps keep 106;
+         * the next TURN supplies the tool-result suffix through normal PREFILL. */
+        if (request_tool_mode == 1 && stop_token == 50)
+            scheduler.request.close_token = 50;
         if (salt_text_scheduler_finish(scheduler.controller, &scheduler.request,
                 &scheduler.result) != 0) {
             emit_fatal(request_id,
@@ -2428,13 +2672,19 @@ static int serve_loop(SaltGemma4Text *text_model,
             }
         }
         position_after = salt_gemma4_text_position(text_model);
+        if (request_input_mode &&
+            (int64_t)prompt_count + output_count + synthetic_close != position_after) {
+            emit_fatal(request_id, "input_commit",
+                       "full-input committed position mismatch");
+            goto done;
+        }
         turn_id++;
         history_turns++;
         if (fill_record(text_model, &journal[journal_count],
                 request_id, turn_id, history_turns,
                 client_request_sha256, request_sha256,
                 mindset_sha256,
-                prompt_ids, prompt_count, image_tokens, output_ids,
+                prompt_ids + input_prefix, prefill_count, image_tokens, output_ids,
                 request_output_limit, output_count,
                 stop_token, synthetic_close, position_before, position_after,
                 response, response_bytes) != 0) {
