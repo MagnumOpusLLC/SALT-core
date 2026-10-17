@@ -135,8 +135,11 @@ void salt_q4_decode(const uint32_t *vals, const uint16_t *scales,
 
 /* y[r] = sum_c W[r,c] * x[c]; W is MLX 4-bit packed. */
 int salt_q4_matvec_status(const uint32_t *vals, const uint16_t *scales,
-                          const uint16_t *biases, int R, int C,
-                          const float *x, float *y);
+                           const uint16_t *biases, int R, int C,
+                           const float *x, float *y);
+int salt_q4_matvec_rows_status(const uint32_t *vals, const uint16_t *scales,
+                               const uint16_t *biases, int R, int C,
+                               const float *x, float *y, int r0, int r1);
 void salt_q4_matvec(const uint32_t *vals, const uint16_t *scales,
                       const uint16_t *biases, int R, int C,
                       const float *x, float *y);

@@ -153,7 +153,13 @@ const uint8_t *salt_pool_expert_ptr(const SaltExpertPool *pool,
 /* trunk: packed dense layers, pinned prefix + ring, prefetch         */
 /* ------------------------------------------------------------------ */
 
-typedef struct SaltTrunkLayer { int64_t off, nbytes; } SaltTrunkLayer;
+typedef struct SaltTrunkLayer {
+    int64_t off, nbytes;
+    /* Optional retained canonical view, created at trunk startup. This is
+     * physical mapping metadata in the existing layer index, not a payload. */
+    uint8_t *retained_map_base;
+    size_t retained_map_nbytes, retained_data_offset;
+} SaltTrunkLayer;
 
 typedef struct SaltTrunk {
     int             fd;
@@ -170,7 +176,7 @@ typedef struct SaltTrunk {
     size_t          map_nbytes;
     size_t          map_data_offset;
 
-    int             npin;        /* first npin layers resident */
+    int             npin;        /* retained prefix: copied or mapped */
     uint8_t        *pin;         /* pin arena, layers back to back */
     int64_t        *pin_off;     /* [npin] offsets within pin arena */
 
@@ -200,6 +206,14 @@ void salt_trunk_plan(SaltTrunk *tr, int64_t budget, int *npin_out,
 int  salt_trunk_start(SaltTrunk *tr, int npin, int64_t slot, int nring);
 /* Start bounded canonical-source mode instead of allocating pin/ring copies. */
 int  salt_trunk_start_mapped(SaltTrunk *tr);
+/* Plan page-rounded retained views plus one active non-retained view.
+ * requested_pin=-1 chooses the largest fitting prefix; no payload is read. */
+int salt_trunk_plan_mapped(const SaltTrunk *tr, int64_t budget,
+                           int requested_pin, int *npin_out,
+                           int64_t *retained_bytes, int64_t *working_bytes);
+/* Retain the admitted prefix as canonical file views, not copied buffers.
+ * The existing single-active-consumer bind/unbind contract still applies. */
+int salt_trunk_start_mapped_retained(SaltTrunk *tr, int npin, int64_t budget);
 void salt_trunk_rewind(SaltTrunk *tr);
 /* Bind layer L: pinned -> resident pointer; streamed -> waits for the
  * reader, returns the ring slot. Blocks. */
@@ -397,6 +411,11 @@ int salt_mmap_dontneed_contained(const void *pointer, size_t bytes,
  * contained by the canonical mapped range. This creates no mapping or payload. */
 int salt_mmap_willneed_contained(const void *pointer, size_t bytes,
                                  size_t *advised_bytes);
+/* Complete the existing read-only mapped-page preparation walk. The caller
+ * owns a readable canonical byte range and retains its lease through every
+ * consumer. No allocation, copy, registration, pinning, or proof-mode branch.
+ * Success prepares pages now; it does not prevent later OS eviction. */
+int salt_mmap_prepare_read(const void *pointer, size_t bytes);
 /* Issue bounded asynchronous read-ahead for an existing canonical file range.
  * No mapping, allocation, payload copy, or residency claim is created. */
 int salt_file_willneed(int fd, int64_t offset, size_t bytes);

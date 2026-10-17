@@ -136,6 +136,12 @@ static void scalar_decode(const uint8_t *vals, const uint8_t *scales,
  * scope: used by BOTH the NEON and AVX2 matvec paths. */
 #define SALT_MLX4_GROUP_LOCAL 64
 
+static void q4_group_values(const uint16_t *scales,
+        const uint16_t *biases, size_t group, float *scale, float *bias) {
+    *scale = bf16_f(load_u16_unaligned(scales, group));
+    *bias = biases ? bf16_f(load_u16_unaligned(biases, group)) : 0.0f;
+}
+
 /* ------------------------------------------------------------------ */
 /* NEON (aarch64)                                                      */
 /* ------------------------------------------------------------------ */
@@ -246,20 +252,20 @@ void salt_simd_q4_matvec(const uint32_t *vals, const uint16_t *scales,
                            const uint16_t *biases, int R, int C,
                            const float *x, float *y, int r0, int r1) {
     /* MLX 4-bit: U32 packs 8 nibbles (low first); BF16 scale+bias per
-     * SALT_MLX4_GROUP (64) elements. Vector math per 8-element word:
-     * extract nibbles -> widen -> float, q*s+b, FMA with x. C%8==0
-     * and groups aligned to words (64 % 8 == 0). The fixed group scratch
-     * covers qualified rows through the Gemma 4 full-attention C=8192 O
-     * projection; the format-aware caller keeps wider rows scalar. */
+     * 64 elements. Rows through the fixed scratch bound hoist every group;
+     * wider rows stream the same group values while retaining the canonical
+     * 32-accumulator arithmetic order. */
     if (r0 < 0) r0 = 0;
     if (r1 > R) r1 = R;
     float srow[SALT_SIMD_Q4_MAX_GROUPS_PER_ROW];
     float brow[SALT_SIMD_Q4_MAX_GROUPS_PER_ROW];
     float32x4_t acc[8];
+    const int ng =
+        (C + SALT_MLX4_GROUP_LOCAL - 1) / SALT_MLX4_GROUP_LOCAL;
+    const int wide = ng > SALT_SIMD_Q4_MAX_GROUPS_PER_ROW;
     for (int r = r0; r < r1; r++) {
         const uint32_t *vr = vals + (size_t)r * (C / 8);
-        int ng = (C + SALT_MLX4_GROUP_LOCAL - 1) / SALT_MLX4_GROUP_LOCAL;
-        for (int g = 0; g < ng; g++) {
+        if (!wide) for (int g = 0; g < ng; g++) {
             /* true absolute group: (r*C + g*64)/64. This is r*ng+g
              * ONLY when C%64==0 -- the general formula is needed for
              * fixture shapes like C=200 (test 13). */
@@ -286,8 +292,18 @@ void salt_simd_q4_matvec(const uint32_t *vals, const uint16_t *scales,
         if (g_dw >= 32) {
         for (; c + 31 < C; c += 32, w += 4) {
             int g = c / SALT_MLX4_GROUP_LOCAL;
-            float32x4_t sv = vld1q_dup_f32(&srow[g]);
-            float32x4_t bv = vld1q_dup_f32(&brow[g]);
+            float sf, bf;
+            if (wide) {
+                size_t absg = ((size_t)r * C +
+                    (size_t)g * SALT_MLX4_GROUP_LOCAL) /
+                    SALT_MLX4_GROUP_LOCAL;
+                q4_group_values(scales, biases, absg, &sf, &bf);
+            } else {
+                sf = srow[g];
+                bf = brow[g];
+            }
+            float32x4_t sv = vdupq_n_f32(sf);
+            float32x4_t bv = vdupq_n_f32(bf);
             uint8x16_t packed =
                 vreinterpretq_u8_u32(vld1q_u32(&vr[w]));
             uint8x16_t lo = vandq_u8(packed, vdupq_n_u8(0x0F));
@@ -305,29 +321,61 @@ void salt_simd_q4_matvec(const uint32_t *vals, const uint16_t *scales,
             uint32x4_t q21 = vmovl_u16(vget_high_u16(vmovl_u8(n2)));
             uint32x4_t q30 = vmovl_u16(vget_low_u16(vmovl_u8(n3)));
             uint32x4_t q31 = vmovl_u16(vget_high_u16(vmovl_u8(n3)));
-            float32x4_t d0 = vmlaq_f32(bv, vcvtq_f32_u32(q00), sv);
-            float32x4_t d1 = vmlaq_f32(bv, vcvtq_f32_u32(q01), sv);
-            float32x4_t d2 = vmlaq_f32(bv, vcvtq_f32_u32(q10), sv);
-            float32x4_t d3 = vmlaq_f32(bv, vcvtq_f32_u32(q11), sv);
-            float32x4_t d4 = vmlaq_f32(bv, vcvtq_f32_u32(q20), sv);
-            float32x4_t d5 = vmlaq_f32(bv, vcvtq_f32_u32(q21), sv);
-            float32x4_t d6 = vmlaq_f32(bv, vcvtq_f32_u32(q30), sv);
-            float32x4_t d7 = vmlaq_f32(bv, vcvtq_f32_u32(q31), sv);
+            float32x4_t d0, d1, d2, d3, d4, d5, d6, d7;
+            if (wide) {
+                d0 = vaddq_f32(vmulq_f32(vcvtq_f32_u32(q00), sv), bv);
+                d1 = vaddq_f32(vmulq_f32(vcvtq_f32_u32(q01), sv), bv);
+                d2 = vaddq_f32(vmulq_f32(vcvtq_f32_u32(q10), sv), bv);
+                d3 = vaddq_f32(vmulq_f32(vcvtq_f32_u32(q11), sv), bv);
+                d4 = vaddq_f32(vmulq_f32(vcvtq_f32_u32(q20), sv), bv);
+                d5 = vaddq_f32(vmulq_f32(vcvtq_f32_u32(q21), sv), bv);
+                d6 = vaddq_f32(vmulq_f32(vcvtq_f32_u32(q30), sv), bv);
+                d7 = vaddq_f32(vmulq_f32(vcvtq_f32_u32(q31), sv), bv);
+            } else {
+                d0 = vmlaq_f32(bv, vcvtq_f32_u32(q00), sv);
+                d1 = vmlaq_f32(bv, vcvtq_f32_u32(q01), sv);
+                d2 = vmlaq_f32(bv, vcvtq_f32_u32(q10), sv);
+                d3 = vmlaq_f32(bv, vcvtq_f32_u32(q11), sv);
+                d4 = vmlaq_f32(bv, vcvtq_f32_u32(q20), sv);
+                d5 = vmlaq_f32(bv, vcvtq_f32_u32(q21), sv);
+                d6 = vmlaq_f32(bv, vcvtq_f32_u32(q30), sv);
+                d7 = vmlaq_f32(bv, vcvtq_f32_u32(q31), sv);
+            }
             int ab = (c >> 2) & 7;   /* 0 for c%32==0 */
-            acc[ab + 0] = vmlaq_f32(acc[ab + 0], d0, vld1q_f32(x + c));
-            acc[ab + 1] = vmlaq_f32(acc[ab + 1], d1, vld1q_f32(x + c + 4));
-            acc[ab + 2] = vmlaq_f32(acc[ab + 2], d2, vld1q_f32(x + c + 8));
-            acc[ab + 3] = vmlaq_f32(acc[ab + 3], d3, vld1q_f32(x + c + 12));
-            acc[ab + 4] = vmlaq_f32(acc[ab + 4], d4, vld1q_f32(x + c + 16));
-            acc[ab + 5] = vmlaq_f32(acc[ab + 5], d5, vld1q_f32(x + c + 20));
-            acc[ab + 6] = vmlaq_f32(acc[ab + 6], d6, vld1q_f32(x + c + 24));
-            acc[ab + 7] = vmlaq_f32(acc[ab + 7], d7, vld1q_f32(x + c + 28));
+#define Q4_ACCUMULATE(LANE, VALUE, OFFSET) do { \
+            float32x4_t q4_x = vld1q_f32(x + c + (OFFSET)); \
+            if (wide) \
+                acc[ab + (LANE)] = vaddq_f32( \
+                    acc[ab + (LANE)], vmulq_f32((VALUE), q4_x)); \
+            else \
+                acc[ab + (LANE)] = vmlaq_f32( \
+                    acc[ab + (LANE)], (VALUE), q4_x); \
+        } while (0)
+            Q4_ACCUMULATE(0, d0, 0);
+            Q4_ACCUMULATE(1, d1, 4);
+            Q4_ACCUMULATE(2, d2, 8);
+            Q4_ACCUMULATE(3, d3, 12);
+            Q4_ACCUMULATE(4, d4, 16);
+            Q4_ACCUMULATE(5, d5, 20);
+            Q4_ACCUMULATE(6, d6, 24);
+            Q4_ACCUMULATE(7, d7, 28);
+#undef Q4_ACCUMULATE
         }
         }
         for (; c + 15 < C; c += 16, w += 2) {
             int g = c / SALT_MLX4_GROUP_LOCAL;
-            float32x4_t sv = vld1q_dup_f32(&srow[g]);
-            float32x4_t bv = vld1q_dup_f32(&brow[g]);
+            float sf, bf;
+            if (wide) {
+                size_t absg = ((size_t)r * C +
+                    (size_t)g * SALT_MLX4_GROUP_LOCAL) /
+                    SALT_MLX4_GROUP_LOCAL;
+                q4_group_values(scales, biases, absg, &sf, &bf);
+            } else {
+                sf = srow[g];
+                bf = brow[g];
+            }
+            float32x4_t sv = vdupq_n_f32(sf);
+            float32x4_t bv = vdupq_n_f32(bf);
             uint32_t u0 = load_u32_unaligned(vr, (size_t)w);
             uint32_t u1 = load_u32_unaligned(vr, (size_t)w + 1);
             uint8x8_t b0 = vreinterpret_u8_u32(vdup_n_u32(u0));
@@ -342,15 +390,33 @@ void salt_simd_q4_matvec(const uint32_t *vals, const uint16_t *scales,
             uint32x4_t q01 = vmovl_u16(vget_high_u16(vmovl_u8(n0)));
             uint32x4_t q10 = vmovl_u16(vget_low_u16(vmovl_u8(n1)));
             uint32x4_t q11 = vmovl_u16(vget_high_u16(vmovl_u8(n1)));
-            float32x4_t d0 = vmlaq_f32(bv, vcvtq_f32_u32(q00), sv);
-            float32x4_t d1 = vmlaq_f32(bv, vcvtq_f32_u32(q01), sv);
-            float32x4_t d2 = vmlaq_f32(bv, vcvtq_f32_u32(q10), sv);
-            float32x4_t d3 = vmlaq_f32(bv, vcvtq_f32_u32(q11), sv);
+            float32x4_t d0, d1, d2, d3;
+            if (wide) {
+                d0 = vaddq_f32(vmulq_f32(vcvtq_f32_u32(q00), sv), bv);
+                d1 = vaddq_f32(vmulq_f32(vcvtq_f32_u32(q01), sv), bv);
+                d2 = vaddq_f32(vmulq_f32(vcvtq_f32_u32(q10), sv), bv);
+                d3 = vaddq_f32(vmulq_f32(vcvtq_f32_u32(q11), sv), bv);
+            } else {
+                d0 = vmlaq_f32(bv, vcvtq_f32_u32(q00), sv);
+                d1 = vmlaq_f32(bv, vcvtq_f32_u32(q01), sv);
+                d2 = vmlaq_f32(bv, vcvtq_f32_u32(q10), sv);
+                d3 = vmlaq_f32(bv, vcvtq_f32_u32(q11), sv);
+            }
             int ab = (c >> 2) & 7;   /* 0 or 4 for c%16==0 */
-            acc[ab + 0] = vmlaq_f32(acc[ab + 0], d0, vld1q_f32(x + c));
-            acc[ab + 1] = vmlaq_f32(acc[ab + 1], d1, vld1q_f32(x + c + 4));
-            acc[ab + 2] = vmlaq_f32(acc[ab + 2], d2, vld1q_f32(x + c + 8));
-            acc[ab + 3] = vmlaq_f32(acc[ab + 3], d3, vld1q_f32(x + c + 12));
+#define Q4_ACCUMULATE4(LANE, VALUE, OFFSET) do { \
+            float32x4_t q4_x = vld1q_f32(x + c + (OFFSET)); \
+            if (wide) \
+                acc[ab + (LANE)] = vaddq_f32( \
+                    acc[ab + (LANE)], vmulq_f32((VALUE), q4_x)); \
+            else \
+                acc[ab + (LANE)] = vmlaq_f32( \
+                    acc[ab + (LANE)], (VALUE), q4_x); \
+        } while (0)
+            Q4_ACCUMULATE4(0, d0, 0);
+            Q4_ACCUMULATE4(1, d1, 4);
+            Q4_ACCUMULATE4(2, d2, 8);
+            Q4_ACCUMULATE4(3, d3, 12);
+#undef Q4_ACCUMULATE4
         }
         /* reduce the accumulators FIRST, then the scalar tail --
          * same summation order as the original pass-1/pass-2 split,
@@ -367,7 +433,17 @@ void salt_simd_q4_matvec(const uint32_t *vals, const uint16_t *scales,
             long wl = (k - (size_t)r * C) >> 3;
             int q = (int)((load_u32_unaligned(vr, (size_t)wl) >>
                            (4 * (k & 7))) & 0xFu);
-            s += ((float)q * srow[gl] + brow[gl]) * x[c];
+            float sf, bf;
+            if (wide) {
+                size_t absg = ((size_t)r * C +
+                    (size_t)gl * SALT_MLX4_GROUP_LOCAL) /
+                    SALT_MLX4_GROUP_LOCAL;
+                q4_group_values(scales, biases, absg, &sf, &bf);
+            } else {
+                sf = srow[gl];
+                bf = brow[gl];
+            }
+            s += ((float)q * sf + bf) * x[c];
         }
         y[r] = s;
     }
@@ -1130,8 +1206,9 @@ SALT_TARGET_AVX2 void salt_simd_q4_matvec(
     if (r0 < 0) r0 = 0;
     if (r1 > R) r1 = R;
     const int ng = (C + SALT_MLX4_GROUP_LOCAL - 1) / SALT_MLX4_GROUP_LOCAL;
+    const int wide = ng > SALT_SIMD_Q4_MAX_GROUPS_PER_ROW;
     int r = r0;
-    if (g_q4_row_pair && (C % SALT_MLX4_GROUP_LOCAL) == 0)
+    if (!wide && g_q4_row_pair && (C % SALT_MLX4_GROUP_LOCAL) == 0)
         for (; r + 1 < r1; r += 2)
             avx2_q4_matvec_rows2(
                 vals, scales, biases, C, x, y, r, ng);
@@ -1140,7 +1217,7 @@ SALT_TARGET_AVX2 void salt_simd_q4_matvec(
         /* scale/bias rows (absolute group index, like kernels.c) */
         float srow[SALT_SIMD_Q4_MAX_GROUPS_PER_ROW];
         float brow[SALT_SIMD_Q4_MAX_GROUPS_PER_ROW];
-        for (int g = 0; g < ng; g++) {
+        if (!wide) for (int g = 0; g < ng; g++) {
             size_t absg = ((size_t)r * C + (size_t)g * SALT_MLX4_GROUP_LOCAL)
                           / SALT_MLX4_GROUP_LOCAL;
             uint32_t sb = (uint32_t)load_u16_unaligned(scales, absg) << 16;
@@ -1161,8 +1238,18 @@ SALT_TARGET_AVX2 void salt_simd_q4_matvec(
         const __m128i sh16 = _mm_setr_epi32(16, 20, 24, 28);
         for (; c + 31 < C; c += 32, w += 4) {
             int g = c / SALT_MLX4_GROUP_LOCAL;
-            __m128 sv = _mm_set1_ps(srow[g]);
-            __m128 bv = _mm_set1_ps(brow[g]);
+            float sf, bf;
+            if (wide) {
+                size_t absg = ((size_t)r * C +
+                    (size_t)g * SALT_MLX4_GROUP_LOCAL) /
+                    SALT_MLX4_GROUP_LOCAL;
+                q4_group_values(scales, biases, absg, &sf, &bf);
+            } else {
+                sf = srow[g];
+                bf = brow[g];
+            }
+            __m128 sv = _mm_set1_ps(sf);
+            __m128 bv = _mm_set1_ps(bf);
             __m128i u0 = _mm_set1_epi32(
                 (int)load_u32_unaligned(vr, (size_t)w));
             __m128i u1 = _mm_set1_epi32(
@@ -1214,8 +1301,18 @@ SALT_TARGET_AVX2 void salt_simd_q4_matvec(
         }
         for (; c + 15 < C; c += 16, w += 2) {
             int g = c / SALT_MLX4_GROUP_LOCAL;
-            __m128 sv = _mm_set1_ps(srow[g]);
-            __m128 bv = _mm_set1_ps(brow[g]);
+            float sf, bf;
+            if (wide) {
+                size_t absg = ((size_t)r * C +
+                    (size_t)g * SALT_MLX4_GROUP_LOCAL) /
+                    SALT_MLX4_GROUP_LOCAL;
+                q4_group_values(scales, biases, absg, &sf, &bf);
+            } else {
+                sf = srow[g];
+                bf = brow[g];
+            }
+            __m128 sv = _mm_set1_ps(sf);
+            __m128 bv = _mm_set1_ps(bf);
             __m128i u0 = _mm_set1_epi32(
                 (int)load_u32_unaligned(vr, (size_t)w));
             __m128i u1 = _mm_set1_epi32(
@@ -1262,7 +1359,17 @@ SALT_TARGET_AVX2 void salt_simd_q4_matvec(
             long wl = (k - (size_t)r * C) >> 3;
             int q = (int)((load_u32_unaligned(vr, (size_t)wl) >>
                            (4 * (k & 7))) & 0xFu);
-            s += ((float)q * srow[gl] + brow[gl]) * x[c];
+            float sf, bf;
+            if (wide) {
+                size_t absg = ((size_t)r * C +
+                    (size_t)gl * SALT_MLX4_GROUP_LOCAL) /
+                    SALT_MLX4_GROUP_LOCAL;
+                q4_group_values(scales, biases, absg, &sf, &bf);
+            } else {
+                sf = srow[gl];
+                bf = brow[gl];
+            }
+            s += ((float)q * sf + bf) * x[c];
         }
         y[r] = s;
     }

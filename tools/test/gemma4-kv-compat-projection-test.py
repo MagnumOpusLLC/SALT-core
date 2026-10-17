@@ -27,7 +27,7 @@ SPEC.loader.exec_module(projection_module)
 
 PRODUCTION_MANIFEST = Path("models/gemma4-26b-a4b/kv-cache-compat.json")
 PRODUCTION_PROJECTION = Path("models/gemma4-26b-a4b/kv-cache-compat-projection.json")
-EXPECTED_PRODUCTION = "36da7910335af449d03531ce73b8d539ba6550633118c26e7b54a015cfc89a98"
+EXPECTED_PRODUCTION = "c0856a91d14325f93c019d84c6f88205c2ffc936dd60ed1dc90fcb138c872b6f"
 BEGIN = b"# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1\n"
 END = b"# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1\n"
 

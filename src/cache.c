@@ -225,10 +225,21 @@ static int quota_plan_init(SaltCache *c) {
     return 0;
 }
 
-/* Frequency first, LRU second, slot index last: deterministic and cheap.
- * LOADING and pinned slots are never victims. */
+/* Logical demand first, slot frequency second, LRU third, slot index last.
+ * Demand survives physical-slot eviction and lets the fixed ledger converge
+ * on hot (layer, expert) resources. LOADING and pinned slots are never
+ * victims. */
 static int better_victim(const SaltCache *c, int slot, int best) {
     if (best < 0) return 1;
+    int slot_layer = key_layer(c->key[slot]);
+    int slot_expert = key_expert(c->key[slot]);
+    int best_layer = key_layer(c->key[best]);
+    int best_expert = key_expert(c->key[best]);
+    uint64_t slot_demand =
+        c->demand[resident_index(c, slot_layer, slot_expert)];
+    uint64_t best_demand =
+        c->demand[resident_index(c, best_layer, best_expert)];
+    if (slot_demand != best_demand) return slot_demand < best_demand;
     if (c->hits[slot] != c->hits[best])
         return c->hits[slot] < c->hits[best];
     if (c->used_at[slot] != c->used_at[best])
@@ -537,6 +548,14 @@ static int64_t touch_mapped_prefix(const uint8_t *payload, int64_t bytes) {
     for (int64_t i = 0; i < bytes; i += 4096) (void)p8[i];
     (void)p8[bytes - 1];
     return bytes;
+}
+
+int salt_mmap_prepare_read(const void *pointer, size_t bytes) {
+    /* Bound the original helper's final stride as well as the byte span. */
+    if (!pointer || !bytes || (uint64_t)bytes > (uint64_t)INT64_MAX - 4095u ||
+        bytes > UINTPTR_MAX - (uintptr_t)pointer) return -1;
+    return touch_mapped_prefix((const uint8_t *)pointer, (int64_t)bytes) ==
+        (int64_t)bytes ? 0 : -1;
 }
 
 static void perform_fetch(FetchJob *j) {

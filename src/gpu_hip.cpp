@@ -147,6 +147,8 @@ typedef struct HipTextKvRef {
 typedef struct HipTextLayerRefs {
     HipTextTensorRef q, k, v, o;
     HipTextTensorRef dense_gate, dense_up, dense_down, router;
+    HipTextTensorRef model_input_projection, model_kernel;
+    HipTextTensorRef model_output_projection;
     HipTextTensorRef pre_attention_norm, q_norm, k_norm;
     HipTextTensorRef post_attention_norm;
     HipTextTensorRef pre_ffn_norm_1, pre_ffn_norm_2;
@@ -155,6 +157,29 @@ typedef struct HipTextLayerRefs {
     HipTextTensorRef layer_scalar;
     HipTextKvRef kv;
 } HipTextLayerRefs;
+
+static SaltTextModelGpuTensorView hip_text_model_view(
+        const HipTextTensorRef *ref) {
+    SaltTextModelGpuTensorView view = {};
+    if (!ref) return view;
+    view.resource = (void *)ref->resource;
+    view.value_offset = ref->value_offset;
+    view.scale_offset = ref->scale_offset;
+    view.bias_offset = ref->bias_offset;
+    view.rows = ref->rows;
+    view.cols = ref->cols;
+    view.encoding = (SaltTensorEncoding)ref->encoding;
+    return view;
+}
+
+static SaltTextModelGpuBufferView hip_text_buffer_view(
+        void *resource, uint64_t offset, uint64_t bytes) {
+    SaltTextModelGpuBufferView view = {};
+    view.resource = resource;
+    view.offset = offset;
+    view.bytes = bytes;
+    return view;
+}
 
 typedef struct HipTextCellTemplate {
     const SaltTextExecutionCell *cell;
@@ -191,6 +216,12 @@ typedef struct HipTextProgramState {
     HipTextTensorRef embedding, final_norm, output_head;
     HipTextLayerRefs *layers;
     HipTextTensorRef *expert_refs;
+    const SaltTextModelGpuOps *model_gpu_ops;
+    void *model_gpu_context;
+    void *model_gpu_state;
+    size_t model_gpu_state_bytes;
+    float *attention_score_workspace;
+    size_t attention_score_workspace_floats;
     HipTextCellTemplate *templates;
     hipEvent_t *cell_event_start;
     hipEvent_t *cell_event_end;
@@ -226,6 +257,7 @@ typedef struct HipTextProgramCommand {
     uint32_t source_position;
     uint32_t input_count;
     uint32_t maximum_depth;
+    uint32_t frontier_linear;
     uint32_t attention_score_rows;
     uint32_t next_cell;
     uint32_t encoded_cells;
@@ -1986,15 +2018,28 @@ __global__ static void hip_text_system_fence(void) {
         __threadfence_system();
 }
 
+__device__ static float hip_text_weight(
+        const unsigned char *weight, uint32_t encoding, uint32_t index) {
+    if (!weight) return 0.0f;
+    if (encoding == SALT_TENSOR_ENCODING_F32)
+        return ((const float *)(const void *)weight)[index];
+    if (encoding == SALT_TENSOR_ENCODING_BF16)
+        return hip_bf16(weight + (size_t)index * 2u);
+    return NAN;
+}
+
 __device__ static void hip_text_norm_block(
-        const float *input, const float *weight, float *output,
+        const float *input, const unsigned char *weight,
+        uint32_t weight_encoding, float *output,
         uint32_t width, float epsilon, int with_scale,
         float *inverse, int *status) {
     if (threadIdx.x == 0) {
         float sum = 0.0f;
         for (uint32_t column = 0; column < width; column++) {
             float value = input[column];
-            if (!isfinite(value) || (with_scale && !isfinite(weight[column])))
+            float scale = with_scale
+                ? hip_text_weight(weight, weight_encoding, column) : 1.0f;
+            if (!isfinite(value) || (with_scale && !isfinite(scale)))
                 hip_text_fail(status);
             sum = __fadd_rn(sum, __fmul_rn(value, value));
         }
@@ -2006,7 +2051,9 @@ __device__ static void hip_text_norm_block(
     for (uint32_t column = threadIdx.x; column < width;
          column += blockDim.x) {
         float value = __fmul_rn(input[column], *inverse);
-        if (with_scale) value = __fmul_rn(value, weight[column]);
+        if (with_scale)
+            value = __fmul_rn(value,
+                hip_text_weight(weight, weight_encoding, column));
         output[column] = value;
         if (!isfinite(value)) hip_text_fail(status);
     }
@@ -2014,30 +2061,34 @@ __device__ static void hip_text_norm_block(
 }
 
 __global__ static void hip_text_rmsnorm_rows(
-        const float *input, size_t input_stride, const float *weight,
-        float *output, size_t output_stride, uint32_t rows, uint32_t width,
+        const float *input, size_t input_stride, const unsigned char *weight,
+        uint32_t weight_encoding, float *output, size_t output_stride,
+        uint32_t rows, uint32_t width,
         float epsilon, int with_scale, int *status) {
     uint32_t row = (uint32_t)blockIdx.x;
     __shared__ float inverse;
     if (row >= rows) return;
     hip_text_norm_block(input + (size_t)row * input_stride, weight,
-        output + (size_t)row * output_stride, width, epsilon,
+        weight_encoding, output + (size_t)row * output_stride, width, epsilon,
         with_scale, &inverse, status);
 }
 
 __global__ static void hip_text_rmsnorm_pair_rows(
         const float *input, size_t input_stride,
-        const float *weight0, const float *weight1,
+        const unsigned char *weight0, uint32_t weight0_encoding,
+        const unsigned char *weight1, uint32_t weight1_encoding,
         float *output0, float *output1, size_t output_stride,
         uint32_t rows, uint32_t width, float epsilon, int *status) {
     uint32_t row = (uint32_t)blockIdx.x;
     uint32_t plane = (uint32_t)blockIdx.y;
-    const float *weight = plane == 0u ? weight0 : weight1;
+    const unsigned char *weight = plane == 0u ? weight0 : weight1;
+    uint32_t weight_encoding = plane == 0u
+        ? weight0_encoding : weight1_encoding;
     float *output = plane == 0u ? output0 : output1;
     __shared__ float inverse;
     if (row >= rows || plane >= 2u || !weight || !output) return;
     hip_text_norm_block(input + (size_t)row * input_stride, weight,
-        output + (size_t)row * output_stride, width, epsilon,
+        weight_encoding, output + (size_t)row * output_stride, width, epsilon,
         1, &inverse, status);
 }
 
@@ -2084,9 +2135,10 @@ __global__ static void hip_text_attention_transform(
         const uint32_t *source_position_pointer, const uint32_t *depths,
         uint32_t rows,
         uint32_t query_width, uint32_t kv_width, float epsilon,
-        int shared_kv_projection,
+        int shared_kv_projection, int raw_values,
         float *queries, float *keys, float *values,
-        const float *q_weight, const float *k_weight,
+        const unsigned char *q_weight, uint32_t q_weight_encoding,
+        const unsigned char *k_weight, uint32_t k_weight_encoding,
         float *tentative_keys, float *tentative_values, int *status) {
     uint32_t tasks_per_row = n_heads + 2u * n_kv_heads;
     if (!source_position_pointer || !depths) {
@@ -2099,7 +2151,8 @@ __global__ static void hip_text_attention_transform(
     uint32_t local = task - row_index * tasks_per_row;
     uint32_t kind, head;
     float *row;
-    const float *weight = NULL;
+    const unsigned char *weight = NULL;
+    uint32_t weight_encoding = SALT_TENSOR_ENCODING_F32;
     __shared__ float inverse;
     if (row_index >= rows) return;
     if (local < n_heads) {
@@ -2108,12 +2161,14 @@ __global__ static void hip_text_attention_transform(
         row = queries + (size_t)row_index * query_width +
             (size_t)head * head_dim;
         weight = q_weight;
+        weight_encoding = q_weight_encoding;
     } else if (local < n_heads + n_kv_heads) {
         kind = 1u;
         head = local - n_heads;
         row = keys + (size_t)row_index * kv_width +
             (size_t)head * head_dim;
         weight = k_weight;
+        weight_encoding = k_weight_encoding;
     } else {
         kind = 2u;
         head = local - n_heads - n_kv_heads;
@@ -2126,8 +2181,9 @@ __global__ static void hip_text_attention_transform(
                     (size_t)head * head_dim + column];
     }
     __syncthreads();
-    hip_text_norm_block(row, weight, row, head_dim, epsilon,
-                         kind != 2u, &inverse, status);
+    if (kind != 2u || !raw_values)
+        hip_text_norm_block(row, weight, weight_encoding, row, head_dim,
+                            epsilon, kind != 2u, &inverse, status);
     if (kind != 2u) {
         for (uint32_t column = threadIdx.x; column < head_dim;
              column += blockDim.x)
@@ -2329,23 +2385,38 @@ __global__ static void hip_text_attention_body(
 }
 
 __global__ static void hip_text_residual_postnorm_rows(
-        const float *residual, float *branch, const float *weight,
+        const float *residual, float *branch,
+        const unsigned char *weight, uint32_t weight_encoding,
         float *output, uint32_t rows, uint32_t width, float epsilon,
-        int *status) {
+        int with_norm, int *status) {
     uint32_t row = (uint32_t)blockIdx.x;
     __shared__ float inverse;
     if (row >= rows) return;
     residual += (size_t)row * width;
     branch += (size_t)row * width;
     output += (size_t)row * width;
-    hip_text_norm_block(branch, weight, branch, width, epsilon, 1,
-                         &inverse, status);
+    if (with_norm)
+        hip_text_norm_block(branch, weight, weight_encoding, branch, width,
+                            epsilon, 1, &inverse, status);
     for (uint32_t column = threadIdx.x; column < width;
          column += blockDim.x) {
         float value = __fadd_rn(residual[column], branch[column]);
         output[column] = value;
         if (!isfinite(value)) hip_text_fail(status);
     }
+}
+
+__global__ static void hip_text_ffn_add_rows(
+        const float *residual, const float *dense, const float *routed,
+        float *output, size_t elements, uint32_t mode, int *status) {
+    size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= elements) return;
+    float branch = 0.0f;
+    if (mode & 1u) branch = dense[index];
+    if (mode & 2u) branch = __fadd_rn(branch, routed[index]);
+    float value = __fadd_rn(residual[index], branch);
+    output[index] = value;
+    if (!isfinite(value)) hip_text_fail(status);
 }
 
 __global__ static void hip_text_router_input_rows(
@@ -2633,17 +2704,20 @@ __global__ static void hip_text_parallel_combine_rows(
     scratch_a += (size_t)row * width;
     scratch_b += (size_t)row * width;
     output += (size_t)row * width;
-    hip_text_norm_block(dense, dense_weight, scratch_a, width, epsilon, 1,
-                         &inverse, status);
-    hip_text_norm_block(routed, routed_weight, scratch_b, width, epsilon, 1,
-                         &inverse, status);
+    hip_text_norm_block(dense, (const unsigned char *)dense_weight,
+                         SALT_TENSOR_ENCODING_F32, scratch_a, width,
+                         epsilon, 1, &inverse, status);
+    hip_text_norm_block(routed, (const unsigned char *)routed_weight,
+                         SALT_TENSOR_ENCODING_F32, scratch_b, width,
+                         epsilon, 1, &inverse, status);
     for (uint32_t column = threadIdx.x; column < width;
          column += blockDim.x) {
         scratch_a[column] = __fadd_rn(scratch_a[column], scratch_b[column]);
         if (!isfinite(scratch_a[column])) hip_text_fail(status);
     }
     __syncthreads();
-    hip_text_norm_block(scratch_a, final_weight, scratch_b,
+    hip_text_norm_block(scratch_a, (const unsigned char *)final_weight,
+                         SALT_TENSOR_ENCODING_F32, scratch_b,
                          width, epsilon, 1, &inverse, status);
     for (uint32_t column = threadIdx.x; column < width;
          column += blockDim.x) {
@@ -3496,7 +3570,16 @@ static int hip_residency_permanent_publish(void *context) {
 
 static int hip_component_pool_finalize(void) {
     uint64_t total = 0;
+    int component_resources = 0;
     if (hip_component_pool_finalized) return 0;
+    for (int index = 0; index < HIP_MAX_RESOURCES; index++)
+        if (hip_resources[index].used && hip_resources[index].active &&
+            hip_resources[index].component_pool)
+            component_resources++;
+    if (component_resources == 0) {
+        hip_component_pool_finalized = 1;
+        return 0;
+    }
     if (hip_component_pool_build_regions() != 0) return -1;
     for (int index = 0; index < hip_component_region_count; index++) {
         HipComponentRegion *region = &hip_component_regions[index];
@@ -5232,7 +5315,8 @@ extern "C" int salt_gpu_exact_cells(const SaltGpuExactCell *cells, int count) {
                     cell->n, &views[2]) != 0)
                 return -1;
             hip_text_rmsnorm_rows<<<1, 256>>>(
-                (const float *)views[0], cell->n, (const float *)views[1],
+                (const float *)views[0], cell->n,
+                (const unsigned char *)views[1], SALT_TENSOR_ENCODING_F32,
                 (float *)views[2], cell->n, 1u, cell->n, cell->eps,
                 (int)cell->aux, hip_attention_status);
             break;
@@ -5259,8 +5343,9 @@ extern "C" int salt_gpu_exact_cells(const SaltGpuExactCell *cells, int count) {
                     return -1;
             hip_text_residual_postnorm_rows<<<1, 256>>>(
                 (const float *)views[0], (float *)views[1],
-                (const float *)views[2], (float *)views[3],
-                1u, cell->n, cell->eps, hip_attention_status);
+                (const unsigned char *)views[2], SALT_TENSOR_ENCODING_F32,
+                (float *)views[3], 1u, cell->n, cell->eps, 1,
+                hip_attention_status);
             break;
         case SALT_GPU_EXACT_PARALLEL_COMBINE:
             for (int view = 0; view < 8; view++) {
@@ -6990,7 +7075,7 @@ static int hip_text_patch_selected_tensor(
     if (!program || !tensor || !ref || slot < 0 ||
         slot >= hip_selected_capacity ||
         !(spec = hip_text_resource_spec(program, &tensor->storage)) ||
-        spec->source_class != SALT_TENSOR_SOURCE_SELECTED || !spec->base ||
+        spec->source_class != SALT_TENSOR_SOURCE_SELECTED ||
         tensor->storage.logical_resource_id >=
             (uint64_t)(uint32_t)hip_selected_logical_capacity)
         return -1;
@@ -7027,6 +7112,12 @@ static int hip_text_patch_selected_tensor(
     ref->cols = tensor->cols;
     ref->encoding = (uint32_t)tensor->storage.encoding;
     return 0;
+}
+
+static const unsigned char *hip_text_tensor_bytes(
+        const HipTextTensorRef *ref) {
+    return ref && ref->resource
+        ? ref->resource + ref->value_offset : NULL;
 }
 
 static const float *hip_text_tensor_f32(const HipTextTensorRef *ref) {
@@ -7118,6 +7209,27 @@ static int hip_text_project(
     if (!state || !ref || !ref->resource || !input || !output || batch == 0 ||
         ref->rows == 0 || ref->cols == 0)
         return -1;
+    if (state->model_gpu_ops && state->model_gpu_ops->project) {
+        SaltTextModelGpuProjectArgs args = {};
+        const unsigned char *canonical = state->device_canonical;
+        const unsigned char *input_bytes =
+            (const unsigned char *)(const void *)input;
+        unsigned char *output_bytes = (unsigned char *)(void *)output;
+        if (input_bytes < canonical || output_bytes < canonical ||
+            (size_t)(input_bytes - canonical) > state->canonical_bytes ||
+            (size_t)(output_bytes - canonical) > state->canonical_bytes)
+            return -1;
+        args.backend = SALT_TEXT_MODEL_GPU_HIP;
+        args.command = (void *)state->stream;
+        args.canonical = state->device_canonical;
+        args.canonical_bytes = state->canonical_bytes;
+        args.tensor = hip_text_model_view(ref);
+        args.input_offset = (uint64_t)(input_bytes - canonical);
+        args.output_offset = (uint64_t)(output_bytes - canonical);
+        args.rows = batch;
+        return state->model_gpu_ops->project(state->model_gpu_context, &args,
+            state->model_gpu_state, state->model_gpu_state_bytes);
+    }
     if (ref->encoding == SALT_TENSOR_ENCODING_AFFINE_Q4) {
         if (hip_text_nrow_enabled && batch >= hip_text_nrow_min_b)
             hip_q4_warp_batch<<<ref->rows, 1024, 0, state->stream>>>(
@@ -7161,6 +7273,31 @@ static int hip_text_project(
         return -1;
     }
     return hipGetLastError() == hipSuccess ? 0 : -1;
+}
+
+typedef struct HipTextModelProjectContext {
+    HipTextProgramState *state;
+} HipTextModelProjectContext;
+
+static int hip_text_model_project(void *opaque,
+        const SaltTextModelGpuTensorView *tensor,
+        uint64_t input_offset, uint64_t output_offset, uint32_t rows) {
+    HipTextModelProjectContext *context =
+        (HipTextModelProjectContext *)opaque;
+    HipTextTensorRef ref = {};
+    if (!context || !context->state || !tensor || !tensor->resource ||
+        rows == 0u)
+        return -1;
+    ref.resource = (const unsigned char *)tensor->resource;
+    ref.value_offset = tensor->value_offset;
+    ref.scale_offset = tensor->scale_offset;
+    ref.bias_offset = tensor->bias_offset;
+    ref.rows = tensor->rows;
+    ref.cols = tensor->cols;
+    ref.encoding = (uint32_t)tensor->encoding;
+    return hip_text_project(context->state, &ref,
+        hip_text_f32(context->state, input_offset),
+        hip_text_f32(context->state, output_offset), rows);
 }
 
 static int hip_text_map_kv(
@@ -7241,6 +7378,8 @@ static int hip_text_requirements(
         SaltTextGpuProgramRequirements *requirements,
         size_t requirements_size) {
     uint64_t selected_jobs;
+    size_t backend_bytes = sizeof(HipTextProgramState);
+    const SaltTextModelGpuOps *model_ops;
     if (!program || !program->ready || !program->descriptor ||
         !program->descriptor->model || !policy || !requirements ||
         requirements_size != sizeof *requirements || !hip_ready ||
@@ -7258,8 +7397,15 @@ static int hip_text_requirements(
          * unique expert resources retain their separate bound above. */
         selected_jobs > HIP_MAX_BATCH_JOBS)
         return -1;
+    model_ops = program->descriptor->model_gpu_ops;
+    if (model_ops) {
+        if (!model_ops->prepare || !model_ops->destroy ||
+            model_ops->state_bytes > SIZE_MAX - backend_bytes)
+            return -1;
+        backend_bytes += model_ops->state_bytes;
+    }
     memset(requirements, 0, sizeof *requirements);
-    requirements->backend_state_bytes = sizeof(HipTextProgramState);
+    requirements->backend_state_bytes = backend_bytes;
     requirements->command_bytes = sizeof(HipTextProgramCommand);
     requirements->maximum_commands = program->dispatch.cell_count;
     return 0;
@@ -7268,6 +7414,10 @@ static int hip_text_requirements(
 static void hip_text_state_release(HipTextProgramState *state) {
     if (!state) return;
     if (state->stream) (void)hipStreamSynchronize(state->stream);
+    if (state->model_gpu_ops && state->model_gpu_ops->destroy)
+        state->model_gpu_ops->destroy(state->model_gpu_context,
+            SALT_TEXT_MODEL_GPU_HIP, state->model_gpu_state,
+            state->model_gpu_state_bytes);
     for (uint32_t index = 0; index < state->cell_event_capacity; index++) {
         if (state->cell_event_start && state->cell_event_start[index])
             (void)hipEventDestroy(state->cell_event_start[index]);
@@ -7320,6 +7470,7 @@ static int hip_text_cell_matrix_rows(
     case SALT_TEXT_CELL_EXPERT_REDUCTION:
     case SALT_TEXT_CELL_FFN_COMBINE:
     case SALT_TEXT_CELL_FINAL_NORM:
+    case SALT_TEXT_CELL_MODEL_LAYER:
         rows = program->hidden;
         break;
     case SALT_TEXT_CELL_QUERY_PROJECTION:
@@ -7425,14 +7576,21 @@ static int hip_text_prepare_templates(
             const SaltTextLayerPlan *plan =
                 program->layers[cell->layer].descriptor->plan;
             uint64_t jobs;
-            if (!plan || plan->dense_intermediate < 1 ||
-                plan->expert_intermediate < 1 || plan->n_experts < 1 ||
-                plan->top_k_experts < 1)
+            if (!plan ||
+                (plan->dense_intermediate < 1 &&
+                 plan->expert_intermediate < 1) ||
+                (plan->expert_intermediate > 0 &&
+                 (plan->n_experts < 1 || plan->top_k_experts < 1)))
                 return -1;
-            target->dense = (uint32_t)plan->dense_intermediate;
-            target->routed = (uint32_t)plan->expert_intermediate;
-            target->experts = (uint32_t)plan->n_experts;
-            target->topk = (uint32_t)plan->top_k_experts;
+            target->dense = plan->dense_intermediate > 0
+                ? (uint32_t)plan->dense_intermediate : 0u;
+            target->routed = plan->expert_intermediate > 0
+                ? (uint32_t)plan->expert_intermediate : 0u;
+            target->experts = plan->n_experts > 0
+                ? (uint32_t)plan->n_experts : 0u;
+            target->topk = plan->top_k_experts > 0
+                ? (uint32_t)plan->top_k_experts : 0u;
+            if (target->routed == 0u) continue;
             jobs = (uint64_t)program->maximum_candidates * target->topk;
             if (jobs > UINT32_MAX) return -1;
             if ((uint32_t)jobs > selected_capacity)
@@ -7458,7 +7616,7 @@ static int hip_text_prepare(
         void *backend_state, size_t backend_state_bytes,
         void *command, size_t command_bytes) {
     HipTextProgramState *state = (HipTextProgramState *)backend_state;
-    size_t bytes;
+    size_t bytes, device_bytes, score_offset, score_floats, score_bytes;
     uint64_t expert_ref_count, expert_ref_bytes, selected_descriptor_bytes;
     HipTextKvRef host_kv[64];
     const char *failure_stage = "validate";
@@ -7475,9 +7633,17 @@ static int hip_text_prepare(
     if (bytes > SIZE_MAX - sizeof(int)) return -1;
     state->status_offset = bytes;
     bytes += sizeof(int);
+    score_offset = (bytes + 63u) & ~(size_t)63u;
+    if ((size_t)program->maximum_context > SIZE_MAX / 256u)
+        return -1;
+    score_floats = (size_t)program->maximum_context * 256u;
+    if (score_floats > SIZE_MAX / sizeof(float)) return -1;
+    score_bytes = score_floats * sizeof(float);
+    if (score_offset > SIZE_MAX - score_bytes) return -1;
+    device_bytes = score_offset + score_bytes;
     failure_stage = "arenas";
     if (salt_gpu_shared_buffer_alloc(&state->canonical, bytes) != 0 ||
-        hip_success(hipMalloc((void **)&state->device_canonical, bytes),
+        hip_success(hipMalloc((void **)&state->device_canonical, device_bytes),
             "hipMalloc text canonical arena") != 0 ||
         hip_success(hipStreamCreateWithFlags(
             &state->stream, hipStreamNonBlocking),
@@ -7485,7 +7651,27 @@ static int hip_text_prepare(
         goto fail;
     state->program = program;
     state->canonical_bytes = program->layout.total_bytes;
-    state->device_canonical_bytes = bytes;
+    state->device_canonical_bytes = device_bytes;
+    state->attention_score_workspace = (float *)(void *)(
+        state->device_canonical + score_offset);
+    state->attention_score_workspace_floats = score_floats;
+    if (program->descriptor->model_gpu_ops) {
+        SaltTextModelGpuPrepareArgs args = {};
+        const SaltTextModelGpuOps *ops = program->descriptor->model_gpu_ops;
+        if (ops->state_bytes > backend_state_bytes - sizeof *state)
+            goto fail;
+        args.backend = SALT_TEXT_MODEL_GPU_HIP;
+        args.device = NULL;
+        args.maximum_rows = program->maximum_candidates;
+        args.maximum_context = program->maximum_context;
+        state->model_gpu_ops = ops;
+        state->model_gpu_context = program->descriptor->model_gpu_context;
+        state->model_gpu_state = (unsigned char *)state + sizeof *state;
+        state->model_gpu_state_bytes = ops->state_bytes;
+        if (ops->prepare(state->model_gpu_context, &args,
+                state->model_gpu_state, state->model_gpu_state_bytes) != 0)
+            goto fail;
+    }
     if (hip_u64_mul(program->layer_count, program->layout.maximum_experts,
             &expert_ref_count) != 0 ||
         hip_u64_mul(expert_ref_count, HIP_TEXT_EXPERT_PROJECTIONS,
@@ -7539,6 +7725,7 @@ static int hip_text_prepare(
         const SaltTextCompiledLayer *compiled = &program->layers[layer];
         const SaltTextLayerExecDesc *source = compiled->descriptor;
         HipTextLayerRefs *target = &state->layers[layer];
+        const SaltAttentionDesc *attention = &source->plan->attention;
         failure_layer = layer;
         failure_stage = "layer-fixed";
 #define REALIZE(field) \
@@ -7547,28 +7734,57 @@ static int hip_text_prepare(
 #define OPTIONAL(field) \
         if (hip_text_realize_optional(program, &source->field, \
                 &target->field) != 0) goto fail
-        REALIZE(q); REALIZE(k); OPTIONAL(v); REALIZE(o);
-        REALIZE(dense_gate); REALIZE(dense_up); REALIZE(dense_down);
-        REALIZE(router); REALIZE(pre_attention_norm); REALIZE(q_norm);
-        REALIZE(k_norm); REALIZE(post_attention_norm);
-        REALIZE(pre_ffn_norm_1); REALIZE(pre_ffn_norm_2);
-        REALIZE(post_ffn_norm_1); REALIZE(post_ffn_norm_2);
-        REALIZE(post_ffn_norm); REALIZE(router_scale);
-        REALIZE(per_expert_scale); OPTIONAL(layer_scalar);
+        if (attention->kind == SALT_ATTN_MODEL) {
+            OPTIONAL(q); OPTIONAL(k); OPTIONAL(v); OPTIONAL(o);
+            REALIZE(model_input_projection); REALIZE(model_kernel);
+            REALIZE(model_output_projection);
+        } else {
+            REALIZE(q); REALIZE(k); OPTIONAL(v); REALIZE(o);
+            OPTIONAL(model_input_projection); OPTIONAL(model_kernel);
+            OPTIONAL(model_output_projection);
+        }
+        if (source->plan->dense_intermediate > 0) {
+            REALIZE(dense_gate); REALIZE(dense_up); REALIZE(dense_down);
+        } else {
+            OPTIONAL(dense_gate); OPTIONAL(dense_up); OPTIONAL(dense_down);
+        }
+        if (source->plan->pinned) {
+            OPTIONAL(router); OPTIONAL(per_expert_scale);
+        } else {
+            REALIZE(router); REALIZE(per_expert_scale);
+        }
+        REALIZE(pre_attention_norm);
+        if (attention->kind == SALT_ATTN_MODEL) {
+            OPTIONAL(q_norm); OPTIONAL(k_norm);
+        } else {
+            REALIZE(q_norm); REALIZE(k_norm);
+        }
+        OPTIONAL(post_attention_norm);
+        OPTIONAL(pre_ffn_norm_1); REALIZE(pre_ffn_norm_2);
+        OPTIONAL(post_ffn_norm_1); OPTIONAL(post_ffn_norm_2);
+        OPTIONAL(post_ffn_norm); OPTIONAL(router_scale);
+        OPTIONAL(layer_scalar);
 #undef REALIZE
 #undef OPTIONAL
         failure_stage = "layer-kv";
-        if (!source->kv || layer >= 64u ||
+        if (layer >= 64u ||
             compiled->tentative_key_offset % sizeof(float) != 0 ||
-            compiled->tentative_value_offset % sizeof(float) != 0 ||
-            hip_text_map_kv(source->kv, compiled->kv_width,
-                &target->kv) != 0 || source->expert_count == 0 ||
-            source->expert_count > state->experts_per_layer)
+            compiled->tentative_value_offset % sizeof(float) != 0)
             goto fail;
-        target->kv.tentative_key_float_offset =
-            compiled->tentative_key_offset / sizeof(float);
-        target->kv.tentative_value_float_offset =
-            compiled->tentative_value_offset / sizeof(float);
+        if (compiled->kv_width == 0u) {
+            memset(&target->kv, 0, sizeof target->kv);
+        } else {
+            if (!source->kv ||
+                hip_text_map_kv(source->kv, compiled->kv_width,
+                    &target->kv) != 0)
+                goto fail;
+            target->kv.tentative_key_float_offset =
+                compiled->tentative_key_offset / sizeof(float);
+            target->kv.tentative_value_float_offset =
+                compiled->tentative_value_offset / sizeof(float);
+        }
+        if (source->expert_count > state->experts_per_layer)
+            goto fail;
         for (uint32_t expert = 0; expert < source->expert_count; expert++) {
             const SaltTextExpertDesc *entry = &source->experts[expert];
             size_t base = ((size_t)layer * state->experts_per_layer + expert) *
@@ -7695,6 +7911,7 @@ static int hip_text_begin_depth(void *backend_state, void *command,
     cmd->source_position = source_position;
     cmd->input_count = input_count;
     cmd->maximum_depth = maximum_depth;
+    cmd->frontier_linear = 1u;
     cmd->authoritative_output_rows = output_rows;
     cmd->stats.backend_template_count = state->template_count;
     cmd->stats.backend_dynamic_patches = 4u;
@@ -7767,6 +7984,7 @@ static int hip_text_begin_frontier(
         (size_t)input_count * sizeof(uint32_t));
     state->source_position_host = source_position;
     cmd->source_position = source_position;
+    cmd->frontier_linear = 0u;
     if (hip_success(hipMemcpyAsync(hip_text_bytes(state,
             state->program->layout.target_parent_rows),
             state->parent_rows_host,
@@ -7785,8 +8003,23 @@ static int hip_text_begin_frontier(
     return 0;
 }
 
+static uint64_t hip_text_diag_fnv1a(const void *data, size_t bytes) {
+    const unsigned char *pointer = (const unsigned char *)data;
+    uint64_t hash = UINT64_C(1469598103934665603);
+    for (size_t index = 0; index < bytes; index++) {
+        hash ^= pointer[index];
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
 static int hip_text_launch_status(void) {
-    return hipGetLastError() == hipSuccess ? 0 : -1;
+    hipError_t error = hipGetLastError();
+    if (error == hipSuccess) return 0;
+    if (getenv("SALT_GPU_DIAG"))
+        fprintf(stderr, "SALT_HIP_TEXT_LAUNCH_FAIL code=%d name=%s message=%s\n",
+            (int)error, hipGetErrorName(error), hipGetErrorString(error));
+    return -1;
 }
 
 static void hip_text_record_matrix(
@@ -7800,6 +8033,43 @@ static void hip_text_record_matrix(
     } else {
         cmd->stats.area_m1_dispatches++;
     }
+}
+
+static int hip_text_encode_model_layer(
+        HipTextProgramState *state, const SaltTextCompiledLayer *compiled,
+        const HipTextLayerRefs *refs, uint32_t layer, uint32_t rows) {
+    SaltTextModelGpuEncodeArgs args = {};
+    HipTextModelProjectContext project = {};
+    const SaltTextCanonicalLayout *layout;
+    if (!state || !compiled || !compiled->descriptor || !refs ||
+        !state->model_gpu_ops || !state->model_gpu_ops->encode ||
+        !state->stream || rows == 0u)
+        return -1;
+    layout = &state->program->layout;
+    args.backend = SALT_TEXT_MODEL_GPU_HIP;
+    args.command = (void *)state->stream;
+    args.canonical = state->device_canonical;
+    project.state = state;
+    args.backend_context = &project;
+    args.project = hip_text_model_project;
+    args.canonical_bytes = state->canonical_bytes;
+    args.layer = layer;
+    args.rows = rows;
+    args.hidden = state->program->hidden;
+    args.normalized_offset = layout->normalized;
+    args.scratch_offset = layout->model_scratch;
+    args.scratch_float_capacity =
+        (size_t)rows * layout->maximum_model_scratch_floats;
+    args.state_offset = compiled->model_state_offset;
+    args.state_bytes = compiled->model_state_bytes;
+    args.output_offset = layout->branch;
+    args.input_projection = hip_text_model_view(
+        &refs->model_input_projection);
+    args.kernel = hip_text_model_view(&refs->model_kernel);
+    args.output_projection = hip_text_model_view(
+        &refs->model_output_projection);
+    return state->model_gpu_ops->encode(state->model_gpu_context, &args,
+        state->model_gpu_state, state->model_gpu_state_bytes);
 }
 
 static int hip_text_encode_cell(
@@ -7829,8 +8099,22 @@ static int hip_text_encode_cell(
         cmd->next_cell >= state->template_count ||
         cell != &program->dispatch.cells[cmd->next_cell] || !assignment ||
         assignment->cpu.count != 0 || assignment->gpu.first != 0 ||
-        input_count != cmd->input_count || assignment->gpu.count == 0)
+        input_count != cmd->input_count || assignment->gpu.count == 0) {
+        if (getenv("SALT_GPU_DIAG"))
+            fprintf(stderr,
+                "SALT_HIP_TEXT_ENCODE_REFUSE which=1 begun=%d submitted=%d "
+                "next=%u cells=%u templates=%u input=%u command_input=%u "
+                "cpu=%u gpu_first=%u gpu_count=%u\n",
+                cmd ? cmd->begun : -1, cmd ? cmd->submitted : -1,
+                cmd ? cmd->next_cell : UINT32_MAX,
+                program ? program->dispatch.cell_count : 0u,
+                state ? state->template_count : 0u, input_count,
+                cmd ? cmd->input_count : 0u,
+                assignment ? assignment->cpu.count : UINT32_MAX,
+                assignment ? assignment->gpu.first : UINT32_MAX,
+                assignment ? assignment->gpu.count : 0u);
         return -1;
+    }
     cell_template = &state->templates[cmd->next_cell];
     if (cell_template->cell != cell ||
         cell_template->index != cmd->next_cell ||
@@ -7842,8 +8126,15 @@ static int hip_text_encode_cell(
         cell_template->completion_epoch != cell->completion_epoch ||
         cell_template->destination_offset != cell->destination_offset ||
         cell_template->destination_stride != cell->destination_stride ||
-        cell_template->flags != cell->flags)
+        cell_template->flags != cell->flags) {
+        if (getenv("SALT_GPU_DIAG"))
+            fprintf(stderr,
+                "SALT_HIP_TEXT_ENCODE_REFUSE which=2 next=%u kind=%u/%u "
+                "layer=%u/%u\n",
+                cmd->next_cell, cell_template->kind, (uint32_t)cell->kind,
+                cell_template->layer, cell->layer);
         return -1;
+    }
     terminal_output = cell->kind == SALT_TEXT_CELL_FINAL_NORM ||
         cell->kind == SALT_TEXT_CELL_FINAL_HEAD ||
         cell->kind == SALT_TEXT_CELL_LOGIT_SOFTCAP;
@@ -7853,7 +8144,13 @@ static int hip_text_encode_cell(
         count = cmd->authoritative_output_rows;
         output_first = input_count - count;
     }
-    if (assignment->gpu.count < count) return -1;
+    if (assignment->gpu.count < count) {
+        if (getenv("SALT_GPU_DIAG"))
+            fprintf(stderr,
+                "SALT_HIP_TEXT_ENCODE_REFUSE which=3 gpu_count=%u count=%u\n",
+                assignment->gpu.count, count);
+        return -1;
+    }
     cmd->stats.backend_template_reuses++;
     layout = &program->layout;
     hidden = cell_template->hidden;
@@ -7875,8 +8172,17 @@ static int hip_text_encode_cell(
         (dense != (uint32_t)layer_plan->dense_intermediate ||
          routed != (uint32_t)layer_plan->expert_intermediate ||
          experts != (uint32_t)layer_plan->n_experts ||
-         topk != (uint32_t)layer_plan->top_k_experts))
+         topk != (uint32_t)layer_plan->top_k_experts)) {
+        if (getenv("SALT_GPU_DIAG"))
+            fprintf(stderr,
+                "SALT_HIP_TEXT_ENCODE_REFUSE which=4 layer=%u "
+                "dense=%u/%d routed=%u/%d experts=%u/%d topk=%u/%d\n",
+                cell->layer, dense, layer_plan->dense_intermediate,
+                routed, layer_plan->expert_intermediate,
+                experts, layer_plan->n_experts,
+                topk, layer_plan->top_k_experts);
         return -1;
+    }
     if (state->cell_timing_enabled &&
         (cmd->next_cell >= state->cell_event_capacity ||
          hip_success(hipEventRecord(state->cell_event_start[cmd->next_cell],
@@ -7885,25 +8191,57 @@ static int hip_text_encode_cell(
     switch (cell->kind) {
     case SALT_TEXT_CELL_EMBEDDING: {
         size_t elements = (size_t)input_count * hidden;
-        if (state->embedding.encoding != SALT_TENSOR_ENCODING_AFFINE_Q4 ||
-            state->embedding.rows != program->vocabulary ||
-            state->embedding.cols != hidden)
-            return -1;
-        hip_text_embedding_q4<<<
-            (unsigned int)((elements + 255u) / 256u), 256, 0, state->stream>>>(
-            state->embedding.resource, state->embedding.value_offset,
-            state->embedding.scale_offset, state->embedding.bias_offset,
-            hip_text_i32(state, layout->candidate_token_ids), input_count,
-            program->vocabulary, hidden, program->descriptor->embedding_scale,
-            destination, status);
+        if (state->model_gpu_ops && state->model_gpu_ops->embedding) {
+            SaltTextModelGpuEmbeddingArgs args = {};
+            args.backend = SALT_TEXT_MODEL_GPU_HIP;
+            args.command = (void *)state->stream;
+            args.canonical = state->device_canonical;
+            args.canonical_bytes = state->canonical_bytes;
+            args.tensor = hip_text_model_view(&state->embedding);
+            args.token_ids_offset = layout->candidate_token_ids;
+            args.output_offset = cell_template->destination_offset;
+            args.token_count = input_count;
+            args.scale = program->descriptor->embedding_scale;
+            {
+                int model_rc = state->model_gpu_ops->embedding(
+                    state->model_gpu_context, &args, state->model_gpu_state,
+                    state->model_gpu_state_bytes);
+                if (model_rc != 0) {
+                    if (getenv("SALT_GPU_DIAG"))
+                        fprintf(stderr,
+                            "SALT_HIP_TEXT_MODEL_FAIL cell=embedding rc=%d\n",
+                            model_rc);
+                    return -1;
+                }
+            }
+        } else {
+            if (state->embedding.encoding != SALT_TENSOR_ENCODING_AFFINE_Q4 ||
+                state->embedding.rows != program->vocabulary ||
+                state->embedding.cols != hidden)
+                return -1;
+            hip_text_embedding_q4<<<
+                (unsigned int)((elements + 255u) / 256u), 256, 0,
+                state->stream>>>(state->embedding.resource,
+                state->embedding.value_offset, state->embedding.scale_offset,
+                state->embedding.bias_offset,
+                hip_text_i32(state, layout->candidate_token_ids), input_count,
+                program->vocabulary, hidden,
+                program->descriptor->embedding_scale, destination, status);
+        }
         break;
     }
     case SALT_TEXT_CELL_PRE_ATTENTION_NORM:
         hip_text_rmsnorm_rows<<<input_count, 256, 0, state->stream>>>(
             hip_text_f32(state, layout->state_a), hidden,
-            hip_text_tensor_f32(&refs->pre_attention_norm), destination,
+            hip_text_tensor_bytes(&refs->pre_attention_norm),
+            refs->pre_attention_norm.encoding, destination,
             hidden, input_count, hidden, program->descriptor->norm_epsilon,
             1, status);
+        break;
+    case SALT_TEXT_CELL_MODEL_LAYER:
+        if (hip_text_encode_model_layer(state, compiled, refs,
+                cell->layer, input_count) != 0)
+            return -1;
         break;
     case SALT_TEXT_CELL_QUERY_PROJECTION:
         if (hip_text_pair_enabled &&
@@ -7997,33 +8335,90 @@ static int hip_text_encode_cell(
             input_count,
             compiled->query_width, compiled->kv_width,
             program->descriptor->norm_epsilon,
-            0,
+            attention->shared_kv_projection, attention->raw_values,
             hip_text_f32(state, layout->queries),
             hip_text_f32(state, layout->keys),
             hip_text_f32(state, layout->values),
-            hip_text_tensor_f32(&refs->q_norm),
-            hip_text_tensor_f32(&refs->k_norm),
+            hip_text_tensor_bytes(&refs->q_norm), refs->q_norm.encoding,
+            hip_text_tensor_bytes(&refs->k_norm), refs->k_norm.encoding,
             hip_text_f32(state, compiled->tentative_key_offset),
             hip_text_f32(state, compiled->tentative_value_offset), status);
         break;
     case SALT_TEXT_CELL_ATTENTION_BODY:
-        hip_text_attention_body<<<input_count * attention->n_heads, 256,
-            (size_t)cmd->attention_score_rows * sizeof(float), state->stream>>>(
-            attention->kind == SALT_ATTN_FULL,
-            attention->n_heads, attention->n_kv_heads, attention->head_dim,
-            attention->window, attention->score_scale,
-            state->device_source_position,
-            (const uint32_t *)hip_text_bytes(state,
-                layout->target_parent_rows),
-            (const uint32_t *)hip_text_bytes(state, layout->target_depths),
-            input_count, compiled->query_width,
-            compiled->kv_width, refs->kv.private_mode,
-            refs->kv.row_capacity,
-            hip_text_f32(state, layout->queries),
-            refs->kv.device_keys, refs->kv.device_values,
-            hip_text_f32(state, compiled->tentative_key_offset),
-            hip_text_f32(state, compiled->tentative_value_offset),
-            destination, status);
+        if (state->model_gpu_ops && state->model_gpu_ops->attention) {
+            SaltTextModelGpuAttentionArgs args = {};
+            uint64_t rows_bytes = (uint64_t)input_count * sizeof(uint32_t);
+            uint64_t query_bytes = (uint64_t)input_count *
+                compiled->query_width * sizeof(float);
+            uint64_t tentative_bytes = (uint64_t)input_count *
+                compiled->kv_width * sizeof(float);
+            uint64_t committed_bytes = (uint64_t)refs->kv.row_capacity *
+                compiled->kv_width * sizeof(float);
+            uint64_t output_bytes = (uint64_t)input_count *
+                compiled->query_width * sizeof(float);
+            args.backend = SALT_TEXT_MODEL_GPU_HIP;
+            args.command = (void *)state->stream;
+            args.source_position = hip_text_buffer_view(
+                state->device_source_position, 0u, sizeof(uint32_t));
+            if (!cmd->frontier_linear)
+                args.parent_rows = hip_text_buffer_view(
+                    state->device_canonical,
+                    layout->target_parent_rows, rows_bytes);
+            args.depths = hip_text_buffer_view(state->device_canonical,
+                layout->target_depths, rows_bytes);
+            args.queries = hip_text_buffer_view(state->device_canonical,
+                layout->queries, query_bytes);
+            args.committed_keys = hip_text_buffer_view(refs->kv.device_keys,
+                0u, committed_bytes);
+            args.committed_values = hip_text_buffer_view(refs->kv.device_values,
+                0u, committed_bytes);
+            args.tentative_keys = hip_text_buffer_view(state->device_canonical,
+                compiled->tentative_key_offset, tentative_bytes);
+            args.tentative_values = hip_text_buffer_view(state->device_canonical,
+                compiled->tentative_value_offset, tentative_bytes);
+            args.score_workspace = hip_text_buffer_view(
+                state->attention_score_workspace, 0u,
+                (uint64_t)state->attention_score_workspace_floats *
+                    sizeof(float));
+            args.output = hip_text_buffer_view(state->device_canonical,
+                cell_template->destination_offset, output_bytes);
+            args.status = hip_text_buffer_view(state->device_canonical,
+                state->status_offset, sizeof(int));
+            args.physical_launches = &physical_launches;
+            args.rows = input_count;
+            args.maximum_context = program->maximum_context;
+            args.query_width = compiled->query_width;
+            args.kv_width = compiled->kv_width;
+            args.n_heads = attention->n_heads;
+            args.n_kv_heads = attention->n_kv_heads;
+            args.head_dim = attention->head_dim;
+            args.window = attention->window;
+            args.kv_mode = refs->kv.private_mode;
+            args.kv_capacity = refs->kv.row_capacity;
+            args.score_scale = attention->score_scale;
+            args.full_attention = attention->kind == SALT_ATTN_FULL;
+            if (state->model_gpu_ops->attention(state->model_gpu_context,
+                    &args, state->model_gpu_state,
+                    state->model_gpu_state_bytes) != 0)
+                return -1;
+        } else {
+            hip_text_attention_body<<<input_count * attention->n_heads, 256,
+                (size_t)cmd->attention_score_rows * sizeof(float),
+                state->stream>>>(attention->kind == SALT_ATTN_FULL,
+                attention->n_heads, attention->n_kv_heads, attention->head_dim,
+                attention->window, attention->score_scale,
+                state->device_source_position,
+                (const uint32_t *)hip_text_bytes(state,
+                    layout->target_parent_rows),
+                (const uint32_t *)hip_text_bytes(state, layout->target_depths),
+                input_count, compiled->query_width, compiled->kv_width,
+                refs->kv.private_mode, refs->kv.row_capacity,
+                hip_text_f32(state, layout->queries),
+                refs->kv.device_keys, refs->kv.device_values,
+                hip_text_f32(state, compiled->tentative_key_offset),
+                hip_text_f32(state, compiled->tentative_value_offset),
+                destination, status);
+        }
         break;
     case SALT_TEXT_CELL_OUTPUT_PROJECTION:
         if (hip_text_project(state, &refs->o,
@@ -8035,15 +8430,19 @@ static int hip_text_encode_cell(
         hip_text_residual_postnorm_rows<<<input_count, 256, 0,
             state->stream>>>(hip_text_f32(state, layout->state_a),
             hip_text_f32(state, layout->branch),
-            hip_text_tensor_f32(&refs->post_attention_norm), destination,
-            input_count, hidden, program->descriptor->norm_epsilon, status);
+            hip_text_tensor_bytes(&refs->post_attention_norm),
+            refs->post_attention_norm.encoding, destination,
+            input_count, hidden, program->descriptor->norm_epsilon,
+            layer_plan->residual_postnorm, status);
         break;
     case SALT_TEXT_CELL_DENSE_NORM:
         if (cmd->ffn_norm_wave_layer != UINT32_MAX) return -1;
         hip_text_rmsnorm_pair_rows<<<dim3(input_count, 2u, 1u), 256,
             0, state->stream>>>(hip_text_f32(state, layout->state_b), hidden,
-            hip_text_tensor_f32(&refs->pre_ffn_norm_1),
-            hip_text_tensor_f32(&refs->pre_ffn_norm_2),
+            hip_text_tensor_bytes(&refs->pre_ffn_norm_1),
+            refs->pre_ffn_norm_1.encoding,
+            hip_text_tensor_bytes(&refs->pre_ffn_norm_2),
+            refs->pre_ffn_norm_2.encoding,
             hip_text_f32(state, layout->normalized),
             hip_text_f32(state, layout->combine_a), hidden,
             input_count, hidden, program->descriptor->norm_epsilon, status);
@@ -8087,10 +8486,30 @@ static int hip_text_encode_cell(
     case SALT_TEXT_CELL_DENSE_ACTIVATION: {
         if (cmd->dense_wave_pending) return -1;
         size_t elements = (size_t)input_count * dense;
-        hip_text_activate<<<(unsigned int)((elements + 255u) / 256u), 256,
-            0, state->stream>>>(hip_text_f32(state, layout->dense_gate),
-            hip_text_f32(state, layout->dense_up), destination,
-            elements, status);
+        if (layer_plan->activation == SALT_ACT_GELU_TANH) {
+            hip_text_activate<<<(unsigned int)((elements + 255u) / 256u), 256,
+                0, state->stream>>>(hip_text_f32(state, layout->dense_gate),
+                hip_text_f32(state, layout->dense_up), destination,
+                elements, status);
+        } else {
+            SaltTextModelGpuActivationArgs args = {};
+            if (!state->model_gpu_ops || !state->model_gpu_ops->activation)
+                return -1;
+            args.backend = SALT_TEXT_MODEL_GPU_HIP;
+            args.command = (void *)state->stream;
+            args.canonical = state->device_canonical;
+            args.canonical_bytes = state->canonical_bytes;
+            args.gate_offset = layout->dense_gate;
+            args.up_offset = layout->dense_up;
+            args.output_offset = cell_template->destination_offset;
+            args.elements = elements;
+            args.activation = layer_plan->activation;
+            args.activation_limit = layer_plan->activation_limit;
+            if (state->model_gpu_ops->activation(state->model_gpu_context,
+                    &args, state->model_gpu_state,
+                    state->model_gpu_state_bytes) != 0)
+                return -1;
+        }
         break;
     }
     case SALT_TEXT_CELL_DENSE_DOWN:
@@ -8100,11 +8519,20 @@ static int hip_text_encode_cell(
         cmd->stats.projection_dispatches++;
         break;
     case SALT_TEXT_CELL_ROUTER_INPUT:
-        hip_text_router_input_rows<<<input_count, 256, 0, state->stream>>>(
-            hip_text_f32(state, layout->state_b),
-            hip_text_tensor_f32(&refs->router_scale), destination,
-            input_count, hidden, program->descriptor->norm_epsilon,
-            0.0f, status);
+        if (!layer_plan->router_rmsnorm) {
+            hip_text_rmsnorm_rows<<<input_count, 256, 0, state->stream>>>(
+                hip_text_f32(state, layout->state_b), hidden,
+                hip_text_tensor_bytes(&refs->pre_ffn_norm_2),
+                refs->pre_ffn_norm_2.encoding, destination,
+                hidden, input_count, hidden,
+                program->descriptor->norm_epsilon, 1, status);
+        } else {
+            hip_text_router_input_rows<<<input_count, 256, 0, state->stream>>>(
+                hip_text_f32(state, layout->state_b),
+                hip_text_tensor_f32(&refs->router_scale), destination,
+                input_count, hidden, program->descriptor->norm_epsilon,
+                0.0f, status);
+        }
         break;
     case SALT_TEXT_CELL_ROUTER_PROJECTION:
         if (hip_text_project(state, &refs->router,
@@ -8113,31 +8541,67 @@ static int hip_text_encode_cell(
         cmd->stats.projection_dispatches++;
         break;
     case SALT_TEXT_CELL_ROUTED_NORM:
-        if (cmd->ffn_norm_wave_layer != cell->layer) return -1;
-        cmd->ffn_norm_wave_layer = UINT32_MAX;
-        physical_launches = 0u;
+        if (cmd->ffn_norm_wave_layer == cell->layer) {
+            cmd->ffn_norm_wave_layer = UINT32_MAX;
+        } else {
+            hip_text_rmsnorm_rows<<<input_count, 256, 0, state->stream>>>(
+                hip_text_f32(state, layout->state_b), hidden,
+                hip_text_tensor_bytes(&refs->pre_ffn_norm_2),
+                refs->pre_ffn_norm_2.encoding, destination,
+                hidden, input_count, hidden,
+                program->descriptor->norm_epsilon, 1, status);
+        }
         break;
     case SALT_TEXT_CELL_ROUTER_TOPK:
-        hip_text_topk_rows<<<input_count, 1, 0, state->stream>>>(
-            hip_text_f32(state, layout->router_logits),
-            hip_text_tensor_f32(&refs->per_expert_scale),
-            hip_text_i32(state, layout->selected_experts),
-            hip_text_f32(state, layout->selected_weights), input_count,
-            experts, topk, status);
-        hip_text_group_maps<<<1, 1, 0, state->stream>>>(
-            hip_text_i32(state, layout->selected_experts), input_count,
-            experts, topk,
-            hip_text_i32(state, layout->grouped_to_canonical),
-            hip_text_i32(state, layout->canonical_to_grouped),
-            hip_text_i32(state, layout->tensor_row), status);
-        hip_text_routed_gather<<<
-            (unsigned int)(((size_t)jobs * hidden + 255u) / 256u), 256,
-            0, state->stream>>>(
-            hip_text_i32(state, layout->grouped_to_canonical),
-            hip_text_f32(state, layout->combine_a),
-            hip_text_f32(state, layout->routed_input), jobs, topk,
-            hidden, status);
-        physical_launches = 3u;
+        if (layer_plan->router_kind == SALT_ROUTER_MODEL) {
+            SaltTextModelGpuRouterArgs args = {};
+            if (!state->model_gpu_ops || !state->model_gpu_ops->router_topk)
+                return -1;
+            args.backend = SALT_TEXT_MODEL_GPU_HIP;
+            args.command = (void *)state->stream;
+            args.canonical = state->device_canonical;
+            args.canonical_bytes = state->canonical_bytes;
+            args.expert_bias = hip_text_model_view(&refs->per_expert_scale);
+            args.logits_offset = layout->router_logits;
+            args.selected_offset = layout->selected_experts;
+            args.weights_offset = layout->selected_weights;
+            args.grouped_offset = layout->grouped_to_canonical;
+            args.inverse_offset = layout->canonical_to_grouped;
+            args.scratch_offset = layout->tensor_row;
+            args.source_offset = layout->combine_a;
+            args.routed_offset = layout->routed_input;
+            args.rows = input_count;
+            args.experts = experts;
+            args.topk = topk;
+            args.hidden = hidden;
+            args.normalize_topk = layer_plan->router_normalize_topk;
+            args.router_scale = layer_plan->router_scale;
+            if (state->model_gpu_ops->router_topk(state->model_gpu_context,
+                    &args, state->model_gpu_state,
+                    state->model_gpu_state_bytes) != 0)
+                return -1;
+        } else {
+            hip_text_topk_rows<<<input_count, 1, 0, state->stream>>>(
+                hip_text_f32(state, layout->router_logits),
+                hip_text_tensor_f32(&refs->per_expert_scale),
+                hip_text_i32(state, layout->selected_experts),
+                hip_text_f32(state, layout->selected_weights), input_count,
+                experts, topk, status);
+            hip_text_group_maps<<<1, 1, 0, state->stream>>>(
+                hip_text_i32(state, layout->selected_experts), input_count,
+                experts, topk,
+                hip_text_i32(state, layout->grouped_to_canonical),
+                hip_text_i32(state, layout->canonical_to_grouped),
+                hip_text_i32(state, layout->tensor_row), status);
+            hip_text_routed_gather<<<
+                (unsigned int)(((size_t)jobs * hidden + 255u) / 256u), 256,
+                0, state->stream>>>(
+                hip_text_i32(state, layout->grouped_to_canonical),
+                hip_text_f32(state, layout->combine_a),
+                hip_text_f32(state, layout->routed_input), jobs, topk,
+                hidden, status);
+            physical_launches = 3u;
+        }
         break;
     case SALT_TEXT_CELL_EXPERT_GATE:
     case SALT_TEXT_CELL_EXPERT_UP:
@@ -8211,10 +8675,30 @@ static int hip_text_encode_cell(
     }
     case SALT_TEXT_CELL_EXPERT_ACTIVATION: {
         size_t elements = (size_t)jobs * routed;
-        hip_text_activate<<<(unsigned int)((elements + 255u) / 256u), 256,
-            0, state->stream>>>(hip_text_f32(state, layout->routed_gate),
-            hip_text_f32(state, layout->routed_up), destination,
-            elements, status);
+        if (layer_plan->activation == SALT_ACT_GELU_TANH) {
+            hip_text_activate<<<(unsigned int)((elements + 255u) / 256u), 256,
+                0, state->stream>>>(hip_text_f32(state, layout->routed_gate),
+                hip_text_f32(state, layout->routed_up), destination,
+                elements, status);
+        } else {
+            SaltTextModelGpuActivationArgs args = {};
+            if (!state->model_gpu_ops || !state->model_gpu_ops->activation)
+                return -1;
+            args.backend = SALT_TEXT_MODEL_GPU_HIP;
+            args.command = (void *)state->stream;
+            args.canonical = state->device_canonical;
+            args.canonical_bytes = state->canonical_bytes;
+            args.gate_offset = layout->routed_gate;
+            args.up_offset = layout->routed_up;
+            args.output_offset = cell_template->destination_offset;
+            args.elements = elements;
+            args.activation = layer_plan->activation;
+            args.activation_limit = layer_plan->activation_limit;
+            if (state->model_gpu_ops->activation(state->model_gpu_context,
+                    &args, state->model_gpu_state,
+                    state->model_gpu_state_bytes) != 0)
+                return -1;
+        }
         break;
     }
     case SALT_TEXT_CELL_EXPERT_REDUCTION:
@@ -8225,26 +8709,44 @@ static int hip_text_encode_cell(
             input_count, topk, hidden, status);
         break;
     case SALT_TEXT_CELL_FFN_COMBINE:
-        hip_text_parallel_combine_rows<<<input_count, 256, 0,
-            state->stream>>>(hip_text_f32(state, layout->state_b),
-            hip_text_f32(state, layout->dense_output),
-            hip_text_f32(state, layout->routed_output),
-            hip_text_tensor_f32(&refs->post_ffn_norm_1),
-            hip_text_tensor_f32(&refs->post_ffn_norm_2),
-            hip_text_tensor_f32(&refs->post_ffn_norm),
-            hip_text_f32(state, layout->combine_a),
-            hip_text_f32(state, layout->combine_b), destination,
-            input_count, hidden, program->descriptor->norm_epsilon, 1.0f,
-            layer_plan->final_layer_scale
-                ? hip_text_tensor_f32(&refs->layer_scalar) : NULL,
-            status);
+        if (cmd->ffn_norm_wave_layer != UINT32_MAX) {
+            if (cmd->ffn_norm_wave_layer != cell->layer)
+                return -1;
+            cmd->ffn_norm_wave_layer = UINT32_MAX;
+        }
+        if (!layer_plan->residual_postnorm) {
+            size_t elements = (size_t)input_count * hidden;
+            uint32_t mode = layer_plan->dense_intermediate > 0 ? 1u : 2u;
+            if (layer_plan->parallel_dense_routed) mode = 3u;
+            hip_text_ffn_add_rows<<<
+                (unsigned int)((elements + 255u) / 256u), 256, 0,
+                state->stream>>>(hip_text_f32(state, layout->state_b),
+                hip_text_f32(state, layout->dense_output),
+                hip_text_f32(state, layout->routed_output), destination,
+                elements, mode, status);
+        } else {
+            hip_text_parallel_combine_rows<<<input_count, 256, 0,
+                state->stream>>>(hip_text_f32(state, layout->state_b),
+                hip_text_f32(state, layout->dense_output),
+                hip_text_f32(state, layout->routed_output),
+                hip_text_tensor_f32(&refs->post_ffn_norm_1),
+                hip_text_tensor_f32(&refs->post_ffn_norm_2),
+                hip_text_tensor_f32(&refs->post_ffn_norm),
+                hip_text_f32(state, layout->combine_a),
+                hip_text_f32(state, layout->combine_b), destination,
+                input_count, hidden, program->descriptor->norm_epsilon, 1.0f,
+                layer_plan->final_layer_scale
+                    ? hip_text_tensor_f32(&refs->layer_scalar) : NULL,
+                status);
+        }
         break;
     case SALT_TEXT_CELL_FINAL_NORM:
         if (count > 0)
             hip_text_rmsnorm_rows<<<count, 256, 0, state->stream>>>(
                 hip_text_f32(state, layout->state_a) +
                     (size_t)output_first * hidden,
-                hidden, hip_text_tensor_f32(&state->final_norm),
+                hidden, hip_text_tensor_bytes(&state->final_norm),
+                state->final_norm.encoding,
                 destination + (size_t)output_first * hidden,
                 hidden, count, hidden, program->descriptor->norm_epsilon,
                 1, status);
@@ -8269,12 +8771,13 @@ static int hip_text_encode_cell(
         float cap = program->layers[program->layer_count - 1u].descriptor->
             plan->logit_softcap;
         size_t elements = (size_t)count * program->vocabulary;
-        if (!(cap > 0.0f) || !isfinite(cap)) return -1;
-        if (elements > 0)
+        if (cap > 0.0f && isfinite(cap) && elements > 0)
             hip_text_softcap<<<(unsigned int)((elements + 255u) / 256u), 256,
                 0, state->stream>>>(
                 destination + (size_t)output_first * program->vocabulary,
                 elements, cap, status);
+        else if (!(cap == 0.0f) || !isfinite(cap))
+            return -1;
         else
             physical_launches = 0u;
         break;
@@ -8291,6 +8794,72 @@ static int hip_text_encode_cell(
             state->stream), "hipEventRecord text cell end") != 0)
         return -1;
     if (hip_text_launch_status() != 0) return -1;
+    if (cell->kind == SALT_TEXT_CELL_FFN_COMBINE && cell->layer == 0u) {
+        size_t boundary_bytes = (size_t)input_count * hidden * sizeof(float);
+        if (hip_success(hipMemcpyAsync(
+                (unsigned char *)state->canonical.contents + layout->state_a,
+                state->device_canonical + layout->state_a,
+                boundary_bytes, hipMemcpyDeviceToHost, state->stream),
+                "hipMemcpy text layer-zero handoff") != 0 ||
+            hip_success(hipStreamSynchronize(state->stream),
+                "hipStreamSynchronize text layer-zero handoff") != 0)
+            return -1;
+    }
+    if (getenv("SALT_GPU_DIAG")) {
+        if (getenv("SALT_HIP_TEXT_CELL_DIAG")) {
+            int diagnostic_status = 0;
+            if (hip_success(hipMemcpyAsync(&diagnostic_status,
+                    state->device_canonical + state->status_offset, sizeof(int),
+                    hipMemcpyDeviceToHost, state->stream),
+                    "hipMemcpy text diagnostic status") != 0 ||
+                hip_success(hipStreamSynchronize(state->stream),
+                    "hipStreamSynchronize text diagnostic status") != 0)
+                return -1;
+            if (diagnostic_status != 0) {
+                fprintf(stderr,
+                    "SALT_HIP_TEXT_STATUS_FAIL next=%u kind=%d layer=%u status=%d\n",
+                    cmd->next_cell, (int)cell->kind, cell->layer,
+                    diagnostic_status);
+                return -1;
+            }
+        }
+        if (cell->kind == SALT_TEXT_CELL_FFN_COMBINE &&
+            (cell->layer == 0u || cell->layer + 1u == program->layer_count)) {
+            size_t diagnostic_bytes = (size_t)input_count * hidden * sizeof(float);
+            unsigned char *diagnostic_host =
+                (unsigned char *)state->canonical.contents + layout->state_a;
+            if (hip_success(hipMemcpyAsync(diagnostic_host,
+                    state->device_canonical + layout->state_a,
+                    diagnostic_bytes, hipMemcpyDeviceToHost, state->stream),
+                    "hipMemcpy text diagnostic layer state") != 0 ||
+                hip_success(hipStreamSynchronize(state->stream),
+                    "hipStreamSynchronize text diagnostic layer state") != 0)
+                return -1;
+            uint64_t model_hash = 0u;
+            if (layout->model_state_bytes > 0u) {
+                unsigned char *model_host =
+                    (unsigned char *)state->canonical.contents +
+                    layout->model_state;
+                if (hip_success(hipMemcpyAsync(model_host,
+                        state->device_canonical + layout->model_state,
+                        layout->model_state_bytes, hipMemcpyDeviceToHost,
+                        state->stream),
+                        "hipMemcpy text diagnostic model state") != 0 ||
+                    hip_success(hipStreamSynchronize(state->stream),
+                        "hipStreamSynchronize text diagnostic model state") != 0)
+                    return -1;
+                model_hash = hip_text_diag_fnv1a(
+                    model_host, layout->model_state_bytes);
+            }
+            fprintf(stderr,
+                "SALT_HIP_TEXT_LAYER_HASH layer=%u rows=%u fnv=%016llx "
+                "model_fnv=%016llx\n",
+                cell->layer, input_count,
+                (unsigned long long)hip_text_diag_fnv1a(
+                    diagnostic_host, diagnostic_bytes),
+                (unsigned long long)model_hash);
+        }
+    }
     cmd->stats.backend_physical_kernel_nodes += physical_launches;
     cmd->stats.backend_host_kernel_launch_calls += physical_launches;
     switch (cell->kind) {
@@ -8619,8 +9188,16 @@ static int hip_text_resource_resume(
         !cmd->begun || cmd->phase != HIP_TEXT_PHASE_RESOURCE_PENDING ||
         layer != cmd->active_resource_layer || !experts || !slots ||
         expert_count != cmd->resource_request_count ||
-        layer >= state->program->layer_count)
+        layer >= state->program->layer_count) {
+        if (getenv("SALT_GPU_DIAG"))
+            fprintf(stderr,
+                "SALT_HIP_RESOURCE_RESUME_REFUSE which=1 layer=%u active=%u "
+                "phase=%u count=%u request=%u\n",
+                layer, cmd ? cmd->active_resource_layer : UINT32_MAX,
+                cmd ? cmd->phase : UINT32_MAX, expert_count,
+                cmd ? cmd->resource_request_count : 0u);
         return -1;
+    }
     if (cmd->resource_wait_started_ns) {
         hip_u64_add_saturating(&cmd->resource_wait_ns,
             hip_host_now_ns() - cmd->resource_wait_started_ns);
@@ -8633,8 +9210,13 @@ static int hip_text_resource_resume(
     uint32_t grouped_cursor = 0;
     uint32_t max_occupancy = 0;
     if (!state->host_selected_desc || !state->device_selected_desc ||
-        expert_count > state->selected_job_capacity)
+        expert_count > state->selected_job_capacity) {
+        if (getenv("SALT_GPU_DIAG"))
+            fprintf(stderr,
+                "SALT_HIP_RESOURCE_RESUME_REFUSE which=2 count=%u capacity=%u\n",
+                expert_count, state->selected_job_capacity);
         return -1;
+    }
     for (uint32_t index = 0; index < expert_count; index++) {
         int32_t expert = experts[index];
         int32_t slot = slots[index];
@@ -8642,31 +9224,60 @@ static int hip_text_resource_resume(
         size_t base;
         if (expert != cmd->resource_experts[index] || expert < 0 ||
             expert >= (int32_t)source->expert_count || slot < 0 ||
-            slot >= hip_selected_capacity)
+            slot >= hip_selected_capacity) {
+            if (getenv("SALT_GPU_DIAG"))
+                fprintf(stderr,
+                    "SALT_HIP_RESOURCE_RESUME_REFUSE which=3 index=%u "
+                    "expert=%d expected=%d expert_count=%u slot=%d capacity=%d\n",
+                    index, expert, cmd->resource_experts[index],
+                    source->expert_count, slot, hip_selected_capacity);
             return -1;
+        }
         base = ((size_t)layer * state->experts_per_layer +
             (uint32_t)expert) * HIP_TEXT_EXPERT_PROJECTIONS;
         occupancy = cmd->expert_occupancies[(uint32_t)expert];
         if (occupancy == 0 ||
-            grouped_cursor > UINT32_MAX - occupancy)
+            grouped_cursor > UINT32_MAX - occupancy) {
+            if (getenv("SALT_GPU_DIAG"))
+                fprintf(stderr,
+                    "SALT_HIP_RESOURCE_RESUME_REFUSE which=4 index=%u "
+                    "expert=%d occupancy=%u grouped=%u\n",
+                    index, expert, occupancy, grouped_cursor);
             return -1;
-        if (hip_text_patch_selected_tensor(state->program,
-                &source->experts[expert].gate,
-                source->experts[expert].gate.storage.value_offset, slot,
-                &state->expert_refs[base]) != 0 ||
-            hip_text_patch_selected_tensor(state->program,
-                &source->experts[expert].up,
-                source->experts[expert].gate.storage.value_offset, slot,
-                &state->expert_refs[base + 1u]) != 0 ||
-            hip_text_patch_selected_tensor(state->program,
-                &source->experts[expert].down,
-                source->experts[expert].gate.storage.value_offset, slot,
-                &state->expert_refs[base + 2u]) != 0 ||
-            hip_success(hipMemcpyAsync(state->device_experts + base,
-                state->expert_refs + base,
-                3u * sizeof(HipTextTensorRef), hipMemcpyHostToDevice,
-                state->stream), "hipMemcpy selected text expert refs") != 0)
-            return -1;
+        }
+        {
+            int patch_stage = 0;
+            if (hip_text_patch_selected_tensor(state->program,
+                    &source->experts[expert].gate,
+                    source->experts[expert].gate.storage.value_offset, slot,
+                    &state->expert_refs[base]) != 0)
+                patch_stage = 1;
+            else if (hip_text_patch_selected_tensor(state->program,
+                    &source->experts[expert].up,
+                    source->experts[expert].gate.storage.value_offset, slot,
+                    &state->expert_refs[base + 1u]) != 0)
+                patch_stage = 2;
+            else if (hip_text_patch_selected_tensor(state->program,
+                    &source->experts[expert].down,
+                    source->experts[expert].gate.storage.value_offset, slot,
+                    &state->expert_refs[base + 2u]) != 0)
+                patch_stage = 3;
+            else if (hip_success(hipMemcpyAsync(state->device_experts + base,
+                    state->expert_refs + base,
+                    3u * sizeof(HipTextTensorRef), hipMemcpyHostToDevice,
+                    state->stream), "hipMemcpy selected text expert refs") != 0)
+                patch_stage = 4;
+            if (patch_stage != 0) {
+                if (getenv("SALT_GPU_DIAG"))
+                    fprintf(stderr,
+                        "SALT_HIP_RESOURCE_RESUME_REFUSE which=5 stage=%d "
+                        "index=%u layer=%u expert=%d slot=%d logical=%llu\n",
+                        patch_stage, index, layer, expert, slot,
+                        (unsigned long long)source->experts[expert].gate.storage.
+                            logical_resource_id);
+                return -1;
+            }
+        }
         if (hip_text_selected_descriptor(state, &state->expert_refs[base], slot,
                 occupancy,
                 layout->routed_input + (size_t)grouped_cursor *
@@ -9018,6 +9629,15 @@ static int hip_text_finish(
     if (*status != 0 || cmd->resource_wait_started_ns ||
         hip_text_publish_cell_timing(state) != 0)
         return -1;
+    if (state->program->layout.model_state_bytes > 0u &&
+        hip_success(hipMemcpy(
+            (unsigned char *)state->canonical.contents +
+                state->program->layout.model_state,
+            state->device_canonical + state->program->layout.model_state,
+            state->program->layout.model_state_bytes,
+            hipMemcpyDeviceToHost),
+            "hipMemcpy text final model state") != 0)
+        return -1;
     if (state->cell_timing_enabled)
         fprintf(stderr,
             "SALT_HIP_RESOURCE_WAIT calls=%u host_ns=%llu\n",
@@ -9101,6 +9721,8 @@ static int hip_text_resolve(
         committed_position = cmd->source_position + committed_count;
         for (uint32_t layer = 0; layer < state->program->layer_count; layer++) {
             HipAttentionKvSync *sync = state->layers[layer].kv.sync;
+            if (state->layers[layer].kv.width == 0u)
+                continue;
             if (!sync || sync->device_positions != (int)cmd->source_position)
                 return -1;
             sync->device_positions = (int)committed_position;
@@ -9252,10 +9874,19 @@ static int hip_text_encode_extent_diag(void *backend_state, void *command,
         uint32_t *encoded_cells) {
     int rc = hip_text_encode_extent(backend_state, command, program, plan,
         first_cell, cell_count, input_count, encoded_cells);
-    if (rc < 0 && getenv("SALT_GPU_DIAG"))
+    if (rc < 0 && getenv("SALT_GPU_DIAG")) {
+        HipTextProgramCommand *cmd = (HipTextProgramCommand *)command;
+        const SaltTextExecutionCell *cell = cmd && program &&
+            cmd->next_cell < program->dispatch.cell_count
+            ? &program->dispatch.cells[cmd->next_cell] : NULL;
         fprintf(stderr,
-            "SALT_HIP_TEXT_FAIL stage=encode_extent first=%u count=%u\n",
-            first_cell, cell_count);
+            "SALT_HIP_TEXT_FAIL stage=encode_extent first=%u count=%u "
+            "encoded=%u next=%u kind=%d layer=%u\n",
+            first_cell, cell_count, encoded_cells ? *encoded_cells : 0u,
+            cmd ? cmd->next_cell : UINT32_MAX,
+            cell ? (int)cell->kind : -1,
+            cell ? cell->layer : UINT32_MAX);
+    }
     return rc;
 }
 

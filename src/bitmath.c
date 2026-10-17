@@ -13,16 +13,35 @@
  * in double precision (exact for our ranges); -ffp-contract=off keeps
  * compilers from fusing mul+add. Same source -> same bits everywhere.
  */
+#ifndef SALT_BITMATH_EMBEDDED
 #include "salt/bitmath.h"
+#endif
 
 #include <math.h>
 #include <stdint.h>
 #include <string.h>
 
+#ifndef SALT_BITMATH_API
+#define SALT_BITMATH_API
+#endif
+#ifndef SALT_BITMATH_LOCAL
+#define SALT_BITMATH_LOCAL static
+#endif
+
+SALT_BITMATH_API float salt_expf(float x);
+SALT_BITMATH_API float salt_logf(float x);
+SALT_BITMATH_API float salt_powf(float x, float y);
+SALT_BITMATH_API float salt_rsqrtf(float x);
+SALT_BITMATH_API float salt_sqrtf(float x);
+SALT_BITMATH_API float salt_tanhf(float x);
+SALT_BITMATH_API float salt_sinf(float x);
+SALT_BITMATH_API float salt_cosf(float x);
+SALT_BITMATH_API float salt_log1pf(float x);
+
 /* ------------------------------------------------------------------ */
 /* exp(x): x = n*ln2 + r, exp(x) = ldexp(exp(r), n).                  */
 /* ------------------------------------------------------------------ */
-float salt_expf(float x) {
+SALT_BITMATH_API float salt_expf(float x) {
     if (x != x) return x;
     if (x > 88.722839f) return 3.402823466e+38f;
     if (x < -87.336548f) return 0.0f;
@@ -47,7 +66,7 @@ float salt_expf(float x) {
 /* log(x): x = m*2^e, m in [0.5,1); log = log(m) + e*ln2.            */
 /* log(m) = 2u(1 + u^2/3 + u^4/5 + ...), u = (m-1)/(m+1).            */
 /* ------------------------------------------------------------------ */
-float salt_logf(float x) {
+SALT_BITMATH_API float salt_logf(float x) {
     if (x != x) return x;
     if (x <= 0.0f) return -1.0f / 0.0f;
     int e;
@@ -80,14 +99,14 @@ float salt_logf(float x) {
 /* ------------------------------------------------------------------ */
 /* powf(x,y) = exp(y * log(x)).                                       */
 /* ------------------------------------------------------------------ */
-float salt_powf(float x, float y) {
+SALT_BITMATH_API float salt_powf(float x, float y) {
     if (x == 1.0f || y == 0.0f) return 1.0f;
     if (x > 0.0f && y == -0.5f) return salt_rsqrtf(x);
     if (x > 0.0f) return salt_expf(y * salt_logf(x));
     return x;
 }
 
-static double invsqrt64(float x) {
+SALT_BITMATH_LOCAL double invsqrt64(float x) {
     uint32_t bits;
     float seed;
     memcpy(&bits, &x, sizeof bits);
@@ -103,7 +122,7 @@ static double invsqrt64(float x) {
     return y;
 }
 
-float salt_rsqrtf(float x) {
+SALT_BITMATH_API float salt_rsqrtf(float x) {
     if (x != x) return x;
     if (x < 0.0f) return 0.0f / 0.0f;
     if (x == 0.0f) return 1.0f / 0.0f;
@@ -113,7 +132,7 @@ float salt_rsqrtf(float x) {
     return (float)invsqrt64(x);
 }
 
-float salt_sqrtf(float x) {
+SALT_BITMATH_API float salt_sqrtf(float x) {
     if (x != x) return x;
     if (x < 0.0f) return 0.0f / 0.0f;
     if (x == 0.0f || x == 1.0f) return x;
@@ -122,7 +141,7 @@ float salt_sqrtf(float x) {
     return (float)((double)x * invsqrt64(x));
 }
 
-float salt_tanhf(float x) {
+SALT_BITMATH_API float salt_tanhf(float x) {
     float magnitude, exponential, result;
     if (x != x) return x;
     if (x >= 10.0f) return 1.0f;
@@ -137,11 +156,11 @@ float salt_tanhf(float x) {
 /* sin/cos via double range reduction to [-pi/4, pi/4] and fdlibm     */
 /* float polynomials.                                                 */
 /* ------------------------------------------------------------------ */
-static const double PIO2_HI = 1.57079632679489655800e+00; /* pi/2 hi */
-static const double PIO2_LO = 6.12323399573676603587e-17;  /* pi/2 lo */
-static const double INV_PIO2 = 6.36619772367581382433e-01; /* 2/pi  */
+SALT_BITMATH_LOCAL const double PIO2_HI = 1.57079632679489655800e+00; /* pi/2 hi */
+SALT_BITMATH_LOCAL const double PIO2_LO = 6.12323399573676603587e-17;  /* pi/2 lo */
+SALT_BITMATH_LOCAL const double INV_PIO2 = 6.36619772367581382433e-01; /* 2/pi  */
 
-static void sin_cos_reduce(float x, int *quad, float *r) {
+SALT_BITMATH_LOCAL void sin_cos_reduce(float x, int *quad, float *r) {
     double d = (double)x;
     double n = round(d * INV_PIO2);
     double rr = d - n * PIO2_HI;
@@ -154,7 +173,7 @@ static void sin_cos_reduce(float x, int *quad, float *r) {
     *r = (float)rr;
 }
 
-static float sin_poly(float x) {
+SALT_BITMATH_LOCAL float sin_poly(float x) {
     /* fdlibm __kernel_sinf: sin = x + x^3*S1 + x^5*S2 + x^7*S3 */
     static const float S1 = -1.66666666641626524e-01f;
     static const float S2 =  8.33302275008926213e-03f;
@@ -166,7 +185,7 @@ static float sin_poly(float x) {
     return x + x * z;            /* x + x^3*S1 + x^5*S2 + x^7*S3 */
 }
 
-static float cos_poly(float x) {
+SALT_BITMATH_LOCAL float cos_poly(float x) {
     /* fdlibm __kernel_cosf: C1 C2 C3 */
     static const float C1 =  4.16666679023301001e-02f;
     static const float C2 = -1.38873162549376522e-03f;
@@ -178,7 +197,7 @@ static float cos_poly(float x) {
     return 1.0f + x2 * z;   /* fdlibm: 1 - x2/2 + x2*x2*(C1 + x2*(C2 + x2*C3)) */
 }
 
-float salt_sinf(float x) {
+SALT_BITMATH_API float salt_sinf(float x) {
     if (x != x) return x;
     int q;
     float r;
@@ -191,7 +210,7 @@ float salt_sinf(float x) {
     }
 }
 
-float salt_cosf(float x) {
+SALT_BITMATH_API float salt_cosf(float x) {
     if (x != x) return x;
     int q;
     float r;
@@ -207,7 +226,7 @@ float salt_cosf(float x) {
 /* ------------------------------------------------------------------ */
 /* log1p(x) = log(1+x): u = x/(2+x) series.                          */
 /* ------------------------------------------------------------------ */
-float salt_log1pf(float x) {
+SALT_BITMATH_API float salt_log1pf(float x) {
     if (x <= -1.0f) return -1.0f / 0.0f;
     if (x > 1.0f)
         return salt_logf(1.0f + x);   /* large x: u-series diverges */

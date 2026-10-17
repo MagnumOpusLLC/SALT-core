@@ -33,12 +33,12 @@ cuda_start = CUDA.index("case SALT_TEXT_CELL_ATTENTION_TRANSFORM:")
 cuda_end = CUDA.index("case SALT_TEXT_CELL_ATTENTION_BODY:", cuda_start)
 cuda = CUDA[cuda_start:cuda_end]
 assert cuda.index("cuda_text_copy<<<") < cuda.index("cuda_text_attention_transform<<<")
-assert "program->descriptor->norm_epsilon,\n            0," in cuda
+assert "program->descriptor->norm_epsilon,\n            attention->shared_kv_projection, attention->raw_values," in cuda
 
 hip_start = HIP.index("case SALT_TEXT_CELL_ATTENTION_TRANSFORM:")
 hip_end = HIP.index("case SALT_TEXT_CELL_ATTENTION_BODY:", hip_start)
 hip = HIP[hip_start:hip_end]
 assert hip.index("hip_text_copy<<<") < hip.index("hip_text_attention_transform<<<")
-assert "program->descriptor->norm_epsilon,\n            0," in hip
+assert "program->descriptor->norm_epsilon,\n            attention->shared_kv_projection, attention->raw_values," in hip
 
 print("GEMMA4_SHARED_KV_TRANSFORM_SOURCE_TEST_PASS")

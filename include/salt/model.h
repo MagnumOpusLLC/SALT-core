@@ -16,8 +16,14 @@
 typedef enum {
     SALT_ATTN_NONE = 0,
     SALT_ATTN_SLIDING = 1,
-    SALT_ATTN_FULL = 2
+    SALT_ATTN_FULL = 2,
+    SALT_ATTN_MODEL = 3
 } SaltAttentionKind;
+
+typedef enum {
+    SALT_ROUTER_SOFTMAX = 0,
+    SALT_ROUTER_MODEL = 1
+} SaltRouterKind;
 
 typedef enum {
     SALT_ACT_NONE = 0,
@@ -47,12 +53,15 @@ typedef struct {
     double rope_theta;
     float score_scale;
     int raw_values; /* zero preserves the established value RMSNorm contract */
+    int k_norm_absent;
 } SaltAttentionDesc;
 
 typedef struct {
     int period;
     int full_slot;
     int dense_intermediate;
+    int dense_layers;
+    int pinned_layers;
     SaltActivationKind expert_activation;
     int router_rmsnorm;
     int parallel_dense_routed;
@@ -67,6 +76,9 @@ typedef struct {
     SaltAttentionDesc full;
     float activation_limit;
     int router_rank_order;
+    SaltRouterKind router_kind;
+    int router_normalize_topk;
+    float router_scale;
 } SaltTextGraphDesc;
 
 typedef struct {
@@ -89,6 +101,7 @@ typedef struct {
     int top_k_experts;
     int expert_intermediate;
     int dense_intermediate;
+    int pinned;
     SaltActivationKind activation;
     int router_rmsnorm;
     int parallel_dense_routed;
@@ -99,6 +112,9 @@ typedef struct {
     float logit_softcap;
     float activation_limit;
     int router_rank_order;
+    SaltRouterKind router_kind;
+    int router_normalize_topk;
+    float router_scale;
 } SaltTextLayerPlan;
 
 typedef struct {

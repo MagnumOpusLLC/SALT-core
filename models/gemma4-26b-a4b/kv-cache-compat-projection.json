@@ -7,14 +7,21 @@
       "snapshot_path": "models/gemma4-26b-a4b/compat/v6/Makefile",
       "snapshot_sha256": "f34e7285395963b84600379f3a3a1065c3f1d5d38dc8d04c2f7776b07fb8e212",
       "live_projection": "pin-live-source-v1",
-      "live_sha256": "44234c3c0ae3502ee754e87bee84f2763e27bd380f53e0d29d360997f664c30a"
+      "live_sha256": "362b106cd26d209727e1433ffa3260860a10f09feead4927417c2f231b30213c"
     },
     {
       "logical_path": "include/salt/model.h",
       "snapshot_path": "models/gemma4-26b-a4b/compat/v6/include/salt/model.h",
       "snapshot_sha256": "a4d9b4a4e36034167f4f1d6cdecdf9d097cb10ed26273c224dc30e6b687026bf",
       "live_projection": "pin-live-source-v1",
-      "live_sha256": "c53187f6236867b064c87ee99c9b7ad3900ef239eaa06c184499cf26ff154049"
+      "live_sha256": "470fdaaa59b657cef65669fcb114207076bf8657e77c8cb63611a537318a93ad"
+    },
+    {
+      "logical_path": "include/salt/salt.h",
+      "snapshot_path": "models/gemma4-26b-a4b/compat/v6/include/salt/salt.h",
+      "snapshot_sha256": "d56babecc730223621414508d27ecfa1d9dbd9305107a7e6911966ef4c04aaf8",
+      "live_projection": "pin-live-source-v1",
+      "live_sha256": "d569497ac8934291ed0088af941ee0b51150c20d2901e1f86c416c79cecd537d"
     },
     {
       "logical_path": "include/salt/text_exec.h",
@@ -28,7 +35,7 @@
       "snapshot_path": "models/gemma4-26b-a4b/compat/v6/models/gemma4-26b-a4b/gemma4_text.c",
       "snapshot_sha256": "2276829cd1e01df341577ea3e1b0227e2c54b171174ea3c74098d2543c3b6952",
       "live_projection": "pin-live-source-v1",
-      "live_sha256": "7936f38aab2aa88338d5bd63b5e0bbfc1e19a4594d918a7ce7786238707769ee"
+      "live_sha256": "b11d92b252fde62afd6f411ca693b832f6a4a9dd9bbcbddc025e36b40a9436ed"
     },
     {
       "logical_path": "models/gemma4-26b-a4b/gemma4_text.h",
@@ -98,7 +105,7 @@
       "snapshot_path": "models/gemma4-26b-a4b/compat/v6/src/model.c",
       "snapshot_sha256": "dd927e289ce8f11db7822744a6a03a81353e6e7164510e3d4f7129342fca1521",
       "live_projection": "pin-live-source-v1",
-      "live_sha256": "8f9069b62e8d6e3cfaa18ff740df4b1abe1afa60cb32b2bc4707104525643a5b"
+      "live_sha256": "b0e0d95b23ad64d14283e9e886b6f935f207089dcf2c947f0163f3ed27d34c71"
     },
     {
       "logical_path": "src/moe_group.c",
@@ -112,7 +119,7 @@
       "snapshot_path": "models/gemma4-26b-a4b/compat/v6/src/simd.c",
       "snapshot_sha256": "253646500a9a944d814bd7a988150a32240e7b41eb47ed0bf8353a84f22bcc15",
       "live_projection": "pin-live-source-v1",
-      "live_sha256": "163d08671bac085c71e955a4a8640a8ff46adda6db66b678be7d567189e39776"
+      "live_sha256": "7d126c939415b4cdbf57efa7fb61c1ef10ae89897abd559c586d8810dd01a8f5"
     },
     {
       "logical_path": "src/text_exec.c",

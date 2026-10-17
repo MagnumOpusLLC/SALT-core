@@ -46,9 +46,11 @@ T(S,B) -> SB + L(SB)
 `SA` and `SB` are distinct tentative universes. Their successor proposals are
 cheap because TARGET has already produced `L(SA)` and `L(SB)`; deriving later Q
 alternatives uses those retained logits/projections rather than another proposal
-rollout. Below 512 pre-request live-KV rows, the separate runtime admission gate
+rollout. Below 512 pre-request live-KV rows, the ordinary runtime admission gate
 forces X1 and ordinary B1 may repeat after a proposal miss or with DPR off;
-authenticated exact reuse and one-row DPR verification remain valid.
+authenticated exact reuse remains valid. Opt-in
+`SALT_DPR_INDEPENDENT_DRAFT=1` lets an eligible linked DPR draft verify up to
+its own configured horizon and target-row capacity without warming ordinary X.
 Current-prompt PREFILL does not count toward the threshold.
 
 `F2` means two such isolated universes. A backend may batch two ready lane
@@ -91,9 +93,10 @@ At an authoritative token boundary:
 4. TARGET executes tentative work and selects the exact accepted path;
 5. only target-authorized state/KV is committed.
 
-Below 512 pre-request live-KV rows, effective X is one: no-DPR or proposal-miss
-decode uses ordinary B1, while authenticated exact reuse and one-row DPR
-verification remain valid. At or above 512 rows, an ordinary transition may
+Below 512 pre-request live-KV rows, ordinary effective X is one: no-DPR or proposal-miss
+decode uses ordinary B1, while authenticated exact reuse remains valid. An
+opt-in DPR hit can independently verify multiple linked draft tokens without
+enabling ordinary wide X. At or above 512 rows, an ordinary transition may
 bootstrap the first candidate state when DPR or a retained projection is
 unavailable; after that bootstrap, non-exact-hit boundaries return to the
 bounded X4 cascade.
@@ -105,7 +108,7 @@ of the NFQ N/F/Q checking surface: N/F/Q governs proposal/search work, while X
 governs how many causally ordered candidate-token rows TARGET may verify in one
 attempt.
 
-For normal serving:
+For ordinary serving and DPR when its independent-draft flag is absent/0:
 
 ```text
 request_x = 1                                      when position_before < 512
@@ -119,6 +122,9 @@ attempt without changing configured N/F/Q or configured X. One X-TARGET attempt
 ends at its first mismatch. TARGET commits the accepted prefix and returns the
 exact correction/pending boundary; the rejected remainder is not re-admitted as
 part of the same attempt.
+When `SALT_DPR_INDEPENDENT_DRAFT=1`, only an eligible DPR draft uses
+`min(configured_x, SALT_DPR_DRAFT_N, linked_edges, output_remaining - 1)`;
+the miss path still follows the ordinary request-wide limit.
 
 Inside one attempt the proposed rows are computed as one causal batch and the
 comparisons form a validity vector `V[0..X-1]`; the commit boundary is its first
@@ -265,7 +271,7 @@ trajectory. It still uses the same live PREFILL state and TARGET verifier.
 | `SALT_TARGET_X` | Configured causal X-TARGET row ceiling. The normal-serving live-KV gate and output tail may reduce it; it does not redefine N/F/Q. |
 | `SALT_TARGET_KV_WARMUP_ROWS` | Pre-request live-KV threshold below which normal serving forces X1. Current-prompt PREFILL rows are excluded. Current Gemma recipes use 512. |
 | `SALT_TARGET_WARM_X` | Maximum normal-serving X after the warmup threshold. It is still clamped by `SALT_TARGET_X` and output remaining. Current Gemma recipes use 4. |
-| `SALT_DPR_DRAFT_N` | Maximum DPR/ND token horizon offered to TARGET. DPR remains optional; this value does not enable DPR or redefine NFQ N or X-TARGET width. |
+| `SALT_DPR_DRAFT_N` | Maximum composed DPR/ND token horizon offered to TARGET (currently at most 356; the selected recipe may impose a lower bound). One V2 edge remains limited to 64 candidate IDs; V1 per-edge stats and NFQ storage do not grow with the composed walk. DPR remains optional; this value does not enable DPR or redefine NFQ N or X-TARGET width. |
 | `SALT_TARGET_AREA_WORKERS` | Persistent physical worker budget for target area scans and CPU realization. Worker identity never owns a candidate, lane, or winner. |
 | `SALT_TARGET_GPU_PROGRAM` | Makes the complete backend TARGET program available. It does not enable DPR, manufacture candidates, or force normal generation into TARGET. |
 | `SALT_TARGET_CPU_GRAPH` | Selects the retained CPU graph realization for admitted TARGET/fine-token work. `0` retains the qualified graph-off interpreter; the graph is a physical control, not a scheduler. |

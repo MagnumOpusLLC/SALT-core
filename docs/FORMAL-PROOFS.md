@@ -14,8 +14,8 @@ KV/state bit identity are separate evidence classes.
 The first nine proof models retain their historical runtime source baseline
 `d3a2037f404d520998ac2d3b2d182ca58f529c82`
 (**2026-09-21 19:50:34 −04:00**). The exported runtime source is now
-`ca634c59d2632122c55f4a25ef86338d2144a697`
-(**2026-10-06T23:47:09-04:00**). The supplemental loader proof was copied from
+`90b9c82b11eb18116f6dc4f18146c0e36100f58b`
+(**2026-10-17T08:23:20-04:00**). The supplemental loader proof was copied from
 `beab7291b7dd7ae11bb7d21ea0735e83ad7c0fa0`
 (**2026-10-02 10:49:29 −04:00**) and manually maps three loader paths in
 `9f5c1e0b26059e79f557e4c5a5994579e4634aec`

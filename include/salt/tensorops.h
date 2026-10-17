@@ -23,7 +23,8 @@ typedef enum SaltTensorEncoding {
     SALT_TENSOR_ENCODING_AFFINE_Q4 = 3,
     SALT_TENSOR_ENCODING_AFFINE_Q8 = 4,
     SALT_TENSOR_ENCODING_NVFP4 = 5,
-    SALT_TENSOR_ENCODING_ROW_INT2 = 6
+    SALT_TENSOR_ENCODING_ROW_INT2 = 6,
+    SALT_TENSOR_ENCODING_AFFINE_Q6 = 7
 } SaltTensorEncoding;
 
 /* Source ownership is independent from execution backend. STATIC names one

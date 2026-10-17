@@ -260,6 +260,19 @@ static void q4_canonical_rows(const uint32_t *vals,
         y[r] = q4_canonical_row(vals, scales, biases, C, x, r);
 }
 
+int salt_q4_matvec_rows_status(const uint32_t *vals,
+                               const uint16_t *scales,
+                               const uint16_t *biases, int R, int C,
+                               const float *x, float *y,
+                               int r0, int r1) {
+    if (!vals || !scales || !x || !y || R < 1 || C < 1 ||
+        r0 < 0 || r1 < r0 || r1 > R ||
+        (size_t)R > SIZE_MAX / (size_t)C)
+        return -1;
+    q4_canonical_rows(vals, scales, biases, R, C, x, y, r0, r1);
+    return 0;
+}
+
 static void *q4_row_worker(void *arg) {
     Mlx4RowJob *j = (Mlx4RowJob *)arg;
     salt_simd_q4_matvec(j->vals, j->scales, j->biases, j->R, j->C,

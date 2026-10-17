@@ -79,7 +79,7 @@ static id<MTLBuffer> _bx, _by;    /* per-token x / y */
 static int _R = -1, _C = -1;
 static int _has_bias = 0;
 static id<MTLComputePipelineState> _transform_pso, _attention_pso;
-static id<MTLComputePipelineState> _activation_pso, _q8_pso;
+static id<MTLComputePipelineState> _activation_pso, _text_activation_pso, _q8_pso;
 static id<MTLComputePipelineState> _text_embedding_pso, _text_route_maps_pso;
 static id<MTLComputePipelineState> _text_routed_gather_pso;
 static id<MTLComputePipelineState> _text_expert_reduce_pso;
@@ -130,7 +130,8 @@ static id<MTLLibrary> metal_library_for_source(const char *source,
 }
 
 static int metal_ops_prepare(void) {
-    if (_transform_pso && _attention_pso && _activation_pso && _q8_pso &&
+    if (_transform_pso && _attention_pso && _activation_pso &&
+        _text_activation_pso && _q8_pso &&
         _text_embedding_pso && _text_route_maps_pso &&
         _text_routed_gather_pso && _text_expert_reduce_pso &&
         _text_combine_pso &&
@@ -153,6 +154,7 @@ static int metal_ops_prepare(void) {
             {"attention_transform", &_transform_pso},
             {"attention_exact", &_attention_pso},
             {"moe_activate", &_activation_pso},
+            {"text_activate", &_text_activation_pso},
             {"q8batch", &_q8_pso},
             {"text_embedding_q4", &_text_embedding_pso},
             {"text_route_maps", &_text_route_maps_pso},
@@ -3596,6 +3598,7 @@ static int salt_gpu_free_impl(void) {
     metal_release(_transform_pso); _transform_pso = nil;
     metal_release(_attention_pso); _attention_pso = nil;
     metal_release(_activation_pso); _activation_pso = nil;
+    metal_release(_text_activation_pso); _text_activation_pso = nil;
     metal_release(_q8_pso); _q8_pso = nil;
     metal_release(_text_embedding_pso); _text_embedding_pso = nil;
     metal_release(_text_route_maps_pso); _text_route_maps_pso = nil;
@@ -4199,6 +4202,8 @@ typedef struct MetalTextTensorRef {
 typedef struct MetalTextLayerRefs {
     MetalTextTensorRef q, k, v, o;
     MetalTextTensorRef dense_gate, dense_up, dense_down, router;
+    MetalTextTensorRef model_input_projection, model_kernel;
+    MetalTextTensorRef model_output_projection;
     MetalTextTensorRef pre_attention_norm, q_norm, k_norm;
     MetalTextTensorRef post_attention_norm;
     MetalTextTensorRef pre_ffn_norm_1, pre_ffn_norm_2;
@@ -4209,6 +4214,21 @@ typedef struct MetalTextLayerRefs {
     size_t meta_float_offset;
 } MetalTextLayerRefs;
 
+static SaltTextModelGpuTensorView metal_text_model_view(
+        const MetalTextTensorRef *ref) {
+    SaltTextModelGpuTensorView view;
+    memset(&view, 0, sizeof view);
+    if (!ref) return view;
+    view.resource = (void *)ref->value;
+    view.value_offset = (uint64_t)ref->value_offset;
+    view.scale_offset = (uint64_t)ref->scale_offset;
+    view.bias_offset = (uint64_t)ref->bias_offset;
+    view.rows = ref->rows;
+    view.cols = ref->cols;
+    view.encoding = ref->encoding;
+    return view;
+}
+
 typedef struct MetalTextProgramState {
     uint64_t magic;
     const SaltTextVerifyProgram *program;
@@ -4216,6 +4236,10 @@ typedef struct MetalTextProgramState {
     size_t canonical_bytes;
     MetalTextTensorRef embedding, final_norm, output_head;
     MetalTextLayerRefs layers[METAL_TEXT_MAX_LAYERS];
+    const SaltTextModelGpuOps *model_gpu_ops;
+    void *model_gpu_context;
+    void *model_gpu_state;
+    size_t model_gpu_state_bytes;
     uint32_t layer_count;
     uint32_t ready;
 } MetalTextProgramState;
@@ -4399,14 +4423,23 @@ static int metal_text_requirements(
         const SaltTextDispatchPolicy *policy,
         SaltTextGpuProgramRequirements *requirements,
         size_t requirements_size) {
+    size_t backend_bytes = sizeof(MetalTextProgramState);
+    const SaltTextModelGpuOps *model_ops;
     if (!program || !program->ready || !program->descriptor || !policy ||
         !requirements || requirements_size != sizeof *requirements || !_dev ||
         policy->execution_class != SALT_TEXT_EXECUTION_GPU_ONLY ||
         program->layer_count == 0 ||
         program->layer_count > METAL_TEXT_MAX_LAYERS)
         return -1;
+    model_ops = program->descriptor->model_gpu_ops;
+    if (model_ops) {
+        if (!model_ops->prepare || !model_ops->destroy ||
+            model_ops->state_bytes > SIZE_MAX - backend_bytes)
+            return -1;
+        backend_bytes += model_ops->state_bytes;
+    }
     memset(requirements, 0, sizeof *requirements);
-    requirements->backend_state_bytes = sizeof(MetalTextProgramState);
+    requirements->backend_state_bytes = backend_bytes;
     requirements->command_bytes = sizeof(MetalTextProgramCommand);
     requirements->maximum_commands = program->dispatch.cell_count;
     requirements->flags = 0;
@@ -4443,14 +4476,18 @@ static int metal_text_prepare(
             (uint32_t)source->plan->top_k_experts;
         if (task_jobs > required_task_jobs) required_task_jobs = task_jobs;
         attention = &source->plan->attention;
-        if (attention->head_dim < 2 || attention->rope_dim < 2 ||
-            attention->rope_dim > attention->head_dim ||
-            (size_t)program->maximum_candidates >
-                (SIZE_MAX - 2u * (size_t)attention->head_dim) /
-                    attention->rope_dim)
-            return -1;
-        layer_meta = 2u * (size_t)attention->head_dim +
-            (size_t)program->maximum_candidates * attention->rope_dim;
+        if (attention->kind == SALT_ATTN_MODEL) {
+            layer_meta = 0u;
+        } else {
+            if (attention->head_dim < 2 || attention->rope_dim < 2 ||
+                attention->rope_dim > attention->head_dim ||
+                (size_t)program->maximum_candidates >
+                    (SIZE_MAX - 2u * (size_t)attention->head_dim) /
+                        attention->rope_dim)
+                return -1;
+            layer_meta = 2u * (size_t)attention->head_dim +
+                (size_t)program->maximum_candidates * attention->rope_dim;
+        }
         if (layer_meta > SIZE_MAX - required_meta_floats)
             return -1;
         required_meta_floats += layer_meta;
@@ -4490,6 +4527,24 @@ static int metal_text_prepare(
     state->program = program;
     state->canonical_bytes = program->layout.total_bytes;
     state->layer_count = program->layer_count;
+    if (program->descriptor->model_gpu_ops) {
+        SaltTextModelGpuPrepareArgs args;
+        const SaltTextModelGpuOps *ops = program->descriptor->model_gpu_ops;
+        if (ops->state_bytes > backend_state_bytes - sizeof *state)
+            goto fail;
+        memset(&args, 0, sizeof args);
+        args.backend = SALT_TEXT_MODEL_GPU_METAL;
+        args.device = (void *)_dev;
+        args.maximum_rows = program->maximum_candidates;
+        args.maximum_context = program->maximum_context;
+        state->model_gpu_ops = ops;
+        state->model_gpu_context = program->descriptor->model_gpu_context;
+        state->model_gpu_state = (unsigned char *)state + sizeof *state;
+        state->model_gpu_state_bytes = ops->state_bytes;
+        if (ops->prepare(state->model_gpu_context, &args,
+                state->model_gpu_state, state->model_gpu_state_bytes) != 0)
+            goto fail;
+    }
     if (metal_text_realize_tensor(program, &program->descriptor->embedding,
             &state->embedding) != 0 ||
         metal_text_realize_tensor(program, &program->descriptor->final_norm,
@@ -4509,23 +4564,51 @@ static int metal_text_prepare(
 #define MT_OPTIONAL(field) \
         if (metal_text_realize_optional(program, &source->field, \
                 &target->field) != 0) goto fail
-        MT_REALIZE(q); MT_REALIZE(k); MT_OPTIONAL(v); MT_REALIZE(o);
-        MT_REALIZE(dense_gate); MT_REALIZE(dense_up); MT_REALIZE(dense_down);
-        MT_REALIZE(router); MT_REALIZE(pre_attention_norm);
-        MT_REALIZE(q_norm); MT_REALIZE(k_norm);
-        MT_REALIZE(post_attention_norm);
-        MT_REALIZE(pre_ffn_norm_1); MT_REALIZE(pre_ffn_norm_2);
-        MT_REALIZE(post_ffn_norm_1); MT_REALIZE(post_ffn_norm_2);
-        MT_REALIZE(post_ffn_norm); MT_REALIZE(router_scale);
-        MT_REALIZE(per_expert_scale); MT_OPTIONAL(layer_scalar);
+        if (attention->kind == SALT_ATTN_MODEL) {
+            MT_OPTIONAL(q); MT_OPTIONAL(k); MT_OPTIONAL(v); MT_OPTIONAL(o);
+            MT_REALIZE(model_input_projection); MT_REALIZE(model_kernel);
+            MT_REALIZE(model_output_projection);
+        } else {
+            MT_REALIZE(q); MT_REALIZE(k); MT_OPTIONAL(v); MT_REALIZE(o);
+            MT_OPTIONAL(model_input_projection); MT_OPTIONAL(model_kernel);
+            MT_OPTIONAL(model_output_projection);
+        }
+        if (source->plan->dense_intermediate > 0) {
+            MT_REALIZE(dense_gate); MT_REALIZE(dense_up); MT_REALIZE(dense_down);
+        } else {
+            MT_OPTIONAL(dense_gate); MT_OPTIONAL(dense_up);
+            MT_OPTIONAL(dense_down);
+        }
+        if (source->plan->pinned) {
+            MT_OPTIONAL(router); MT_OPTIONAL(per_expert_scale);
+        } else {
+            MT_REALIZE(router); MT_REALIZE(per_expert_scale);
+        }
+        MT_REALIZE(pre_attention_norm);
+        if (attention->kind == SALT_ATTN_MODEL) {
+            MT_OPTIONAL(q_norm); MT_OPTIONAL(k_norm);
+        } else {
+            MT_REALIZE(q_norm); MT_REALIZE(k_norm);
+        }
+        MT_OPTIONAL(post_attention_norm);
+        MT_OPTIONAL(pre_ffn_norm_1); MT_REALIZE(pre_ffn_norm_2);
+        MT_OPTIONAL(post_ffn_norm_1); MT_OPTIONAL(post_ffn_norm_2);
+        MT_OPTIONAL(post_ffn_norm); MT_OPTIONAL(router_scale);
+        MT_OPTIONAL(layer_scalar);
 #undef MT_REALIZE
 #undef MT_OPTIONAL
-        if (!source->kv || attention->head_dim < 2 ||
-            attention->rope_dim < 2 || attention->rope_dim > attention->head_dim)
-            goto fail;
-        target->kv = source->kv;
-        meta_count = 2u * (size_t)attention->head_dim +
-            (size_t)program->maximum_candidates * attention->rope_dim;
+        if (attention->kind == SALT_ATTN_MODEL) {
+            target->kv = NULL;
+            meta_count = 0u;
+        } else {
+            if (!source->kv || attention->head_dim < 2 ||
+                attention->rope_dim < 2 ||
+                attention->rope_dim > attention->head_dim)
+                goto fail;
+            target->kv = source->kv;
+            meta_count = 2u * (size_t)attention->head_dim +
+                (size_t)program->maximum_candidates * attention->rope_dim;
+        }
         if (meta_count > SIZE_MAX - meta_cursor ||
             meta_cursor + meta_count > (size_t)[_op_meta length] / sizeof(float))
             goto fail;
@@ -4537,6 +4620,10 @@ static int metal_text_prepare(
     *canonical_out = &state->canonical;
     return 0;
 fail:
+    if (state->model_gpu_ops && state->model_gpu_ops->destroy)
+        state->model_gpu_ops->destroy(state->model_gpu_context,
+            SALT_TEXT_MODEL_GPU_METAL, state->model_gpu_state,
+            state->model_gpu_state_bytes);
     (void)salt_gpu_shared_buffer_free(&state->canonical);
     memset(state, 0, sizeof *state);
     return -1;
@@ -4590,15 +4677,29 @@ static float metal_text_ref_value(const MetalTextTensorRef *ref,
                                   uint32_t index) {
     const unsigned char *base;
     float value = NAN;
-    if (!ref || ref->encoding != SALT_TENSOR_ENCODING_F32 ||
-        !ref->value_alias.contents || index >= ref->rows * ref->cols ||
-        ref->value_offset > ref->value_alias.nbytes ||
-        (size_t)(index + 1u) * sizeof(float) >
+    size_t element_bytes;
+    if (!ref ||
+        (ref->encoding != SALT_TENSOR_ENCODING_F32 &&
+         ref->encoding != SALT_TENSOR_ENCODING_BF16) ||
+        !ref->value_alias.contents || index >= ref->rows * ref->cols)
+        return NAN;
+    element_bytes = ref->encoding == SALT_TENSOR_ENCODING_F32
+        ? sizeof(float) : sizeof(uint16_t);
+    if (ref->value_offset > ref->value_alias.nbytes ||
+        (size_t)(index + 1u) * element_bytes >
             ref->value_alias.nbytes - ref->value_offset)
         return NAN;
     base = (const unsigned char *)ref->value_alias.contents +
         ref->value_offset;
-    memcpy(&value, base + (size_t)index * sizeof(float), sizeof value);
+    if (ref->encoding == SALT_TENSOR_ENCODING_F32) {
+        memcpy(&value, base + (size_t)index * sizeof(float), sizeof value);
+    } else {
+        uint16_t bits;
+        uint32_t wide;
+        memcpy(&bits, base + (size_t)index * sizeof bits, sizeof bits);
+        wide = (uint32_t)bits << 16;
+        memcpy(&value, &wide, sizeof value);
+    }
     return value;
 }
 
@@ -4648,10 +4749,16 @@ static int metal_text_begin_depth(void *backend_state, void *command_state,
             state->program->layers[layer].descriptor;
         const SaltAttentionDesc *attention = &source->plan->attention;
         const MetalTextLayerRefs *refs = &state->layers[layer];
-        uint32_t pairs = (uint32_t)attention->rope_dim / 2u;
-        float *meta = (float *)[_op_meta contents] + refs->meta_float_offset;
-        if (refs->q_norm.encoding != SALT_TENSOR_ENCODING_F32 ||
-            refs->k_norm.encoding != SALT_TENSOR_ENCODING_F32 ||
+        uint32_t pairs;
+        float *meta;
+        if (attention->kind == SALT_ATTN_MODEL)
+            continue;
+        pairs = (uint32_t)attention->rope_dim / 2u;
+        meta = (float *)[_op_meta contents] + refs->meta_float_offset;
+        if ((refs->q_norm.encoding != SALT_TENSOR_ENCODING_F32 &&
+             refs->q_norm.encoding != SALT_TENSOR_ENCODING_BF16) ||
+            (refs->k_norm.encoding != SALT_TENSOR_ENCODING_F32 &&
+             refs->k_norm.encoding != SALT_TENSOR_ENCODING_BF16) ||
             refs->q_norm.cols != (uint32_t)attention->head_dim ||
             refs->k_norm.cols != (uint32_t)attention->head_dim)
             return -1;
@@ -4776,6 +4883,8 @@ static int metal_text_begin_frontier(
         const SaltAttentionDesc *attention =
             &state->program->layers[layer].descriptor->plan->attention;
         const MetalTextLayerRefs *refs = &state->layers[layer];
+        if (attention->kind == SALT_ATTN_MODEL)
+            continue;
         uint32_t pairs = (uint32_t)attention->rope_dim / 2u;
         float *meta = (float *)[_op_meta contents] + refs->meta_float_offset;
         float *cosines = meta + 2u * attention->head_dim;
@@ -4808,6 +4917,29 @@ static int metal_text_encode_projection(
         ref->cols == 0 || input_offset % sizeof(float) != 0 ||
         output_offset % sizeof(float) != 0)
         return -1;
+    if (ref->encoding != SALT_TENSOR_ENCODING_AFFINE_Q4 &&
+        ref->encoding != SALT_TENSOR_ENCODING_AFFINE_Q8) {
+        SaltTextModelGpuProjectArgs args;
+        int rc;
+        if (!state->model_gpu_ops || !state->model_gpu_ops->project)
+            return -1;
+        memset(&args, 0, sizeof args);
+        args.backend = SALT_TEXT_MODEL_GPU_METAL;
+        args.command = (void *)command->command;
+        args.canonical = state->canonical.backend;
+        args.canonical_bytes = state->canonical_bytes;
+        args.tensor = metal_text_model_view(ref);
+        args.input_offset = input_offset;
+        args.output_offset = output_offset;
+        args.rows = batch;
+        rc = state->model_gpu_ops->project(state->model_gpu_context, &args,
+            state->model_gpu_state, state->model_gpu_state_bytes);
+        if (rc == 0) {
+            command->stats.projection_dispatches++;
+            command->stats.backend_physical_kernel_nodes++;
+        }
+        return rc;
+    }
     canonical = (id<MTLBuffer>)state->canonical.backend;
     encoder = [command->command computeCommandEncoder];
     if (!encoder) return -1;
@@ -4917,6 +5049,34 @@ static int metal_text_encode_projection(
     return 0;
 }
 
+typedef struct MetalTextModelProjectContext {
+    MetalTextProgramState *state;
+    MetalTextProgramCommand *command;
+} MetalTextModelProjectContext;
+
+static int metal_text_model_project(void *opaque,
+        const SaltTextModelGpuTensorView *view,
+        uint64_t input_offset, uint64_t output_offset, uint32_t rows) {
+    MetalTextModelProjectContext *context =
+        (MetalTextModelProjectContext *)opaque;
+    MetalTextTensorRef ref;
+    if (!context || !context->state || !context->command || !view ||
+        !view->resource)
+        return -1;
+    memset(&ref, 0, sizeof ref);
+    ref.value = (id<MTLBuffer>)view->resource;
+    ref.scale = ref.value;
+    ref.bias = ref.value;
+    ref.value_offset = (NSUInteger)view->value_offset;
+    ref.scale_offset = (NSUInteger)view->scale_offset;
+    ref.bias_offset = (NSUInteger)view->bias_offset;
+    ref.rows = view->rows;
+    ref.cols = view->cols;
+    ref.encoding = view->encoding;
+    return metal_text_encode_projection(context->state, context->command, &ref,
+        (size_t)input_offset, (size_t)output_offset, rows);
+}
+
 static int metal_text_encode_embedding(
         MetalTextProgramState *state, MetalTextProgramCommand *command) {
     const MetalTextTensorRef *ref = &state->embedding;
@@ -4927,11 +5087,33 @@ static int metal_text_encode_embedding(
         float scale;
     } args;
     uint64_t elements;
-    if (!command->command ||
-        ref->encoding != SALT_TENSOR_ENCODING_AFFINE_Q4 ||
-        !ref->value || !ref->scale || !ref->bias ||
+    if (!command->command || !ref->value || !ref->scale || !ref->bias ||
         ref->rows != state->program->vocabulary ||
         ref->cols != state->program->hidden)
+        return -1;
+    if (ref->encoding == SALT_TENSOR_ENCODING_AFFINE_Q6) {
+        SaltTextModelGpuEmbeddingArgs model_args;
+        int rc;
+        if (!state->model_gpu_ops || !state->model_gpu_ops->embedding)
+            return -1;
+        memset(&model_args, 0, sizeof model_args);
+        model_args.backend = SALT_TEXT_MODEL_GPU_METAL;
+        model_args.command = (void *)command->command;
+        model_args.canonical = state->canonical.backend;
+        model_args.canonical_bytes = state->canonical_bytes;
+        model_args.tensor = metal_text_model_view(ref);
+        model_args.token_ids_offset =
+            state->program->layout.candidate_token_ids;
+        model_args.output_offset = state->program->layout.state_a;
+        model_args.token_count = command->input_count;
+        model_args.scale = state->program->descriptor->embedding_scale;
+        rc = state->model_gpu_ops->embedding(state->model_gpu_context,
+            &model_args, state->model_gpu_state,
+            state->model_gpu_state_bytes);
+        if (rc == 0) command->stats.backend_physical_kernel_nodes++;
+        return rc;
+    }
+    if (ref->encoding != SALT_TENSOR_ENCODING_AFFINE_Q4)
         return -1;
     elements = (uint64_t)command->input_count * ref->cols;
     if (elements > NSUIntegerMax) return -1;
@@ -4964,23 +5146,25 @@ static int metal_text_encode_embedding(
 static int metal_text_encode_activation(
         MetalTextProgramState *state, MetalTextProgramCommand *command,
         size_t gate_offset, size_t up_offset, size_t output_offset,
-        size_t elements) {
+        size_t elements, SaltActivationKind activation, float activation_limit) {
     id<MTLComputeCommandEncoder> encoder;
-    uint32_t count;
+    struct { uint32_t count, kind; float limit; } args;
     if (!state || !command || !command->command || elements == 0 ||
         elements > UINT32_MAX) return -1;
-    count = (uint32_t)elements;
+    args.count = (uint32_t)elements;
+    args.kind = (uint32_t)activation;
+    args.limit = activation_limit;
     encoder = [command->command computeCommandEncoder];
     if (!encoder) return -1;
-    [encoder setComputePipelineState:_activation_pso];
+    [encoder setComputePipelineState:_text_activation_pso];
     [encoder setBuffer:(id<MTLBuffer>)state->canonical.backend
                 offset:gate_offset atIndex:0];
     [encoder setBuffer:(id<MTLBuffer>)state->canonical.backend
                 offset:up_offset atIndex:1];
     [encoder setBuffer:(id<MTLBuffer>)state->canonical.backend
                 offset:output_offset atIndex:2];
-    [encoder setBytes:&count length:sizeof count atIndex:3];
-    [encoder dispatchThreads:MTLSizeMake(count, 1, 1)
+    [encoder setBytes:&args length:sizeof args atIndex:3];
+    [encoder dispatchThreads:MTLSizeMake(args.count, 1, 1)
          threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     [encoder endEncoding];
     command->stats.backend_physical_kernel_nodes++;
@@ -5139,6 +5323,8 @@ static int metal_text_live_b1_validate(MetalTextProgramState *state,
         const SaltAttentionDesc *attention = &compiled->descriptor->plan->attention;
         id<MTLBuffer> buffer;
         size_t offset;
+        if (compiled->kv_width == 0u)
+            continue;
         if (!kv || metal_text_live_b1_row(&kv->keys, attention,
                 compiled->kv_width, command->source_position,
                 &buffer, &offset) != 0 ||
@@ -5162,7 +5348,7 @@ static int metal_text_encode_attention_transform(
     id<MTLComputeCommandEncoder> encoder;
     struct {
         uint32_t n_heads, n_kv_heads, head_dim, rope_dim, batch;
-        uint32_t qstride, kvstride, rope_pairs, shared_kv;
+        uint32_t qstride, kvstride, rope_pairs, shared_kv, raw_values;
         float eps;
     } args = {
         (uint32_t)attention->n_heads, (uint32_t)attention->n_kv_heads,
@@ -5170,6 +5356,7 @@ static int metal_text_encode_attention_transform(
         command->input_count, compiled->query_width, compiled->kv_width,
         (uint32_t)attention->rope_dim / 2u,
         0u,
+        attention->raw_values ? 1u : 0u,
         state->program->descriptor->norm_epsilon,
     };
     uint64_t tasks = (uint64_t)command->input_count *
@@ -5245,6 +5432,7 @@ static int metal_text_encode_attention_body(
         uint32_t source, batch, qstride, kvstride;
         uint32_t private_mode, private_capacity, private_base;
         uint32_t shared_rows, shared_stride;
+        float score_scale;
     } args;
     uint64_t tasks;
     size_t score_bytes;
@@ -5273,6 +5461,7 @@ static int metal_text_encode_attention_body(
     args.private_base = kv->keys.private_position_base;
     args.shared_rows = shared_kr;
     args.shared_stride = shared_ks;
+    args.score_scale = attention->score_scale;
     tasks = (uint64_t)command->input_count * attention->n_heads;
     score_bytes = (size_t)command->attention_score_rows * sizeof(float);
     if (tasks == 0 || tasks > NSUIntegerMax || score_bytes > 32u * 1024u)
@@ -5596,17 +5785,20 @@ static int metal_text_encode_expert_chain(
         return -1;
     }
     [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
-    [encoder setComputePipelineState:_activation_pso];
+    [encoder setComputePipelineState:_text_activation_pso];
     [encoder setBuffer:(id<MTLBuffer>)state->canonical.backend
                 offset:layout->routed_gate atIndex:0];
     [encoder setBuffer:(id<MTLBuffer>)state->canonical.backend
                 offset:layout->routed_up atIndex:1];
     [encoder setBuffer:(id<MTLBuffer>)state->canonical.backend
                 offset:layout->routed_chain atIndex:2];
-    uint32_t elements = (uint32_t)(row_prefix *
-        (uint32_t)plan->expert_intermediate);
-    [encoder setBytes:&elements length:sizeof elements atIndex:3];
-    [encoder dispatchThreads:MTLSizeMake(elements, 1, 1)
+    struct { uint32_t count, kind; float limit; } activation_args = {
+        (uint32_t)(row_prefix * (uint32_t)plan->expert_intermediate),
+        (uint32_t)plan->activation,
+        plan->activation_limit,
+    };
+    [encoder setBytes:&activation_args length:sizeof activation_args atIndex:3];
+    [encoder dispatchThreads:MTLSizeMake(activation_args.count, 1, 1)
          threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
     if (metal_selected_encode_ragged(encoder, _wave_selected_args,
@@ -5685,8 +5877,10 @@ static int metal_text_encode_rows(
         width == 0 || x_offset % sizeof(float) != 0 ||
         y_offset % sizeof(float) != 0 ||
         (z_offset != SIZE_MAX && z_offset % sizeof(float) != 0) ||
-        (weight && (weight->encoding != SALT_TENSOR_ENCODING_F32 ||
-                    !weight->value)))
+        (weight &&
+         (weight->encoding != SALT_TENSOR_ENCODING_F32 &&
+          weight->encoding != SALT_TENSOR_ENCODING_BF16)) ||
+        (weight && !weight->value))
         return -1;
     args.x = x_offset / sizeof(float);
     args.y = y_offset / sizeof(float);
@@ -5694,6 +5888,10 @@ static int metal_text_encode_rows(
     args.rows = rows;
     args.width = width;
     args.aux = aux;
+    if (pipeline == _text_rms_rows_pso ||
+        pipeline == _text_residual_rows_pso ||
+        pipeline == _text_router_rows_pso)
+        args.aux = weight ? weight->encoding : 0u;
     args.eps = eps;
     args.scalar = scalar;
     int parallel_b1 = command->authoritative && command->input_count == 1u &&
@@ -5785,8 +5983,26 @@ static int metal_text_encode_combine(
         float eps, scalar;
     } args;
     float scalar = 1.0f;
-    if (!refs || !plan ||
-        refs->post_ffn_norm_1.encoding != SALT_TENSOR_ENCODING_F32 ||
+    if (!refs || !plan) return -1;
+    if (!plan->residual_postnorm) {
+        size_t branch = plan->dense_intermediate > 0
+            ? layout->dense_output : layout->routed_output;
+        if (plan->parallel_dense_routed && !plan->pinned) {
+            if (metal_text_encode_rows(state, command,
+                    _text_residual_rows_pso, NULL,
+                    layout->dense_output, layout->routed_output,
+                    layout->combine_a, command->input_count,
+                    state->program->hidden, 0u,
+                    state->program->descriptor->norm_epsilon, 1.0f) != 0)
+                return -1;
+            branch = layout->combine_a;
+        }
+        return metal_text_encode_rows(state, command,
+            _text_residual_rows_pso, NULL, layout->state_b, branch,
+            layout->state_a, command->input_count, state->program->hidden,
+            0u, state->program->descriptor->norm_epsilon, 1.0f);
+    }
+    if (refs->post_ffn_norm_1.encoding != SALT_TENSOR_ENCODING_F32 ||
         refs->post_ffn_norm_2.encoding != SALT_TENSOR_ENCODING_F32 ||
         refs->post_ffn_norm.encoding != SALT_TENSOR_ENCODING_F32)
         return -1;
@@ -5831,6 +6047,46 @@ static int metal_text_encode_combine(
     [encoder endEncoding];
     command->stats.backend_physical_kernel_nodes++;
     return 0;
+}
+
+static int metal_text_encode_model_layer(
+        MetalTextProgramState *state, MetalTextProgramCommand *command,
+        const SaltTextCompiledLayer *compiled,
+        const MetalTextLayerRefs *refs, uint32_t layer, uint32_t rows) {
+    SaltTextModelGpuEncodeArgs args;
+    MetalTextModelProjectContext project;
+    const SaltTextCanonicalLayout *layout;
+    if (!state || !command || !compiled || !compiled->descriptor || !refs ||
+        !state->model_gpu_ops || !state->model_gpu_ops->encode ||
+        !command->command || rows == 0u)
+        return -1;
+    layout = &state->program->layout;
+    memset(&args, 0, sizeof args);
+    args.backend = SALT_TEXT_MODEL_GPU_METAL;
+    args.command = (void *)command->command;
+    args.canonical = state->canonical.backend;
+    project.state = state;
+    project.command = command;
+    args.backend_context = &project;
+    args.project = metal_text_model_project;
+    args.canonical_bytes = state->canonical_bytes;
+    args.layer = layer;
+    args.rows = rows;
+    args.hidden = state->program->hidden;
+    args.normalized_offset = layout->normalized;
+    args.scratch_offset = layout->model_scratch;
+    args.scratch_float_capacity =
+        (size_t)rows * layout->maximum_model_scratch_floats;
+    args.state_offset = compiled->model_state_offset;
+    args.state_bytes = compiled->model_state_bytes;
+    args.output_offset = layout->branch;
+    args.input_projection = metal_text_model_view(
+        &refs->model_input_projection);
+    args.kernel = metal_text_model_view(&refs->model_kernel);
+    args.output_projection = metal_text_model_view(
+        &refs->model_output_projection);
+    return state->model_gpu_ops->encode(state->model_gpu_context, &args,
+        state->model_gpu_state, state->model_gpu_state_bytes);
 }
 
 static int metal_text_encode_cell(
@@ -5890,6 +6146,11 @@ static int metal_text_encode_cell(
             SIZE_MAX, input_count, program->hidden, 1u,
             program->descriptor->norm_epsilon, 1.0f);
         break;
+    case SALT_TEXT_CELL_MODEL_LAYER:
+        rc = metal_text_encode_model_layer(state, command, compiled, refs,
+            cell->layer, input_count);
+        if (rc == 0) command->stats.backend_physical_kernel_nodes += 3u;
+        break;
     case SALT_TEXT_CELL_QUERY_PROJECTION:
         rc = metal_text_encode_projection(state, command, &refs->q,
             layout->normalized, layout->queries, input_count);
@@ -5915,8 +6176,10 @@ static int metal_text_encode_cell(
         break;
     case SALT_TEXT_CELL_ATTENTION_COMBINE:
         rc = metal_text_encode_rows(state, command, _text_residual_rows_pso,
-            &refs->post_attention_norm, layout->state_a, layout->branch,
-            layout->state_b, input_count, program->hidden, 0u,
+            plan->residual_postnorm ? &refs->post_attention_norm : NULL,
+            layout->state_a, layout->branch,
+            layout->state_b, input_count, program->hidden,
+            (uint32_t)plan->residual_postnorm,
             program->descriptor->norm_epsilon, 1.0f);
         break;
     case SALT_TEXT_CELL_DENSE_NORM:
@@ -5941,33 +6204,74 @@ static int metal_text_encode_cell(
     case SALT_TEXT_CELL_DENSE_ACTIVATION:
         rc = metal_text_encode_activation(state, command,
             layout->dense_gate, layout->dense_up, layout->dense_chain,
-            (size_t)input_count * (uint32_t)plan->dense_intermediate);
+            (size_t)input_count * (uint32_t)plan->dense_intermediate,
+            plan->activation, plan->activation_limit);
         break;
     case SALT_TEXT_CELL_DENSE_DOWN:
         rc = metal_text_encode_projection(state, command, &refs->dense_down,
             layout->dense_chain, layout->dense_output, input_count);
         break;
     case SALT_TEXT_CELL_ROUTER_INPUT:
-        rc = metal_text_encode_rows(state, command, _text_router_rows_pso,
-            &refs->router_scale, layout->state_b, layout->router_input,
-            SIZE_MAX, input_count, program->hidden, 0u,
-            program->descriptor->norm_epsilon,
-            1.0f / salt_sqrtf((float)program->hidden));
+        if (!plan->router_rmsnorm) {
+            rc = metal_text_encode_rows(state, command, _text_rms_rows_pso,
+                &refs->pre_ffn_norm_2, layout->state_b,
+                layout->router_input, SIZE_MAX, input_count,
+                program->hidden, 1u, program->descriptor->norm_epsilon, 1.0f);
+        } else {
+            rc = metal_text_encode_rows(state, command, _text_router_rows_pso,
+                &refs->router_scale, layout->state_b, layout->router_input,
+                SIZE_MAX, input_count, program->hidden, 0u,
+                program->descriptor->norm_epsilon,
+                1.0f / salt_sqrtf((float)program->hidden));
+        }
         break;
     case SALT_TEXT_CELL_ROUTER_PROJECTION:
         rc = metal_text_encode_projection(state, command, &refs->router,
             layout->router_input, layout->router_logits, input_count);
         break;
     case SALT_TEXT_CELL_ROUTED_NORM:
-        rc = 0;
+        rc = metal_text_encode_rows(state, command, _text_rms_rows_pso,
+            &refs->pre_ffn_norm_2, layout->state_b, layout->combine_a,
+            SIZE_MAX, input_count, program->hidden, 1u,
+            program->descriptor->norm_epsilon, 1.0f);
         break;
     case SALT_TEXT_CELL_ROUTER_TOPK:
-        rc = metal_text_encode_topk_rows(state, command,
-            &refs->per_expert_scale, layout->router_logits,
-            layout->selected_experts, layout->selected_weights,
-            input_count, (uint32_t)plan->n_experts,
-            (uint32_t)plan->top_k_experts);
-        if (rc == 0)
+        if (plan->router_kind == SALT_ROUTER_MODEL) {
+            SaltTextModelGpuRouterArgs router_args;
+            if (!state->model_gpu_ops || !state->model_gpu_ops->router_topk)
+                return -1;
+            memset(&router_args, 0, sizeof router_args);
+            router_args.backend = SALT_TEXT_MODEL_GPU_METAL;
+            router_args.command = (void *)command->command;
+            router_args.canonical = state->canonical.backend;
+            router_args.canonical_bytes = state->canonical_bytes;
+            router_args.expert_bias = metal_text_model_view(
+                &refs->per_expert_scale);
+            router_args.logits_offset = layout->router_logits;
+            router_args.selected_offset = layout->selected_experts;
+            router_args.weights_offset = layout->selected_weights;
+            router_args.grouped_offset = layout->grouped_to_canonical;
+            router_args.inverse_offset = layout->canonical_to_grouped;
+            router_args.scratch_offset = layout->tensor_row;
+            router_args.source_offset = layout->combine_a;
+            router_args.routed_offset = layout->routed_input;
+            router_args.rows = input_count;
+            router_args.experts = (uint32_t)plan->n_experts;
+            router_args.topk = (uint32_t)plan->top_k_experts;
+            router_args.hidden = program->hidden;
+            router_args.normalize_topk = plan->router_normalize_topk;
+            router_args.router_scale = plan->router_scale;
+            rc = state->model_gpu_ops->router_topk(
+                state->model_gpu_context, &router_args,
+                state->model_gpu_state, state->model_gpu_state_bytes);
+        } else {
+            rc = metal_text_encode_topk_rows(state, command,
+                &refs->per_expert_scale, layout->router_logits,
+                layout->selected_experts, layout->selected_weights,
+                input_count, (uint32_t)plan->n_experts,
+                (uint32_t)plan->top_k_experts);
+        }
+        if (rc == 0 && plan->router_kind != SALT_ROUTER_MODEL)
             rc = metal_text_encode_route_complete(state, command,
                 (uint32_t)plan->n_experts, (uint32_t)plan->top_k_experts);
         break;
@@ -6011,7 +6315,7 @@ static int metal_text_encode_cell(
     case SALT_TEXT_CELL_LOGIT_SOFTCAP: {
         float cap = state->program->layers[state->layer_count - 1u].descriptor->
             plan->logit_softcap;
-        rc = actual == 0u ? 0 :
+        rc = actual == 0u || !(cap > 0.0f) ? 0 :
             metal_text_encode_softcap(state, command,
                 layout->position_logits +
                     (size_t)output_first * program->vocabulary * sizeof(float),
@@ -6185,6 +6489,10 @@ static int metal_text_destroy(void *backend_state, void *command_state) {
     if (!state || state->magic != METAL_TEXT_MAGIC || !command ||
         command->phase != METAL_TEXT_IDLE || command->command)
         return -1;
+    if (state->model_gpu_ops && state->model_gpu_ops->destroy)
+        state->model_gpu_ops->destroy(state->model_gpu_context,
+            SALT_TEXT_MODEL_GPU_METAL, state->model_gpu_state,
+            state->model_gpu_state_bytes);
     if (salt_gpu_shared_buffer_free(&state->canonical) != 0) return -1;
     memset(state, 0, sizeof *state);
     memset(command, 0, sizeof *command);

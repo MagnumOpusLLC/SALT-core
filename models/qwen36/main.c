@@ -234,6 +234,7 @@ static void usage(const char *argv0) {
         "                        env SALT_CACHE_GB; CLI wins)\\n"
         "  --trunk-gb X        trunk pin budget in GB          (default 4)\n"
         "  --pin-layers N      explicit pinned trunk prefix    (default auto)\n"
+        "  --trunk-mapped      CPU canonical mapped retention (default off)\n"
         "  --nring N           trunk ring slots, >= 2          (default 2)\n"
         "  --gen N             tokens to generate              (default 4)\n"
         "  --mem-limit-gb X    application-footprint hard ceiling in GB\n"
@@ -418,7 +419,15 @@ static const uint8_t *runtime_trunk_bind(SaltTrunk *trunk, int layer,
                                          int *release_failed) {
     static int address_source_reported = 0;
     if (release_failed) *release_failed = 0;
-    if (!gpu_trunk_enabled) return salt_trunk_bind(trunk, layer);
+    if (!gpu_trunk_enabled) {
+        /* CPU consumers complete before the next layer is admitted. */
+        if (trunk->mapped_mode && trunk->map_base &&
+            trunk->mapped_layer != layer && salt_trunk_unbind(trunk) != 0) {
+            if (release_failed) *release_failed = 1;
+            return NULL;
+        }
+        return salt_trunk_bind(trunk, layer);
+    }
     if (gpu_trunk_layer_release(trunk, 1, device_active) != 0) {
         if (release_failed) *release_failed = 1;
         return NULL;
@@ -611,6 +620,7 @@ int main(int argc, char **argv) {
                                     whole 864.6MB trunk pins) + base
                                     ~1.6GB = ~4.5-5GB PEAK RSS. */
     int pin_layers = -1, nring = 2, gen = 4, threads = 4, refuse = 1;
+    int trunk_mapped = 0;
     /* --gpu and SALT_GPU=1 both funnel through the env var; head.c
      * reads SALT_GPU to decide whether to try the Metal path. */
     /* SALT_STRIP_THINK=1 (opt-in, default off): suppress the model's
@@ -657,6 +667,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--gpu")) setenv("SALT_GPU", "1", 1);
         else if (!strcmp(argv[i], "--trunk-gb") && i + 1 < argc) trunk_gb = atof(argv[++i]);
         else if (!strcmp(argv[i], "--pin-layers") && i + 1 < argc) pin_layers = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--trunk-mapped")) trunk_mapped = 1;
         else if (!strcmp(argv[i], "--nring") && i + 1 < argc) nring = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--gen") && i + 1 < argc) gen = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--mem-limit-gb") && i + 1 < argc) {
@@ -723,6 +734,12 @@ int main(int argc, char **argv) {
     /* Subordinate GPU policy is inert while the model's master switch is off.
      * This lets a CPU-default blueprint describe its qualified opt-in mode. */
     int gpu_trunk_prefill_only = gpu_intent && gpu_trunk_prefill_requested;
+    if (trunk_mapped && (gpu_intent || !isfinite(trunk_gb) ||
+            trunk_gb <= 0.0 || trunk_gb >= (double)INT64_MAX / 1e9)) {
+        fprintf(stderr, "--trunk-mapped requires CPU execution and a finite "
+                "positive --trunk-gb; pageable GPU binding is not qualified\n");
+        return 1;
+    }
     if (gpu_trunk_prefill_requested && gpu_intent && !gpu_trunk_intent) {
         fprintf(stderr, "gpu-trunk: SALT_GPU_TRUNK_PREFILL_ONLY requires "
                 "SALT_GPU=1 and SALT_GPU_TRUNK=1\n");
@@ -775,7 +792,18 @@ int main(int argc, char **argv) {
     /* pin plan: explicit or fixed-point against the trunk budget */
     int npin;
     int64_t slot;
-    if (pin_layers >= 0) {
+    int64_t mapped_retained_bytes = 0, mapped_working_bytes = 0;
+    if (trunk_mapped) {
+        if (salt_trunk_plan_mapped(&trunk, (int64_t)(trunk_gb * 1e9),
+                pin_layers, &npin, &mapped_retained_bytes,
+                &mapped_working_bytes) != 0) {
+            fprintf(stderr, "mapped trunk prefix/working set exceeds budget "
+                    "or has invalid source extents\n");
+            startup_storage_release(&pool, &trunk, NULL, 0);
+            return 1;
+        }
+        slot = 0;
+    } else if (pin_layers >= 0) {
         npin = pin_layers > trunk.n_layers ? trunk.n_layers : pin_layers;
         slot = 0;
         for (int L = npin; L < trunk.n_layers; L++)
@@ -796,10 +824,15 @@ int main(int argc, char **argv) {
 
     SaltMemPlan plan;
     salt_mem_plan(&plan, &cfg, 0, cache_bytes, shared_bytes, npin, slot,
-                  gpu_trunk_intent && !gpu_trunk_prefill_only ? 0 : nring);
+                  trunk_mapped || (gpu_trunk_intent && !gpu_trunk_prefill_only)
+                      ? 0 : nring);
     /* the plan needs the REAL pinned bytes, not a budget guess */
     plan.trunk_pin_b = 0;
     for (int L = 0; L < npin; L++) plan.trunk_pin_b += (double)trunk.lay[L].nbytes;
+    if (trunk_mapped) {
+        plan.trunk_pin_b = (double)mapped_retained_bytes;
+        plan.trunk_ring_b = (double)mapped_working_bytes;
+    }
     plan.need_b = plan.trunk_pin_b + plan.trunk_ring_b + plan.cache_b +
                   plan.shared_b + plan.state_b + plan.index_b;
     salt_mem_print(&plan);
@@ -817,7 +850,17 @@ int main(int argc, char **argv) {
 
     SaltTrunk gpu_prefill_trunk;
     int gpu_prefill_trunk_open = 0;
-    if (gpu_trunk_prefill_only) {
+    if (trunk_mapped) {
+        fprintf(stderr, "trunk: CPU canonical mapped retention "
+                "npin=%d retained_bytes=%lld working_bytes=%lld copied_bytes=0\n",
+                npin, (long long)mapped_retained_bytes,
+                (long long)mapped_working_bytes);
+        if (salt_trunk_start_mapped_retained(&trunk, npin,
+                (int64_t)(trunk_gb * 1e9)) != 0) {
+            startup_storage_release(&pool, &trunk, NULL, 0);
+            return 2;
+        }
+    } else if (gpu_trunk_prefill_only) {
         fprintf(stderr,
                 "gpu-trunk: phase mix prefill=bounded-metal decode=cpu\n");
         fprintf(stderr, "moe: starting CPU decode trunk "

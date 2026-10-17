@@ -3,6 +3,7 @@
 #include "salt/moe.h"
 
 #include <math.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -280,6 +281,17 @@ static SaltTextVerifyExecutor *mock_shadow_executor;
 static int mock_need_resource;
 static int mock_resource_acquires;
 static int mock_resource_releases;
+static int mock_defer_resources;
+static int mock_consumers_completed;
+static const SaltTextVerifyExecutorOps *publication_test_ops;
+
+static int publication_test_finish(void *context,
+        const SaltTextVerifyProgram *program, SaltTextExecutionView *view,
+        SaltTextVerifyBackendStats *stats) {
+    int rc = publication_test_ops->finish(context, program, view, stats);
+    if (rc == 0) view->backend_published_kv = 1u;
+    return rc;
+}
 
 static const F32Binding *f32_binding(const SaltTextTensorDesc *tensor) {
     const F32Binding *binding;
@@ -431,6 +443,8 @@ static int mock_gpu_requirements(
     requirement->backend_state_bytes = sizeof(MockGpuState);
     requirement->command_bytes = sizeof(MockGpuCommand);
     requirement->maximum_commands = program->dispatch.cell_count;
+    requirement->flags = mock_defer_resources
+        ? SALT_TEXT_GPU_DEFER_EXPERT_RELEASE : 0u;
     return 0;
 }
 
@@ -526,8 +540,15 @@ static int mock_gpu_barrier(void *backend_state, void *command,
         dependency_epoch == 0 || completion_epoch <= dependency_epoch)
         return -1;
     state->barriers++;
-    if (state->need_resource && !state->resource_resumed)
+    if (state->need_resource &&
+        cmd->next_cell < state->program->dispatch.cell_count &&
+        state->program->dispatch.cells[cmd->next_cell].kind ==
+            SALT_TEXT_CELL_EXPERT_GATE &&
+        (uint32_t)state->resource_resumed !=
+            state->program->dispatch.cells[cmd->next_cell].layer + 1u) {
+        mock_consumers_completed = 1;
         return SALT_TEXT_GPU_NEED_RESOURCE;
+    }
     return 0;
 }
 
@@ -569,11 +590,14 @@ static int mock_gpu_resource_request(
         void *backend_state, void *command, uint32_t *layer,
         int32_t *experts, uint32_t expert_capacity, uint32_t *expert_count) {
     MockGpuState *state = (MockGpuState *)backend_state;
-    (void)command;
-    if (!state || !layer || !experts || !expert_count || expert_capacity < 1 ||
-        !state->need_resource || state->resource_resumed)
+    MockGpuCommand *cmd = (MockGpuCommand *)command;
+    if (!state || !cmd || !layer || !experts || !expert_count ||
+        expert_capacity < 1 || !state->need_resource ||
+        cmd->next_cell >= state->program->dispatch.cell_count ||
+        state->program->dispatch.cells[cmd->next_cell].kind !=
+            SALT_TEXT_CELL_EXPERT_GATE)
         return -1;
-    *layer = 0;
+    *layer = state->program->dispatch.cells[cmd->next_cell].layer;
     experts[0] = 3;
     *expert_count = 1;
     return 0;
@@ -584,17 +608,20 @@ static int mock_gpu_resource_resume(
         const int32_t *experts, const int32_t *slots, uint32_t expert_count) {
     MockGpuState *state = (MockGpuState *)backend_state;
     (void)command;
-    if (!state || layer != 0 || !experts || experts[0] != 3 || !slots ||
+    if (!state || layer >= state->program->layer_count ||
+        !experts || experts[0] != 3 || !slots ||
         slots[0] != 42 || expert_count != 1)
         return -1;
-    state->resource_resumed = 1;
+    state->resource_resumed = (int)layer + 1;
+    mock_consumers_completed = 0;
     return 0;
 }
 
 static int mock_resource_acquire(void *opaque, uint32_t layer,
         const int32_t *experts, uint32_t count, int32_t *slots) {
     (void)opaque;
-    if (layer != 0 || !experts || experts[0] != 3 || count != 1 || !slots)
+    if (layer >= mock_shadow_executor->program->layer_count ||
+        !experts || experts[0] != 3 || count != 1 || !slots)
         return -1;
     slots[0] = 42;
     mock_resource_acquires++;
@@ -604,8 +631,10 @@ static int mock_resource_acquire(void *opaque, uint32_t layer,
 static int mock_resource_release(void *opaque, uint32_t layer,
         const int32_t *experts, const int32_t *slots, uint32_t count) {
     (void)opaque;
-    if (layer != 0 || !experts || experts[0] != 3 || !slots ||
-        slots[0] != 42 || count != 1)
+    if (layer >= mock_shadow_executor->program->layer_count ||
+        !experts || experts[0] != 3 || !slots ||
+        slots[0] != 42 || count != 1 ||
+        (mock_defer_resources && !mock_consumers_completed))
         return -1;
     mock_resource_releases++;
     return 0;
@@ -634,6 +663,8 @@ static int mock_gpu_finish(void *backend_state, void *command,
     SaltTextExecutionView shadow_view;
     SaltTextVerifyBackendStats shadow_stats;
     if (!state || !cmd || !cmd->submitted || !view || !stats ||
+        (mock_defer_resources && state->need_resource &&
+         mock_resource_acquires != mock_resource_releases + 1) ||
         state->shadow->ops->finish(state->shadow->context,
             state->shadow->program, &shadow_view, &shadow_stats) != 0 ||
         !shadow_view.canonical_base ||
@@ -644,6 +675,7 @@ static int mock_gpu_finish(void *backend_state, void *command,
     view->canonical_base = mock_gpu_canonical;
     view->canonical_bytes = state->program->layout.total_bytes;
     *stats = shadow_stats;
+    mock_consumers_completed = 1;
     return 0;
 }
 
@@ -1334,6 +1366,15 @@ static int kv_read_view_contract(void) {
               salt_text_kv_read_view_row(&ring, 0u, 4u) == tentative &&
               salt_text_kv_read_view_row(&ring, 1u, 5u) == tentative + 2u,
           "ring wrap reinterpreted committed rows as tentative rows");
+    CHECK(salt_text_kv_read_view_init(&ring, &ring_rows,
+              tentative, 8u, 2u, 4u, 131070u, NULL, NULL, 2u) == 0 &&
+              salt_text_kv_read_view_row(&ring, 0u, 131065u) == NULL &&
+              salt_text_kv_read_view_row(&ring, 0u, 131066u) == private_rows + 4u &&
+              salt_text_kv_read_view_row(&ring, 0u, 131069u) == private_rows + 2u &&
+              salt_text_kv_read_view_row(&ring, 0u, 131070u) == tentative &&
+              salt_text_kv_read_view_row(&ring, 2u, 131072u) == tentative + 4u &&
+              ring_rows.private_float_capacity == 8u,
+          "large absolute position expanded or misaddressed bounded ring");
     unchanged = frontier;
     parents[2] = 2u;
     CHECK(salt_text_kv_read_view_init(&frontier, &rows,
@@ -1897,6 +1938,7 @@ static int run_scenario(SyntheticPackage *package,
               route_result.produced_count == CANDIDATES + 1u &&
               route_result.pending_token_id == serial_result.pending_token_id &&
               route_result.winning_node_index == CANDIDATES - 1u &&
+              route_result.projection_rows == CANDIDATES &&
               route_result.backend.engine_submissions == 1u &&
               route_result.backend.completion_fences == 1u &&
               route_result.backend.initial_transfer_bytes ==
@@ -1923,10 +1965,42 @@ static int run_scenario(SyntheticPackage *package,
               route_result.result_position == source + 2u &&
               route_result.winning_node_index == 1u &&
               route_result.backend.engine_submissions == 1u &&
-              route_result.backend.completion_fences == 1u,
+              route_result.backend.completion_fences == 1u &&
+              route_result.projection_rows == CANDIDATES &&
+              route_result.backend.initial_transfer_bytes ==
+                  CANDIDATES * sizeof(int32_t),
               "N4-F2 depth miss changed accepted prefix");
         CHECK(kv_matches(&route_reject_fixture, &serial_kv[2]),
               "N4-F2 depth miss changed committed KV");
+
+        /* Resume only the corrected suffix through the same engine route used
+         * by a selected production trajectory; never replay accepted rows. */
+        route.source_position = source + 2u;
+        route.transition_generation = 112u;
+        route.route_token_ids = candidates + 2u;
+        route.sequence_tiles = CANDIDATES - 2u;
+        route.route_count = 1u;
+        route.parent_logits = route_result.pending_logits;
+        CHECK(salt_text_verify_route_execute(
+                  &route_reject_fixture.program,
+                  &route_reject_fixture.executor,
+                  &route, &route_result) == 0 &&
+              route_result.accepted_count == CANDIDATES - 2u &&
+              route_result.result_position == source + CANDIDATES &&
+              route_result.pending_token_id == serial_result.pending_token_id &&
+              route_result.projection_rows == CANDIDATES - 2u &&
+              route_result.backend.engine_submissions == 1u &&
+              route_result.backend.completion_fences == 1u &&
+              route_result.backend.initial_transfer_bytes ==
+                  (CANDIDATES - 2u) * sizeof(int32_t),
+              "X suffix was split or replayed accepted prefix");
+        CHECK(kv_matches(&route_reject_fixture, &serial_kv[CANDIDATES]),
+              "X suffix continuation changed complete KV");
+        route.source_position = source;
+        route.route_token_ids = &routes[0][0];
+        route.sequence_tiles = CANDIDATES;
+        route.route_count = 2u;
+        route.parent_logits = parent_logits;
 
         CHECK(prepare_execution(&route_root_miss_fixture,
                   package, mode, source) == 0 &&
@@ -2143,9 +2217,13 @@ static int run_scenario(SyntheticPackage *package,
               "target branch cancellation did not preserve only winning path");
     }
 
+    for (int proof = 0; proof <= 1; proof++) {
     CHECK(prepare_execution(&all_fixture, package, mode, source) == 0 &&
               compile_execution(&all_fixture) == 0,
           "ordinary all-row fixture compilation failed");
+    CHECK(all_fixture.program.proof_state == 0,
+          "compiled program enabled proof by default");
+    all_fixture.program.proof_state = proof;
     {
         SaltTextTouchedSpan spans[SALT_TEXT_MAX_TOUCHED_SPANS];
         uint32_t span_count = 0, score_rows = 0;
@@ -2175,6 +2253,7 @@ static int run_scenario(SyntheticPackage *package,
               all_result.transition_generation == 100u &&
               all_result.backend.engine_submissions == 1u &&
               all_result.backend.completion_fences == 1u &&
+              all_result.backend.final_kv_publish_bytes == expected_all_kv &&
               all_result.backend.intermediate_host_publications == 0u &&
               all_result.view.canonical_base != NULL &&
               all_result.view.canonical_bytes >=
@@ -2186,6 +2265,35 @@ static int run_scenario(SyntheticPackage *package,
     CHECK(kv_matches(&all_fixture, &serial_kv[CANDIDATES]),
           "ordinary all-row KV differs from serial target steps");
 
+    {
+        SaltTextVerifyExecutorOps published_ops;
+        KvSnapshot before;
+        CHECK(prepare_execution(&all_fixture, package, mode, source) == 0 &&
+                  compile_execution(&all_fixture) == 0,
+              "backend publication fixture compilation failed");
+        all_fixture.program.proof_state = proof;
+        snapshot_kv(&all_fixture, &before);
+        publication_test_ops = all_fixture.executor.ops;
+        published_ops = *publication_test_ops;
+        published_ops.finish = publication_test_finish;
+        all_fixture.executor.ops = &published_ops;
+        /* Mock only the publication claim: untouched destination sentinels
+         * prove the core does not copy tentative rows on this branch. */
+        CHECK(salt_text_execute_all(&all_fixture.program,
+                  &all_fixture.executor, 100u, source, candidates,
+                  CANDIDATES, &all_result) == 0 &&
+                  all_result.status == SALT_TEXT_VERIFY_COMMITTED &&
+                  all_result.backend.final_kv_publish_bytes == expected_all_kv &&
+                  all_result.view.backend_published_kv == 1u &&
+                  kv_matches(&all_fixture, &before),
+              "backend publication lost logical bytes or copied host KV");
+        all_fixture.executor.ops = publication_test_ops;
+    }
+    }
+
+    for (int defer_release = 0; defer_release < 2; defer_release++) {
+    mock_defer_resources = defer_release;
+    mock_consumers_completed = 0;
     CHECK(prepare_execution(&heterogeneous_fixture, package, mode, source) == 0 &&
               compile_execution(&heterogeneous_fixture) == 0 &&
               prepare_execution(&heterogeneous_shadow_fixture, package,
@@ -2222,7 +2330,9 @@ static int run_scenario(SyntheticPackage *package,
               heterogeneous_result.backend.intermediate_host_publications == 0u &&
               heterogeneous_result.backend.internal_dependency_barriers + 1u ==
                   heterogeneous_fixture.program.dispatch.cell_count &&
-              mock_resource_acquires == 1 && mock_resource_releases == 1 &&
+              mock_resource_acquires ==
+                  (int)heterogeneous_fixture.program.layer_count &&
+              mock_resource_releases == mock_resource_acquires &&
               mock_authoritative_output_rows == 1u &&
               mock_gpu_extent_calls > 0 &&
               mock_gpu_extent_calls <
@@ -2237,7 +2347,10 @@ static int run_scenario(SyntheticPackage *package,
     CHECK(salt_text_verify_heterogeneous_destroy(
               &heterogeneous_context) == 0,
           "heterogeneous GPU-only executor teardown failed");
-    printf("heterogeneous GPU-only C99 executor (%s): PASS\n", label);
+    printf("heterogeneous GPU-only C99 executor (%s, deferred=%d): PASS\n",
+           label, defer_release);
+    }
+    mock_defer_resources = 0;
 
     CHECK(prepare_execution(&block_fixture, package, mode, source) == 0 &&
               compile_execution(&block_fixture) == 0,
@@ -3619,6 +3732,9 @@ static int target_policy_fixed_shape_contract(void) {
     SaltTextTargetPolicy invalid = compiled;
     SaltTextVerifyProgram program;
     uint32_t effective_x = 0u;
+    CHECK(SALT_TEXT_NFQ_MAX_CHECKS == 512u &&
+              SALT_DPR_MAX_WALK_HORIZON == 356u,
+          "DPR walk expansion changed NFQ checking capacity");
     memset(&program, 0, sizeof program);
     program.ready = 1;
     program.maximum_candidates = 64u;
@@ -3635,12 +3751,21 @@ static int target_policy_fixed_shape_contract(void) {
               &compiled, 512u, 16u, &effective_x) == 0 && effective_x == 4u &&
           salt_text_target_policy_effective_x(
               &compiled, 512u, 2u, &effective_x) == 0 && effective_x == 2u,
-          "KV warmup did not enforce X1 then bounded X4");
+          "KV warmup did not enforce historical X1/warm-X/remaining bounds");
+    compiled.dpr_independent_draft = 1u;
+    CHECK(salt_text_target_policy_effective_x(
+              &compiled, 0u, 16u, &effective_x) == 0 && effective_x == 1u,
+          "DPR draft opt-in changed ordinary cold admission");
     program.target_policy = NULL;
     invalid.candidate_count = 128u;
     CHECK(salt_text_verify_program_bind_target_policy(
               &program, &invalid) != 0,
           "configured target policy admitted N*F*Q candidate count");
+    invalid = compiled;
+    invalid.dpr_independent_draft = 2u;
+    CHECK(salt_text_verify_program_bind_target_policy(
+              &program, &invalid) != 0,
+          "target policy admitted invalid DPR draft mode");
     printf("configured NFQ N/F/Q and X-TARGET policy: PASS\n");
     return 0;
 }
@@ -3790,9 +3915,20 @@ typedef struct HistoryTargetContract {
     const int32_t *truth;
     uint32_t truth_count, position0;
     uint64_t clock;
-    uint32_t steps, targets, emissions, publications, rows_submitted;
+    uint32_t steps, selections, targets, emissions, publications, rows_submitted;
+    uint32_t nfq_checks;
+    uint32_t selection_rank;
+    int32_t selected_root;
     uint32_t proposed_total, accepted_total, history_hits, projection_hits;
-    float rows[4][10];
+    uint32_t invalid_target_shape;
+    uint32_t strict_parent_root;
+    uint32_t proof_limit, proof_calls, proof_checks;
+    uint32_t materializations, materialized_rows;
+    SaltAreaNfqMatrix sublane_matrix;
+    SaltAreaNfqRoute sublane_routes[64];
+    SaltAreaNfqItem sublane_items[64];
+    uint32_t sublane_ready[8];
+    float rows[64][10];
 } HistoryTargetContract;
 
 static uint64_t ht_clock(void *context) {
@@ -3858,17 +3994,51 @@ static int ht_observe_target(void *context, const SaltTextGenerated *g,
     return 0;
 }
 
+static int ht_select_proposal(void *context,
+        SaltTextTokenEpochController *controller,
+        const int32_t *ids, uint32_t count, const float *parent,
+        SaltTextTokenEpochResult *result) {
+    HistoryTargetContract *f = context;
+    int32_t selected;
+    uint32_t winner = UINT32_MAX;
+    if (!f || !controller || !controller->ready || !ids || !parent || !result ||
+        count != f->policy.candidate_count * f->policy.queue_length ||
+        f->selection_rank >= count)
+        return -1;
+    selected = ids[f->selection_rank];
+    for (uint32_t index = 0u; index < count; index++)
+        if (ids[index] == selected) { winner = index; break; }
+    if (winner == UINT32_MAX) return -1;
+    f->selected_root = selected;
+    f->selections++;
+    f->nfq_checks += count;
+    memset(result, 0, sizeof *result);
+    result->path = SALT_TEXT_TOKEN_PATH_COLD_SEARCH;
+    result->target.status = SALT_TEXT_VERIFY_COMMITTED;
+    result->target.produced_count = 1u;
+    result->target.pending_token_id = selected;
+    result->target.winning_node_index = winner;
+    result->target.winning_node_id = winner;
+    result->target.result_position = f->state.position;
+    result->target.transition_generation = f->state.transition_generation + 1u;
+    result->target.pending_logits = parent;
+    result->target.pending_logits_count = 10u;
+    return 0;
+}
+
 static int ht_target(void *context, SaltTextTokenEpochController *controller,
         const int32_t *ids, uint32_t count, const float *parent,
         SaltTextTokenEpochResult *result) {
     HistoryTargetContract *f = context;
-    int32_t root = 0, expected, pending;
+    int32_t expected, pending, parent_root = 0;
     uint32_t accepted = 0u;
-    if (!f || !controller || !ids || count < 2u || count > 4u || !parent || !result)
+    if (!f || !controller || !ids || count < 2u || count > 64u ||
+        !parent || !result)
         return -1;
     for (int32_t token = 1; token < 10; token++)
-        if (parent[token] > parent[root]) root = token;
-    if (ids[0] != root) return -1;
+        if (parent[token] > parent[parent_root]) parent_root = token;
+    if (ids[0] != (f->strict_parent_root ? parent_root : f->selected_root))
+        return -1;
     /* One batched forward: every row is "computed", then the validity vector
      * is reduced to its first false. */
     f->targets++;
@@ -3901,6 +4071,11 @@ static int ht_target(void *context, SaltTextTokenEpochController *controller,
     result->target.pending_logits_count = 10u;
     result->target.projection_logits = &f->rows[0][0];
     result->target.projection_rows = count;
+    result->target.backend.engine_submissions =
+        f->invalid_target_shape == 1u ? count : 1u;
+    result->target.backend.completion_fences = 1u;
+    if (f->invalid_target_shape == 2u)
+        result->target.projection_rows = 1u;
     f->projection.logits = &f->rows[0][0];
     f->projection.generation = f->state.transition_generation;
     f->projection.position = f->state.position;
@@ -3911,6 +4086,271 @@ static int ht_target(void *context, SaltTextTokenEpochController *controller,
     return 0;
 }
 
+static int ht_prove_prefix(void *context, const int32_t *ids, uint32_t count,
+        uint64_t parent_generation, uint32_t parent_position,
+        uint32_t *checked_count, uint32_t *proven_count) {
+    HistoryTargetContract *f = context;
+    if (checked_count) *checked_count = 0u;
+    if (proven_count) *proven_count = 0u;
+    if (!f || !ids || count == 0u || !checked_count || !proven_count ||
+        parent_generation != f->state.transition_generation ||
+        parent_position != f->state.position || f->proof_limit == 0u ||
+        f->proof_limit > count)
+        return -1;
+    for (uint32_t row = 0u; row < f->proof_limit; row++) {
+        int32_t expected;
+        if (ht_truth(f, parent_position + row, &expected) != 0 ||
+            ids[row] != expected)
+            return -1;
+    }
+    f->proof_calls++;
+    *proven_count = f->proof_limit;
+    *checked_count = f->proof_limit < count ? f->proof_limit + 1u : count;
+    f->proof_checks += *checked_count;
+    return 0;
+}
+
+static int ht_materialize_known(void *context, const int32_t *ids,
+        uint32_t count, SaltTextVerifyResult *result) {
+    HistoryTargetContract *f = context;
+    int32_t expected, pending;
+    if (!f || !ids || count == 0u || count > 64u || !result)
+        return -1;
+    for (uint32_t row = 0u; row < count; row++)
+        if (ht_truth(f, f->state.position + row, &expected) != 0 ||
+            ids[row] != expected)
+            return -1;
+    f->materializations++;
+    f->materialized_rows += count;
+    f->state.position += count;
+    f->state.transition_generation++;
+    if (ht_truth(f, f->state.position, &pending) != 0) pending = 9;
+    ht_select(f->rows[count - 1u], pending);
+    memset(result, 0, sizeof *result);
+    result->status = SALT_TEXT_VERIFY_COMMITTED;
+    result->accepted_count = count;
+    result->committed_count = count;
+    result->produced_count = count + 1u;
+    result->pending_token_id = pending;
+    result->winning_node_index = count - 1u;
+    result->winning_node_id = count - 1u;
+    result->result_position = f->state.position;
+    result->transition_generation = f->state.transition_generation;
+    result->pending_logits = f->rows[count - 1u];
+    result->pending_logits_count = 10u;
+    result->backend.engine_submissions = 1u;
+    result->backend.completion_fences = 1u;
+    return 0;
+}
+
+static int unified_extent_materializer_contract(void) {
+    static const uint32_t extents[] = { 1u, 19u, 40u };
+    int32_t truth[40];
+    for (uint32_t cell = 0u; cell < 3u; cell++) {
+        HistoryTargetContract f;
+        SaltTextTokenEpochController controller = {0};
+        SaltTextGenerationBinding b;
+        SaltTextGenerated generated;
+        float logits[10] = {0}, scratch[10];
+        uint32_t extent = extents[cell];
+        memset(&f, 0, sizeof f);
+        memset(&b, 0, sizeof b);
+        for (uint32_t index = 0u; index < 40u; index++)
+            truth[index] = (int32_t)(index % 8u) + 1;
+        f.truth = truth;
+        f.truth_count = 40u;
+        f.position0 = 80u;
+        f.state.position = f.position0;
+        f.state.transition_generation = 1u;
+        f.proof_limit = extent;
+        f.program.ready = 1;
+        f.program.kv_state = &f.state;
+        f.program.vocabulary = 10u;
+        f.program.maximum_context = 256u;
+        f.program.maximum_candidates = 64u;
+        f.policy.ready = 1;
+        f.policy.worker_budget = 8u;
+        f.policy.sequence_tiles = 2u;
+        f.policy.target_rows = 40u;
+        f.policy.route_count = 1u;
+        f.policy.queue_length = 4u;
+        f.policy.candidate_count = 2u;
+        f.policy.kv_warmup_rows = 1u;
+        f.policy.warm_target_rows = 40u;
+        f.strict_parent_root = 1u;
+        f.projection.logits = &f.rows[0][0];
+        f.projection.generation = f.state.transition_generation;
+        f.projection.position = f.state.position;
+        f.projection.sequence_tiles = 41u;
+        f.projection.route_count = 1u;
+        f.projection.accepted_count = 1u;
+        f.projection.winning_route = 0u;
+        for (uint32_t row = 1u; row < 40u; row++)
+            ht_select(f.rows[row], truth[row]);
+        b.program = &f.program;
+        b.policy = &f.policy;
+        b.projection = &f.projection;
+        b.context = &f;
+        b.is_stop = ht_stop;
+        b.select_proposal = ht_select_proposal;
+        b.target = ht_target;
+        b.prove_prefix = ht_prove_prefix;
+        b.materialize_known = ht_materialize_known;
+        CHECK(salt_text_token_epoch_init(&controller) == 0,
+              "unified materializer token epoch init failed");
+        controller.schedule_prior_kv_rows = 80u;
+        ht_select(logits, 1);
+        CHECK(salt_text_generate_candidates(&controller, &b, logits, 40u,
+                  scratch, ht_clock, &f, &generated) == 0,
+              "unified B extent generation failed");
+        CHECK(generated.proposal_count == 40u &&
+                  generated.proof_checked_rows ==
+                      (extent < 40u ? extent + 1u : 40u) &&
+                  generated.proven_prefix_rows == extent &&
+                  generated.first_unproven == extent &&
+                  generated.materialized_rows == extent &&
+                  generated.state_reuse_rows == 0u &&
+                  generated.target_model_rows == extent &&
+                  generated.target_sublane_rounds == 0u &&
+                  generated.target_sublane_cancelled_rows == 40u - extent &&
+                  generated.target.accepted_count == extent &&
+                  generated.target.committed_count == extent &&
+                  generated.target.result_position == 80u + extent &&
+                  generated.target.backend.engine_submissions == 1u &&
+                  generated.target.backend.completion_fences == 1u &&
+                  generated.target.backend.intermediate_host_publications == 0u &&
+                  f.proof_calls == 1u &&
+                  f.proof_checks == (extent < 40u ? extent + 1u : 40u) &&
+                  f.materializations == 1u &&
+                  f.materialized_rows == extent && f.targets == 0u &&
+                  f.rows_submitted == 0u && f.state.position == 80u + extent,
+              "B=1/B=j did not use one proof-selected materializer");
+        CHECK(memcmp(generated.candidate_token_ids, truth,
+                  (size_t)extent * sizeof truth[0]) == 0,
+              "unified materializer changed the proven prefix");
+        CHECK(logits[extent < 40u ? truth[extent] : 9] > logits[0],
+              "row B-1 did not publish the authoritative boundary logits");
+    }
+    puts("unified materializer: B=1/B=j same mechanism, one submission PASS");
+    return 0;
+}
+
+static int two_lane_target_sublane_contract(void) {
+    int32_t truth[40];
+    for (uint32_t cell = 0u; cell < 2u; cell++) {
+        HistoryTargetContract f;
+        SaltTextTokenEpochController controller = {0};
+        SaltTextGenerationBinding b;
+        SaltTextGenerated generated;
+        float logits[10] = {0}, scratch[10];
+        uint32_t expected_accepted = cell == 0u ? 40u : 10u;
+        uint32_t expected_rounds = cell == 0u ? 5u : 2u;
+        uint32_t expected_rows = cell == 0u ? 40u : 16u;
+        uint32_t expected_cancelled = cell == 0u ? 0u : 24u;
+        memset(&f, 0, sizeof f);
+        memset(&b, 0, sizeof b);
+        for (uint32_t index = 0u; index < 40u; index++)
+            truth[index] = (int32_t)(index % 8u) + 1;
+        f.truth = truth;
+        f.truth_count = 40u;
+        f.position0 = 80u;
+        f.state.position = f.position0;
+        f.state.transition_generation = 1u;
+        f.program.ready = 1;
+        f.program.kv_state = &f.state;
+        f.program.vocabulary = 10u;
+        f.program.maximum_context = 256u;
+        f.program.maximum_candidates = 64u;
+        f.policy.ready = 1;
+        f.policy.worker_budget = 8u;
+        f.policy.sequence_tiles = 2u;
+        f.policy.target_rows = 40u;
+        f.policy.route_count = 1u;
+        f.policy.queue_length = 4u;
+        f.policy.candidate_count = 2u;
+        f.policy.kv_warmup_rows = 1u;
+        f.policy.warm_target_rows = 40u;
+        f.strict_parent_root = 1u;
+        f.projection.logits = &f.rows[0][0];
+        f.projection.generation = f.state.transition_generation;
+        f.projection.position = f.state.position;
+        f.projection.sequence_tiles = 41u;
+        f.projection.route_count = 1u;
+        f.projection.accepted_count = 1u;
+        f.projection.winning_route = 0u;
+        for (uint32_t row = 1u; row < 40u; row++)
+            ht_select(f.rows[row], truth[row]);
+        if (cell == 1u) truth[10] = 9;
+        CHECK(salt_area_nfq_bind(&f.sublane_matrix,
+                  f.sublane_routes, 64u, f.sublane_items, 64u) == 0,
+              "two-lane startup-owned matrix bind failed");
+        b.program = &f.program;
+        b.policy = &f.policy;
+        b.projection = &f.projection;
+        b.context = &f;
+        b.is_stop = ht_stop;
+        b.select_proposal = ht_select_proposal;
+        b.target = ht_target;
+        b.target_sublane_matrix = &f.sublane_matrix;
+        b.target_sublane_ready_items = f.sublane_ready;
+        b.target_sublane_ready_capacity = 8u;
+        CHECK(salt_text_token_epoch_init(&controller) == 0,
+              "two-lane token epoch init failed");
+        controller.schedule_prior_kv_rows = 80u;
+        ht_select(logits, 1);
+        {
+            int generate_rc = salt_text_generate_candidates(
+                &controller, &b, logits, 40u,
+                scratch, ht_clock, &f, &generated);
+            if (generate_rc != 0)
+                fprintf(stderr, "two-lane diagnostic rc=%d selections=%u "
+                    "targets=%u rows=%u position=%u generation=%llu "
+                    "proposal=%u route=%u checks=%u source=%u "
+                    "workers=%u depth=%u rounds=%u "
+                    "matrix_ready=%d matrix_resolved=%d item_count=%u\n",
+                    generate_rc, f.selections, f.targets, f.rows_submitted,
+                    f.state.position,
+                    (unsigned long long)f.state.transition_generation,
+                    generated.proposal_count, generated.route_token_count,
+                    generated.candidate_count, generated.proposal_source,
+                    generated.target_sublane_workers,
+                    generated.target_sublane_depth,
+                    generated.target_sublane_rounds,
+                    f.sublane_matrix.ready, f.sublane_matrix.resolved,
+                    f.sublane_matrix.item_count);
+            CHECK(generate_rc == 0,
+              "two-lane X40/W8 target generation failed");
+        }
+        CHECK(generated.proposal_count == 40u &&
+                  generated.route_token_count == 40u &&
+                  generated.target_sublane_workers == 8u &&
+                  generated.target_sublane_depth == 5u &&
+                  generated.target_sublane_rounds == expected_rounds &&
+                  generated.target_sublane_cancelled_rows == expected_cancelled &&
+                  generated.target_model_rows == expected_rows &&
+                  generated.target.accepted_count == expected_accepted &&
+                  generated.target.committed_count == expected_accepted &&
+                  generated.target.result_position == 80u + expected_accepted &&
+                  generated.target.backend.engine_submissions == expected_rounds &&
+                  generated.target.backend.completion_fences == expected_rounds &&
+                  generated.target.backend.intermediate_host_publications == 0u &&
+                  generated.target.projection_rows == 8u &&
+                  f.targets == expected_rounds &&
+                  f.rows_submitted == expected_rows &&
+                  f.state.position == 80u + expected_accepted &&
+                  f.sublane_matrix.resolved && !f.sublane_matrix.ready,
+              "two-lane X40/W8/Y5 ownership or first-j termination changed");
+        CHECK(memcmp(generated.candidate_token_ids, truth,
+                  (size_t)expected_accepted * sizeof truth[0]) == 0,
+              "two-lane target changed the accepted global prefix");
+        if (cell == 1u)
+            CHECK(logits[9] > logits[0],
+                  "two-lane first-j correction was not grounded once");
+    }
+    puts("two-lane verdict: NFQ horizontal -> X40/W8/Y5 vertical PASS");
+    return 0;
+}
+
 static int history_target_schedule_contract(void) {
     /* Cell 0: repetitive truth, every episode comes from history; zero B1.
      * Cell 1: truth deviates at output 6, forcing a rejection; the next
@@ -3918,7 +4358,7 @@ static int history_target_schedule_contract(void) {
     static const int32_t prompt[8] = { 1, 2, 3, 4, 1, 2, 3, 4 };
     static const int32_t truth_repeat[9] = { 1, 2, 3, 4, 1, 2, 3, 4, 1 };
     static const int32_t truth_deviate[9] = { 1, 2, 3, 4, 1, 2, 7, 4, 1 };
-    for (int cell = 0; cell < 3; cell++) {
+    for (int cell = 0; cell < 8; cell++) {
         HistoryTargetContract f;
         SaltTextTokenEpochController controller = {0};
         SaltTextSchedulerBindings b;
@@ -3931,7 +4371,9 @@ static int history_target_schedule_contract(void) {
         memset(&q, 0, sizeof q);
         f.truth = cell == 1 ? truth_deviate : truth_repeat;
         f.truth_count = 9u;
-        f.position0 = cell == 2 ? 519u : 520u;
+        f.invalid_target_shape = cell == 3 || cell == 4
+            ? (uint32_t)(cell - 2) : 0u;
+        f.position0 = cell == 5 ? 519u : 520u;
         f.state.position = f.position0;
         f.state.transition_generation = 1u;
         f.program.ready = 1;
@@ -3941,7 +4383,7 @@ static int history_target_schedule_contract(void) {
         f.program.maximum_candidates = 8u;
         f.policy.ready = 1;
         f.policy.sequence_tiles = 2u;   /* NFQ N: independent of X */
-        f.policy.target_rows = 4u;      /* X */
+        f.policy.target_rows = cell == 5 ? 1u : 4u; /* X, independent of NFQ */
         f.policy.route_count = 1u;
         f.policy.queue_length = 4u;
         f.policy.candidate_count = 2u;
@@ -3952,8 +4394,14 @@ static int history_target_schedule_contract(void) {
         b.generation.projection = &f.projection;
         b.generation.context = &f;
         b.generation.is_stop = ht_stop;
-        b.generation.select_proposal = ht_target;
+        b.generation.select_proposal = ht_select_proposal;
         b.generation.target = ht_target;
+        if (cell == 2 || cell == 6)
+            b.generation.target = NULL;
+        if (cell == 7) {
+            b.generation.select_proposal = NULL;
+            b.generation.target = NULL;
+        }
         b.context = &f;
         b.stats = &f.stats;
         b.now_ns = ht_clock;
@@ -3970,22 +4418,43 @@ static int history_target_schedule_contract(void) {
         q.close_token = 8;
         q.history_ids = prompt;
         q.history_count = 8u;
+        if (cell == 6) {
+            q.history_ids = NULL;
+            q.history_count = 0u;
+        }
         CHECK(salt_text_scheduler_bind(&controller, &b) == 0,
               "history-target scheduler bind failed");
-        CHECK(salt_text_scheduler_run(&controller, &q, &r) == 0 &&
-              r.output_count == 8u &&
-              memcmp(ids, f.truth, 8u * sizeof ids[0]) == 0 &&
-              f.state.position == f.position0 + (cell == 2 ? 7u : 8u),
-              "history-target output sequence diverged from truth");
-        if (cell == 2) {
-            CHECK(f.targets == 0u && f.steps == 7u &&
+        if (cell == 3 || cell == 4) {
+            CHECK(salt_text_scheduler_run(&controller, &q, &r) != 0 &&
+                  f.targets == 1u && f.publications == 0u,
+                  "X-TARGET accepted split or truncated target execution");
+            continue;
+        }
+        {
+            int run_rc = salt_text_scheduler_run(&controller, &q, &r);
+            if (run_rc != 0 || r.output_count != 8u ||
+                memcmp(ids, f.truth, 8u * sizeof ids[0]) != 0 ||
+                f.state.position != f.position0 + (cell >= 2 ? 7u : 8u))
+                fprintf(stderr, "history-target cell=%d rc=%d outputs=%u "
+                    "position=%u source=%u selections=%u targets=%u steps=%u\n",
+                    cell, run_rc, r.output_count, f.state.position, f.position0,
+                    f.selections, f.targets, f.steps);
+            CHECK(run_rc == 0 && r.output_count == 8u &&
+                  memcmp(ids, f.truth, 8u * sizeof ids[0]) == 0 &&
+                  f.state.position == f.position0 + (cell >= 2 ? 7u : 8u),
+                  "history-target output sequence diverged from truth");
+        }
+        if (cell >= 2) {
+            CHECK(f.selections == (cell == 7 ? 0u : 8u) &&
+                  f.nfq_checks == (cell == 7 ? 0u : 64u) &&
+                  f.targets == 0u && f.steps == 7u &&
                   f.proposed_total == 0u && f.accepted_total == 0u &&
-                  f.history_hits == 0u && f.projection_hits == 0u &&
-                  controller.schedule_bootstraps == 7u,
-                  "sub-threshold live KV admitted X-TARGET");
+                  f.history_hits == 0u && f.projection_hits == 0u,
+                  "ordinary NFQ depended on X or entered TARGET execution");
         } else if (cell == 0) {
             /* Two episodes of X=4, 8/8 accepted, no ordinary transition. */
-            CHECK(f.targets == 2u && f.steps == 0u && f.rows_submitted == 8u &&
+            CHECK(f.selections == 2u && f.nfq_checks == 16u &&
+                  f.targets == 2u && f.steps == 0u && f.rows_submitted == 8u &&
                   f.proposed_total == 8u && f.accepted_total == 8u &&
                   f.history_hits == 2u && f.projection_hits == 0u &&
                   f.stats.rejection_count == 0u &&
@@ -3995,7 +4464,8 @@ static int history_target_schedule_contract(void) {
             /* Episode 1: 4/4 from history. Episode 2: 4 proposed, 2 accepted
              * (truth 7 at output 6). Episode 3 resumes at j from the retained
              * rows: root 7 plus one local-memory row (O_remaining=2). */
-            CHECK(f.targets == 3u && f.steps == 0u && f.rows_submitted == 10u &&
+            CHECK(f.selections == 3u && f.nfq_checks == 24u &&
+                  f.targets == 3u && f.steps == 0u && f.rows_submitted == 10u &&
                   f.proposed_total == 10u && f.accepted_total == 8u &&
                   f.history_hits == 2u && f.projection_hits == 1u &&
                   f.stats.rejection_count == 1u &&
@@ -4003,14 +4473,93 @@ static int history_target_schedule_contract(void) {
                   "rejection did not resume at j from local memory");
         }
         CHECK(salt_text_scheduler_finish(&controller, &q, &r) == 0 &&
-              f.steps == (cell == 2 ? 9u : 1u) &&
+              f.steps == (cell >= 2 ? 9u : 1u) &&
               f.state.position == f.position0 + 9u,
               "history-target close transition failed");
         CHECK(salt_text_scheduler_publish(&controller, &r) == 0 &&
               f.publications == 1u,
               "history-target publication failed");
     }
-    puts("core scheduler: X1 KV warmup -> history -> X-TARGET -> local memory PASS");
+    puts("core scheduler: NFQ independent of X-disabled / X1 / history; X-TARGET preserved PASS");
+    return 0;
+}
+
+static int multi_trajectory_root_mapping_contract(void) {
+    static const int32_t truth[4] = { 2, 5, 6, 7 };
+    HistoryTargetContract f;
+    SaltTextTokenEpochController controller = {0};
+    SaltTextGenerationBinding b;
+    SaltTextGenerated generated;
+    float logits[10] = {0}, scratch[10];
+    uint32_t active_n = 0u, active_f = 0u;
+    memset(&f, 0, sizeof f);
+    memset(&b, 0, sizeof b);
+    f.truth = truth;
+    f.truth_count = 4u;
+    f.position0 = 520u;
+    f.state.position = f.position0;
+    f.state.transition_generation = 7u;
+    f.program.ready = 1;
+    f.program.kv_state = &f.state;
+    f.program.vocabulary = 10u;
+    f.program.maximum_context = 1024u;
+    f.program.maximum_candidates = 8u;
+    f.policy.ready = 1;
+    f.policy.sequence_tiles = 1u;
+    f.policy.target_rows = 4u;
+    f.policy.route_count = 2u;
+    f.policy.queue_length = 4u;
+    f.policy.candidate_count = 2u;
+    f.policy.kv_warmup_rows = 512u;
+    f.policy.warm_target_rows = 4u;
+    f.projection.logits = &f.rows[0][0];
+    f.projection.generation = f.state.transition_generation;
+    f.projection.position = f.state.position;
+    f.projection.sequence_tiles = 4u;
+    f.projection.route_count = 2u;
+    f.projection.accepted_count = 1u;
+    f.projection.winning_route = 0u;
+    /* Route zero is rooted at greedy token 1. Route one is rooted at token 2
+     * and carries the causal suffix selected by the synthetic sampler. */
+    logits[1] = 3.0f;
+    logits[2] = 2.0f;
+    for (uint32_t row = 1u; row < 4u; row++) {
+        f.rows[row][3] = 3.0f;
+        f.rows[row][8] = 2.0f;
+    }
+    for (uint32_t row = 5u; row < 8u; row++) {
+        f.rows[row][4] = 3.0f;
+        f.rows[row][truth[row - 4u]] = 2.0f;
+    }
+    f.selection_rank = 1u;
+    b.program = &f.program;
+    b.policy = &f.policy;
+    b.projection = &f.projection;
+    b.context = &f;
+    b.is_stop = ht_stop;
+    b.select_proposal = ht_select_proposal;
+    b.target = ht_target;
+    CHECK(salt_text_token_epoch_init(&controller) == 0,
+          "multi-trajectory epoch init failed");
+    controller.schedule_prior_kv_rows = 520u;
+    CHECK(salt_text_generate_candidates(&controller, &b, logits, 4u, scratch,
+              ht_clock, &f, &generated) == 0,
+          "multi-trajectory proposal generation failed");
+    CHECK(f.selections == 1u && f.nfq_checks == 8u &&
+              f.targets == 1u && f.rows_submitted == 4u &&
+              generated.proposal_count == 4u &&
+              generated.route_token_count == 4u &&
+              generated.candidate_count == 8u &&
+              generated.proposal_source == SALT_TEXT_PROPOSAL_SOURCE_PROJECTION &&
+              generated.projection_reused_rows == 6u &&
+              generated.target.accepted_count == 4u &&
+              memcmp(generated.candidate_token_ids, truth, sizeof truth) == 0,
+          "selected root did not map to exactly one complete causal trajectory");
+    CHECK(salt_text_target_policy_active_shape(&f.policy,
+              generated.route_token_count, &active_n, &active_f) == 0 &&
+              active_n == 4u && active_f == 1u,
+          "selected trajectory did not reduce TARGET to active F1");
+    puts("multi-trajectory NFQ root mapping -> one causal X-TARGET: PASS");
     return 0;
 }
 
@@ -4021,7 +4570,7 @@ typedef struct ScheduleContract {
     SaltTextProjectionWindow projection;
     SaltTextScheduleStats stats;
     uint64_t clock;
-    uint32_t steps, targets, emissions, publications;
+    uint32_t steps, targets, selections, nfq_checks, emissions, publications;
     int allow_target, step_token, target_next_token;
     float target_logits[2][7];
     int fail_emit, fail_publish, fail_step;
@@ -4066,6 +4615,37 @@ static int schedule_test_publish(void *context, const SaltTextScheduleResult *r)
     (void)r;
     f->publications++;
     return f->fail_publish ? -1 : 0;
+}
+
+static int schedule_test_select_proposal(void *context,
+        SaltTextTokenEpochController *controller,
+        const int32_t *ids, uint32_t count, const float *parent,
+        SaltTextTokenEpochResult *result) {
+    ScheduleContract *f = context;
+    int32_t selected = 0;
+    uint32_t winner = UINT32_MAX;
+    if (!f || !controller || !controller->ready || !ids || !parent || !result ||
+        count != f->policy.candidate_count * f->policy.queue_length)
+        return -1;
+    for (int32_t token = 1; token < 7; token++)
+        if (parent[token] > parent[selected]) selected = token;
+    for (uint32_t index = 0; index < count; index++)
+        if (ids[index] == selected) { winner = index; break; }
+    if (winner == UINT32_MAX) return -1;
+    f->selections++;
+    f->nfq_checks += count;
+    memset(result, 0, sizeof *result);
+    result->path = SALT_TEXT_TOKEN_PATH_COLD_SEARCH;
+    result->target.status = SALT_TEXT_VERIFY_COMMITTED;
+    result->target.produced_count = 1u;
+    result->target.pending_token_id = selected;
+    result->target.winning_node_index = winner;
+    result->target.winning_node_id = winner;
+    result->target.result_position = f->state.position;
+    result->target.transition_generation = f->state.transition_generation + 1u;
+    result->target.pending_logits = parent;
+    result->target.pending_logits_count = 7u;
+    return 0;
 }
 
 static int schedule_test_target(void *context, SaltTextTokenEpochController *controller,
@@ -4153,7 +4733,7 @@ static int schedule_bootstrap_target_contract(void) {
     b.generation.projection = &f.projection;
     b.generation.context = &f;
     b.generation.is_stop = schedule_test_stop;
-    b.generation.select_proposal = schedule_test_target;
+    b.generation.select_proposal = schedule_test_select_proposal;
     b.generation.target = schedule_test_target;
     b.context = &f;
     b.stats = &f.stats;
@@ -4174,6 +4754,7 @@ static int schedule_bootstrap_target_contract(void) {
           ids[2] == 4 && ids[3] == 5,
           "bootstrap-target output sequence failed");
     CHECK(controller.schedule_bootstraps == 3u && f.steps == 3u &&
+          f.selections == 4u && f.nfq_checks == 16u &&
           f.targets == 0u && f.state.position == 4u,
           "scheduler manufactured TARGET work without a causal trajectory");
     CHECK(salt_text_scheduler_finish(&controller, &q, &r) == 0 &&
@@ -4216,7 +4797,7 @@ static int schedule_request_contract(void) {
         b.generation.projection = &f.projection;
         b.generation.context = &f;
         b.generation.is_stop = schedule_test_stop;
-        b.generation.select_proposal = schedule_test_target;
+        b.generation.select_proposal = schedule_test_select_proposal;
         b.generation.target = schedule_test_target;
         b.context = &f;
         b.stats = &f.stats;
@@ -4244,6 +4825,9 @@ static int schedule_request_contract(void) {
         }
         CHECK(salt_text_scheduler_run(&controller, &q, &r) == 0,
               "scheduler ordinary run failed");
+        CHECK(f.selections == r.output_count && f.nfq_checks == r.output_count &&
+              f.targets == 0u,
+              "X1/cap/stop skipped cheap NFQ or submitted target compute");
         CHECK(salt_text_scheduler_run(&controller, &q, &r) != 0,
               "scheduler admitted a duplicate active request");
         CHECK(salt_text_scheduler_publish(&controller, &r) != 0 && !f.publications,
@@ -4265,6 +4849,487 @@ static int schedule_request_contract(void) {
     return 0;
 }
 
+/* The native token-tape API was removed at b23dff9. Current scheduler,
+ * generation, NFQ and TARGET coverage above remains authoritative. */
+#if 0
+/* Scheduler admission must name a real token tape, not a ready-only verifier
+ * stand-in. These cells exercise the real compiler/interpreter/fence/publish
+ * contract with deterministic fixture payloads, not model arithmetic. */
+typedef struct NativeScheduleContract {
+    SaltTextTokenProgram program;
+    SaltTextTokenCell arena[3];
+    SaltTextTokenExecutor executor;
+    SaltTextNativeBinding native;
+    SaltTextScheduleStats stats;
+    SaltTextProjectionWindow projection;
+    SaltTextKvState *state;
+    SaltTextTokenResult last;
+    float next_logits[VOCABULARY], staged_logits[VOCABULARY];
+    float *output_logits;
+    int32_t committed_ids[MAXIMUM_CONTEXT], staged_token, stop_token;
+    uint64_t clock;
+    uint32_t calls, submissions, cells, barriers, fences, token_publications;
+    uint32_t emissions, observations, publications, aborts, next_cell;
+    int failure, fail_token;
+} NativeScheduleContract;
+
+enum {
+    NATIVE_FAIL_BEGIN = 1, NATIVE_FAIL_CELL, NATIVE_FAIL_BARRIER,
+    NATIVE_FAIL_FINISH, NATIVE_FAIL_TOKEN_PUBLISH, NATIVE_FAIL_ABORT,
+    NATIVE_FAIL_EMIT, NATIVE_FAIL_PUBLISH, NATIVE_FAIL_POSITION
+};
+
+static int native_schedule_begin(void *context, const SaltTextTokenProgram *p,
+        const SaltTextTokenExecution *e) {
+    NativeScheduleContract *f = context;
+    if (f->failure == NATIVE_FAIL_BEGIN || e->input_token_id == f->fail_token ||
+        p != &f->program || e->source_position != f->state->position ||
+        e->transition_generation != f->state->transition_generation + 1u ||
+        e->source_position >= f->native.maximum_context ||
+        e->input_token_id < 0 || (uint32_t)e->input_token_id >= f->native.vocabulary)
+        return -1;
+    f->submissions++;
+    f->next_cell = 0u;
+    f->staged_token = -1;
+    return 0;
+}
+
+static SaltTextTokenCellResult native_schedule_cell(void *context,
+        const SaltTextTokenProgram *p, const SaltTextTokenExecution *e,
+        const SaltTextTokenCell *cell, uint32_t index) {
+    NativeScheduleContract *f = context;
+    if (f->failure == NATIVE_FAIL_CELL || f->failure == NATIVE_FAIL_ABORT ||
+        p != &f->program || cell != &p->cells[index] || index != f->next_cell)
+        return SALT_TEXT_TOKEN_CELL_FAILED;
+    if (cell->kind == SALT_TEXT_TOKEN_EMBED) f->staged_token = e->input_token_id;
+    if (cell->kind == SALT_TEXT_TOKEN_HEAD)
+        memcpy(f->staged_logits, f->next_logits, sizeof f->staged_logits);
+    f->next_cell++;
+    f->cells++;
+    return SALT_TEXT_TOKEN_CELL_OK;
+}
+
+static int native_schedule_barrier(void *context, const SaltTextTokenProgram *p,
+        const SaltTextTokenExecution *e, const SaltTextTokenCell *cell, uint32_t index) {
+    NativeScheduleContract *f = context;
+    (void)p; (void)e; (void)cell; (void)index;
+    if (f->failure == NATIVE_FAIL_BARRIER) return -1;
+    f->barriers++;
+    return 0;
+}
+
+static int native_schedule_fence(void *context, const SaltTextTokenProgram *p,
+        const SaltTextTokenExecution *e) {
+    NativeScheduleContract *f = context;
+    (void)e;
+    if (f->failure == NATIVE_FAIL_FINISH || f->next_cell != p->cell_count) return -1;
+    f->fences++;
+    return 0;
+}
+
+static int native_schedule_abort(void *context, const SaltTextTokenProgram *p,
+        const SaltTextTokenExecution *e, SaltTextTokenStatus status, uint32_t completed) {
+    NativeScheduleContract *f = context;
+    (void)p; (void)e; (void)status; (void)completed;
+    f->aborts++;
+    f->staged_token = -1;
+    memset(f->staged_logits, 0, sizeof f->staged_logits);
+    return f->failure == NATIVE_FAIL_ABORT ? -1 : 0;
+}
+
+static int native_schedule_token_publish(void *context, const SaltTextTokenProgram *p,
+        const SaltTextTokenExecution *e, uint32_t position) {
+    NativeScheduleContract *f = context;
+    if (f->failure == NATIVE_FAIL_TOKEN_PUBLISH || f->next_cell != p->cell_count ||
+        f->fences != f->token_publications + 1u ||
+        f->staged_token != e->input_token_id || position != f->state->position + 1u)
+        return -1;
+    f->committed_ids[f->token_publications++] = f->staged_token;
+    memcpy(f->output_logits, f->staged_logits, sizeof f->staged_logits);
+    f->state->position = f->failure == NATIVE_FAIL_POSITION ? position - 1u : position;
+    f->state->transition_generation = e->transition_generation;
+    return 0;
+}
+
+static const SaltTextTokenExecutorOps native_schedule_ops = {
+    .begin = native_schedule_begin,
+    .execute_cell = native_schedule_cell,
+    .dependency_barrier = native_schedule_barrier,
+    .finish = native_schedule_fence,
+    .abort = native_schedule_abort,
+    .publish = native_schedule_token_publish,
+};
+
+static int native_schedule_step(void *context, int32_t token, float *logits) {
+    NativeScheduleContract *f = context;
+    SaltTextTokenExecution e;
+    f->calls++;
+    if (f->state->transition_generation == UINT64_MAX) return -1;
+    e = (SaltTextTokenExecution) {
+        f->state->transition_generation + 1u, f->state->position, token,
+    };
+    f->output_logits = logits;
+    return salt_text_token_execute(f->native.program, f->native.executor, &e, &f->last) == 0 &&
+        f->last.status == SALT_TEXT_TOKEN_COMMITTED ? 0 : -1;
+}
+
+static uint64_t native_schedule_clock(void *context) {
+    return ++((NativeScheduleContract *)context)->clock;
+}
+
+static int native_schedule_stop(void *context, int32_t token) {
+    return token == *(const int32_t *)context;
+}
+
+static int native_schedule_emit(void *context, uint32_t count, int32_t token, int stop) {
+    NativeScheduleContract *f = context;
+    (void)token; (void)stop;
+    if (count != ++f->emissions || f->failure == NATIVE_FAIL_EMIT) return -1;
+    return 0;
+}
+
+static int native_schedule_observe(void *context, uint32_t source, int32_t token,
+        int committed, uint64_t elapsed, uint64_t draws) {
+    NativeScheduleContract *f = context;
+    (void)token; (void)elapsed; (void)draws;
+    if (f->state->position != source + (uint32_t)committed) return -1;
+    f->observations++;
+    return 0;
+}
+
+static int native_schedule_publish(void *context, const SaltTextScheduleResult *r) {
+    NativeScheduleContract *f = context;
+    f->publications++;
+    return f->failure == NATIVE_FAIL_PUBLISH || r->result_position != f->state->position
+        ? -1 : 0;
+}
+
+static int native_schedule_forbidden_release(void *context) {
+    (void)context;
+    return -1;
+}
+
+static int native_schedule_init(NativeScheduleContract *f, SaltTextKvState *state,
+        SaltTextSchedulerBindings *b) {
+    static const SaltTextTokenCell cells[] = {
+        {SALT_TEXT_TOKEN_EMBED, -1, 0, -1, 1,
+         SALT_TEXT_TOKEN_CELL_TENTATIVE_WRITE, 0, 0, sizeof(int32_t)},
+        {SALT_TEXT_TOKEN_HEAD, 0, 0, 0, 2,
+         SALT_TEXT_TOKEN_CELL_TENTATIVE_WRITE | SALT_TEXT_TOKEN_CELL_BARRIER_AFTER,
+         0, sizeof(int32_t), VOCABULARY * sizeof(float)},
+        {SALT_TEXT_TOKEN_FINALIZE, -1, 0, 1, 3, 0, 0, 0, 0},
+    };
+    const SaltTextTokenProgramDesc descriptor = {cells, 3u, 1u, 1u};
+    memset(f, 0, sizeof *f);
+    memset(b, 0, sizeof *b);
+    f->state = state;
+    f->stop_token = -1;
+    f->fail_token = -1;
+    f->next_logits[3] = 2.0f;
+    if (salt_text_token_program_compile(&f->program, &descriptor,
+            f->arena, sizeof f->arena) != 0) return -1;
+    f->executor = (SaltTextTokenExecutor) {&native_schedule_ops, f, 0};
+    f->native = (SaltTextNativeBinding) {
+        &f->program, &f->executor, state, VOCABULARY, MAXIMUM_CONTEXT,
+    };
+    b->native = &f->native;
+    b->generation.context = &f->stop_token;
+    b->generation.is_stop = native_schedule_stop;
+    b->stats = &f->stats;
+    b->context = f;
+    b->now_ns = native_schedule_clock;
+    b->step_known = native_schedule_step;
+    b->emit_token = native_schedule_emit;
+    b->observe_native = native_schedule_observe;
+    b->publish = native_schedule_publish;
+    return 0;
+}
+
+static int native_schedule_binding_contract(void) {
+    NativeScheduleContract f;
+    SaltTextKvState state = {1u, 1u};
+    SaltTextSchedulerBindings binding;
+    SaltTextTokenEpochController controller = {0};
+    SaltTextScheduleDpr dpr = {0};
+    SaltAreaNfqMatrix matrix;
+    uint32_t ready_item = 0u;
+    CHECK(native_schedule_init(&f, &state, &binding) == 0,
+          "native scheduler tape compile failed");
+    CHECK(f.program.cells == f.arena && f.program.cell_count == 3u &&
+          salt_text_scheduler_bind(&controller, &binding) == 0,
+          "native scheduler rejected compiled tape");
+    binding.dpr = &dpr;
+    CHECK(salt_text_scheduler_bind(&controller, &binding) == 0,
+          "native scheduler rejected explicit DPR off");
+#define NATIVE_REFUSE(mutation, message) do { \
+    SaltTextSchedulerBindings b = binding; \
+    SaltTextNativeBinding n = f.native; \
+    SaltTextTokenProgram p = f.program; \
+    SaltTextTokenExecutor executor = f.executor; \
+    SaltTextTokenExecutorOps ops = native_schedule_ops; \
+    SaltTextKvState kv = state; \
+    SaltTextTokenCell cells[3]; \
+    SaltTextTokenEpochController before; \
+    memcpy(&before, &controller, sizeof before); \
+    memcpy(cells, f.arena, sizeof cells); \
+    p.cells = cells; n.program = &p; n.executor = &executor; n.kv_state = &kv; \
+    executor.ops = &ops; b.native = &n; \
+    mutation; \
+    CHECK(salt_text_scheduler_bind(&controller, &b) != 0 && \
+          memcmp(&before, &controller, sizeof before) == 0, message); \
+} while (0)
+    NATIVE_REFUSE(b.native = NULL, "missing native and verifier program admitted");
+    NATIVE_REFUSE(n.program = NULL, "missing native program admitted");
+    NATIVE_REFUSE(p = ((SaltTextTokenProgram){.ready = 1}), "ready-only tape admitted");
+    NATIVE_REFUSE(p.ready = 0, "unready native program admitted");
+    NATIVE_REFUSE(p.cells = NULL, "missing native cells admitted");
+    NATIVE_REFUSE(p.cell_count = 0u, "empty native tape admitted");
+    NATIVE_REFUSE(p.layer_count = 0u, "zero native layers admitted");
+    NATIVE_REFUSE(cells[1].dependency_cell = 1, "native forward dependency admitted");
+    NATIVE_REFUSE(cells[1].completion_id = 0u, "native incomplete cell admitted");
+    NATIVE_REFUSE(p.maximum_internal_barriers = 0u, "native barrier overflow admitted");
+    NATIVE_REFUSE(n.kv_state = NULL, "missing native state admitted");
+    NATIVE_REFUSE(n.vocabulary = 0u, "zero native vocabulary admitted");
+    NATIVE_REFUSE(n.vocabulary = (uint32_t)INT_MAX + 1u, "oversized native vocabulary admitted");
+    NATIVE_REFUSE(n.maximum_context = 0u, "zero native context admitted");
+    NATIVE_REFUSE(kv.position = MAXIMUM_CONTEXT + 1u, "out-of-context native state admitted");
+    NATIVE_REFUSE(n.executor = NULL, "missing native executor admitted");
+    NATIVE_REFUSE(executor.ops = NULL, "missing native ops admitted");
+    NATIVE_REFUSE(ops.begin = NULL, "missing native begin admitted");
+    NATIVE_REFUSE(ops.execute_cell = NULL, "missing native cell executor admitted");
+    NATIVE_REFUSE(ops.dependency_barrier = NULL, "missing native barrier admitted");
+    NATIVE_REFUSE(ops.finish = NULL, "missing native fence admitted");
+    NATIVE_REFUSE(ops.abort = NULL, "missing native abort admitted");
+    NATIVE_REFUSE(ops.publish = NULL, "missing native publisher admitted");
+    NATIVE_REFUSE(executor.layer_lookahead = 1, "unbound native lookahead admitted");
+    NATIVE_REFUSE(b.generation.program = &serial_fixture.program, "ambiguous native/verifier admitted");
+    NATIVE_REFUSE(b.generation.policy = &serial_fixture.target_policy, "native target policy admitted");
+    NATIVE_REFUSE(b.generation.projection = &f.projection, "native projection admitted");
+    NATIVE_REFUSE(b.generation.select_proposal = schedule_test_select_proposal, "native proposal admitted");
+    NATIVE_REFUSE(b.generation.target = schedule_test_target, "native TARGET admitted");
+    NATIVE_REFUSE(b.generation.prove_prefix = ht_prove_prefix, "native prefix proof admitted");
+    NATIVE_REFUSE(b.generation.materialize_known = ht_materialize_known, "native materializer admitted");
+    NATIVE_REFUSE(b.generation.target_sublane_matrix = &matrix, "native target matrix admitted");
+    NATIVE_REFUSE(b.generation.target_sublane_ready_items = &ready_item, "native target ready seats admitted");
+    NATIVE_REFUSE(b.generation.target_sublane_ready_capacity = 1u, "native target capacity admitted");
+    NATIVE_REFUSE(b.release_attention = native_schedule_forbidden_release, "native DPR callback admitted");
+    NATIVE_REFUSE(b.observe_target = ht_observe_target, "native target observer admitted");
+    NATIVE_REFUSE(b.step_known = NULL, "native missing step callback admitted");
+    NATIVE_REFUSE(b.generation.is_stop = NULL, "native missing stop callback admitted");
+    dpr.mode = SALT_DPR_PERSIST;
+    NATIVE_REFUSE((void)0, "native enabled DPR admitted");
+    dpr.mode = SALT_DPR_OFF;
+    dpr.attention_enabled = 1;
+    NATIVE_REFUSE((void)0, "native attention DPR admitted");
+#undef NATIVE_REFUSE
+    CHECK(!f.calls && !f.submissions && !f.publications &&
+          state.position == 1u && state.transition_generation == 1u,
+          "native binding performed token work or changed canonical state");
+    return 0;
+}
+
+static int native_schedule_parity_contract(SyntheticPackage *package) {
+    static ExecutionFixture verifier;
+    for (int scenario = 0; scenario < 8; scenario++) {
+        NativeScheduleContract f[2];
+        SaltTextKvState native_state = {1u, 0u};
+        SaltTextSchedulerBindings b[2];
+        SaltTextScheduleResult r[2] = {{0}};
+        float logits[2][VOCABULARY] = {{0}}, scratch[2][VOCABULARY] = {{0}};
+        int32_t ids[2][3] = {{0}};
+        CHECK(prepare_execution(&verifier, package, SALT_TEXT_KV_PRIVATE_ABSOLUTE, 1u) == 0 &&
+              compile_execution(&verifier) == 0,
+              "native parity verifier compile failed");
+        for (int route = 0; route < 2; route++) {
+            SaltTextTokenEpochController controller = {0};
+            SaltTextScheduleRequest q = {0};
+            CHECK(native_schedule_init(&f[route], route ? &native_state : &verifier.state,
+                      &b[route]) == 0, "native parity tape compile failed");
+            if (!route) {
+                b[route].native = NULL;
+                b[route].generation.program = &verifier.program;
+                b[route].generation.policy = &verifier.target_policy;
+                b[route].generation.projection = &f[route].projection;
+            }
+            {
+                SaltTextSchedulerBindings invalid = b[route];
+                if (route) invalid.generation.program = &verifier.program;
+                else invalid.generation.program = NULL;
+                CHECK(salt_text_scheduler_bind(&controller, &invalid) != 0 && !controller.ready,
+                      "missing verifier or ambiguous real native/verifier binding admitted");
+                if (!route) {
+                    invalid = b[route]; invalid.generation.policy = NULL;
+                    CHECK(salt_text_scheduler_bind(&controller, &invalid) != 0,
+                          "legacy verifier no longer requires its policy");
+                    invalid = b[route]; invalid.generation.projection = NULL;
+                    CHECK(salt_text_scheduler_bind(&controller, &invalid) != 0,
+                          "legacy verifier no longer requires its projection");
+                }
+            }
+            f[route].stop_token = scenario == 1 || scenario == 2 || scenario == 4 ? 6 : -1;
+            if (scenario == 3) f[route].stop_token = 2;
+            if (f[route].stop_token == 6) {
+                f[route].next_logits[3] = 0.0f;
+                f[route].next_logits[6] = 2.0f;
+            }
+            q.sampler = (SaltSamplerConfig) {scenario >= 4 ?
+                SALT_SAMPLER_TEMPERATURE_COUNTER_V1 : SALT_SAMPLER_GREEDY_V1,
+                0.75f, UINT64_C(12345), scenario >= 5 ? 3u : 1u};
+            q.logits = logits[route]; q.scratch_logits = scratch[route];
+            q.output_ids = ids[route]; q.output_limit = scenario == 7 ? 1u : 3u;
+            q.close_token = scenario == 2 || scenario == 4 ? 6 : 5;
+            logits[route][2] = 2.0f;
+            if (scenario >= 5) {
+                logits[route][1] = 1.5f;
+                logits[route][3] = 1.0f;
+                f[route].next_logits[1] = 1.5f;
+                f[route].next_logits[2] = 1.0f;
+                q.repetition_penalty = 1.5f;
+                q.top_p = scenario == 6 ? 0.75f : 1.0f;
+            }
+            CHECK(salt_text_scheduler_bind(&controller, &b[route]) == 0 &&
+                  salt_text_scheduler_publish(&controller, &r[route]) != 0,
+                  "native parity binding or premature publication failed");
+            CHECK(salt_text_scheduler_run(&controller, &q, &r[route]) == 0,
+                  "native parity run failed");
+            CHECK(f[route].token_publications + 1u == r[route].output_count &&
+                  f[route].state->position == r[route].source_position + r[route].output_count - 1u &&
+                  !f[route].publications &&
+                  r[route].sampler_draws == (scenario >= 4 ? r[route].output_count : 0u),
+                  "native pending token or sampler draw boundary changed");
+            CHECK(salt_text_scheduler_run(&controller, &q, &r[route]) != 0 &&
+                  salt_text_scheduler_publish(&controller, &r[route]) != 0,
+                  "native duplicate run or early publication admitted");
+            CHECK(salt_text_scheduler_finish(&controller, &q, &r[route]) == 0 &&
+                  f[route].token_publications == r[route].output_count + (uint32_t)r[route].synthetic_close &&
+                  f[route].cells == 3u * f[route].token_publications &&
+                  f[route].barriers == f[route].token_publications &&
+                  f[route].fences == f[route].token_publications &&
+                  f[route].last.backend.final_publications == 1u &&
+                  f[route].last.backend.intermediate_host_publications == 0u &&
+                  memcmp(f[route].committed_ids, ids[route],
+                      r[route].output_count * sizeof ids[route][0]) == 0,
+                  "native pending/close bypassed token tape or publication");
+            CHECK(r[route].synthetic_close == (q.close_token != r[route].stop_token) &&
+                  (!r[route].synthetic_close ||
+                   f[route].committed_ids[r[route].output_count] == q.close_token) &&
+                  salt_text_scheduler_finish(&controller, &q, &r[route]) != 0 &&
+                  salt_text_scheduler_publish(&controller, &r[route]) == 0 &&
+                  salt_text_scheduler_publish(&controller, &r[route]) != 0 &&
+                  f[route].publications == 1u,
+                  "native finalization/publication not exactly once");
+        }
+        CHECK(memcmp(ids[0], ids[1], sizeof ids[0]) == 0 &&
+              memcmp(logits[0], logits[1], sizeof logits[0]) == 0 &&
+              memcmp(scratch[0], scratch[1], sizeof scratch[0]) == 0 &&
+              memcmp(&r[0], &r[1], sizeof r[0]) == 0 &&
+              memcmp(&f[0].stats, &f[1].stats, sizeof f[0].stats) == 0 &&
+              f[0].state->position == f[1].state->position &&
+              f[0].state->transition_generation == f[1].state->transition_generation &&
+              f[0].observations == f[1].observations,
+              "verifier/native scheduler or sampler semantics diverged");
+    }
+    return 0;
+}
+
+static int native_schedule_failure_contract(void) {
+    for (int failure = NATIVE_FAIL_BEGIN; failure <= NATIVE_FAIL_POSITION; failure++) {
+        NativeScheduleContract f;
+        SaltTextKvState state = {1u, 0u};
+        SaltTextSchedulerBindings b;
+        SaltTextTokenEpochController controller = {0};
+        SaltTextScheduleRequest q = {0};
+        SaltTextScheduleResult r = {0};
+        float logits[VOCABULARY] = {0, 0, 2}, scratch[VOCABULARY] = {0};
+        int32_t ids[3] = {0};
+        CHECK(native_schedule_init(&f, &state, &b) == 0 &&
+              salt_text_scheduler_bind(&controller, &b) == 0, "native failure fixture failed");
+        q.sampler.abi = SALT_SAMPLER_GREEDY_V1;
+        q.logits = logits; q.scratch_logits = scratch; q.output_ids = ids;
+        q.output_limit = 3u; q.close_token = 5;
+        if (failure == NATIVE_FAIL_PUBLISH) {
+            CHECK(salt_text_scheduler_run(&controller, &q, &r) == 0 &&
+                  salt_text_scheduler_finish(&controller, &q, &r) == 0,
+                  "native publish failure setup failed");
+            f.failure = failure;
+            CHECK(salt_text_scheduler_publish(&controller, &r) != 0 && f.publications == 1u &&
+                  salt_text_scheduler_publish(&controller, &r) != 0 && f.publications == 1u,
+                  "native failed publication retried");
+        } else {
+            f.failure = failure;
+            CHECK(salt_text_scheduler_run(&controller, &q, &r) != 0 && !f.publications,
+                  "native executor/presentation failure accepted");
+            if (failure != NATIVE_FAIL_POSITION)
+                CHECK(state.position == 1u && state.transition_generation == 0u &&
+                      !f.token_publications, "failed token published canonical state");
+            if (failure == NATIVE_FAIL_TOKEN_PUBLISH || failure == NATIVE_FAIL_ABORT)
+                CHECK(f.last.status == SALT_TEXT_TOKEN_FATAL, "native fatal result lost");
+        }
+        CHECK(!controller.schedule_active && controller.phase == SALT_TEXT_TOKEN_EPOCH_FAILED &&
+              salt_text_scheduler_publish(&controller, &r) != 0,
+              "native scheduler did not fail closed");
+    }
+    for (int close_failure = 0; close_failure < 2; close_failure++) {
+        NativeScheduleContract f;
+        SaltTextKvState state = {1u, 0u};
+        SaltTextSchedulerBindings b;
+        SaltTextTokenEpochController controller = {0};
+        SaltTextScheduleRequest q = {0};
+        SaltTextScheduleResult r = {0};
+        float logits[VOCABULARY] = {0, 0, 2}, scratch[VOCABULARY] = {0};
+        int32_t ids[1] = {0};
+        CHECK(native_schedule_init(&f, &state, &b) == 0 &&
+              salt_text_scheduler_bind(&controller, &b) == 0, "native finish failure setup failed");
+        q.sampler.abi = SALT_SAMPLER_GREEDY_V1;
+        q.logits = logits; q.scratch_logits = scratch; q.output_ids = ids;
+        q.output_limit = 1u; q.close_token = 5;
+        CHECK(salt_text_scheduler_run(&controller, &q, &r) == 0 && !f.calls,
+              "native cap-one request consumed pending token early");
+        f.fail_token = close_failure ? 5 : 2;
+        CHECK(salt_text_scheduler_finish(&controller, &q, &r) != 0 &&
+              r.close_failed == close_failure && f.token_publications == (uint32_t)close_failure &&
+              state.position == 1u + (uint32_t)close_failure && !controller.schedule_active &&
+              salt_text_scheduler_publish(&controller, &r) != 0 && !f.publications,
+              "native failed pending/close published request");
+    }
+    return 0;
+}
+
+static int native_schedule_request_contract(void) {
+    for (int invalid = 0; invalid < 9; invalid++) {
+        NativeScheduleContract f;
+        SaltTextKvState state = {1u, 0u};
+        SaltTextSchedulerBindings b;
+        SaltTextTokenEpochController controller = {0};
+        SaltTextScheduleRequest q = {0};
+        SaltTextScheduleResult r = {0};
+        float logits[VOCABULARY] = {0, 0, 2}, scratch[VOCABULARY] = {0};
+        int32_t ids[3] = {0};
+        CHECK(native_schedule_init(&f, &state, &b) == 0 &&
+              salt_text_scheduler_bind(&controller, &b) == 0, "native request fixture failed");
+        q.sampler = (SaltSamplerConfig) {SALT_SAMPLER_TEMPERATURE_COUNTER_V1, 1.0f, 1u, 1u};
+        q.logits = logits; q.scratch_logits = scratch; q.output_ids = ids;
+        q.output_limit = 3u; q.close_token = 5;
+        switch (invalid) {
+            case 0: q.close_token = VOCABULARY; break;
+            case 1: q.repetition_penalty = 1.5f; q.scratch_logits = logits; break;
+            case 2: q.repetition_penalty = 0.5f; break;
+            case 3: q.top_p = NAN; break;
+            case 4: q.history_count = 1u; break;
+            case 5: q.history_ids = ids; q.history_count = 2u; break;
+            case 6: q.sampler.abi = 0u; break;
+            case 7: q.scratch_logits = NULL; break;
+            case 8: q.output_limit = 0u; break;
+        }
+        CHECK(salt_text_scheduler_run(&controller, &q, &r) != 0 &&
+              !controller.schedule_active && !f.calls && !f.emissions && !f.publications &&
+              state.position == 1u && state.transition_generation == 0u,
+              "native malformed request reached executor or publication");
+    }
+    return 0;
+}
+#endif
+
 int main(void) {
     CHECK(schedule_request_contract() == 0, "request scheduler contract failed");
     CHECK(schedule_bootstrap_target_contract() == 0,
@@ -4273,6 +5338,12 @@ int main(void) {
           "parent history refill contract failed");
     CHECK(history_target_schedule_contract() == 0,
           "history/local-memory X-TARGET scheduler contract failed");
+    CHECK(multi_trajectory_root_mapping_contract() == 0,
+          "multi-trajectory NFQ root mapping contract failed");
+    CHECK(two_lane_target_sublane_contract() == 0,
+          "two-lane X40/W8/Y5 target sublane contract failed");
+    CHECK(unified_extent_materializer_contract() == 0,
+          "unified B=1/B=j proof-selected materializer contract failed");
     CHECK(projection_refill_contract() == 0,
           "native projection refill contract failed");
     CHECK(area_scan_planner_contract() == 0,
