@@ -139,6 +139,12 @@ typedef struct SaltTextLayerExecDesc {
     SaltTextTensorDesc dense_down;
     SaltTextTensorDesc router;
 
+    SaltTextTensorDesc model_input_projection;
+    SaltTextTensorDesc model_kernel;
+    SaltTextTensorDesc model_output_projection;
+    uint32_t model_scratch_floats_per_row;
+    size_t model_state_bytes;
+
     SaltTextTensorDesc pre_attention_norm;
     SaltTextTensorDesc q_norm;
     SaltTextTensorDesc k_norm;
@@ -207,6 +213,218 @@ typedef struct SaltTextDispatchPolicy {
     uint32_t cpu_jobs;
 } SaltTextDispatchPolicy;
 
+typedef struct SaltTextModelLayerOps {
+    int (*validate)(void *context, uint32_t layer,
+                    const SaltTextLayerPlan *plan,
+                    const SaltTextLayerExecDesc *descriptor);
+    int (*forward)(void *context, uint32_t layer, uint32_t rows,
+                   const float *x, float *y,
+                   float *scratch, size_t scratch_float_capacity,
+                   void *state, size_t state_bytes);
+    int (*router_topk)(void *context, const float *logits,
+                       const float *expert_bias, uint32_t experts,
+                       uint32_t topk, int32_t *selected, float *weights);
+    void *context;
+} SaltTextModelLayerOps;
+
+typedef enum SaltTextModelGpuBackend {
+    SALT_TEXT_MODEL_GPU_METAL = 1,
+    SALT_TEXT_MODEL_GPU_CUDA = 2,
+    SALT_TEXT_MODEL_GPU_HIP = 3
+} SaltTextModelGpuBackend;
+
+typedef struct SaltTextModelGpuTensorView {
+    void *resource;
+    uint64_t value_offset;
+    uint64_t scale_offset;
+    uint64_t bias_offset;
+    uint32_t rows;
+    uint32_t cols;
+    SaltTensorEncoding encoding;
+} SaltTextModelGpuTensorView;
+
+typedef struct SaltTextModelGpuPrepareArgs {
+    SaltTextModelGpuBackend backend;
+    void *device;
+    uint32_t maximum_rows;
+    uint32_t maximum_context;
+} SaltTextModelGpuPrepareArgs;
+
+typedef struct SaltTextModelGpuBufferView {
+    void *resource;
+    uint64_t offset;
+    uint64_t bytes;
+} SaltTextModelGpuBufferView;
+
+typedef struct SaltTextModelGpuAttentionArgs {
+    SaltTextModelGpuBackend backend;
+    void *command;
+    SaltTextModelGpuBufferView source_position;
+    SaltTextModelGpuBufferView parent_rows;
+    SaltTextModelGpuBufferView depths;
+    SaltTextModelGpuBufferView queries;
+    SaltTextModelGpuBufferView committed_keys;
+    SaltTextModelGpuBufferView committed_values;
+    SaltTextModelGpuBufferView tentative_keys;
+    SaltTextModelGpuBufferView tentative_values;
+    SaltTextModelGpuBufferView score_workspace;
+    SaltTextModelGpuBufferView output;
+    SaltTextModelGpuBufferView status;
+    uint32_t *physical_launches;
+    uint32_t rows;
+    uint32_t maximum_context;
+    uint32_t query_width;
+    uint32_t kv_width;
+    uint32_t n_heads;
+    uint32_t n_kv_heads;
+    uint32_t head_dim;
+    uint32_t window;
+    uint32_t kv_mode;
+    uint32_t kv_capacity;
+    float score_scale;
+    int full_attention;
+} SaltTextModelGpuAttentionArgs;
+
+typedef struct SaltTextModelGpuEncodeArgs SaltTextModelGpuEncodeArgs;
+typedef int (*SaltTextModelGpuProjectFn)(
+    void *backend_context, const SaltTextModelGpuTensorView *tensor,
+    uint64_t input_offset, uint64_t output_offset, uint32_t rows);
+
+struct SaltTextModelGpuEncodeArgs {
+    SaltTextModelGpuBackend backend;
+    void *command;
+    void *canonical;
+    void *backend_context;
+    SaltTextModelGpuProjectFn project;
+    size_t canonical_bytes;
+    uint32_t layer;
+    uint32_t rows;
+    uint32_t hidden;
+    uint64_t normalized_offset;
+    uint64_t scratch_offset;
+    size_t scratch_float_capacity;
+    uint64_t state_offset;
+    size_t state_bytes;
+    uint64_t output_offset;
+    SaltTextModelGpuTensorView input_projection;
+    SaltTextModelGpuTensorView kernel;
+    SaltTextModelGpuTensorView output_projection;
+};
+
+typedef struct SaltTextModelGpuProjectArgs {
+    SaltTextModelGpuBackend backend;
+    void *command;
+    void *canonical;
+    size_t canonical_bytes;
+    SaltTextModelGpuTensorView tensor;
+    uint64_t input_offset;
+    uint64_t output_offset;
+    uint32_t rows;
+} SaltTextModelGpuProjectArgs;
+
+typedef struct SaltTextModelGpuEmbeddingArgs {
+    SaltTextModelGpuBackend backend;
+    void *command;
+    void *canonical;
+    size_t canonical_bytes;
+    SaltTextModelGpuTensorView tensor;
+    uint64_t token_ids_offset;
+    uint64_t output_offset;
+    uint32_t token_count;
+    float scale;
+} SaltTextModelGpuEmbeddingArgs;
+
+typedef struct SaltTextModelGpuActivationArgs {
+    SaltTextModelGpuBackend backend;
+    void *command;
+    void *canonical;
+    size_t canonical_bytes;
+    uint64_t gate_offset;
+    uint64_t up_offset;
+    uint64_t output_offset;
+    size_t elements;
+    SaltActivationKind activation;
+    float activation_limit;
+} SaltTextModelGpuActivationArgs;
+
+typedef struct SaltTextModelGpuRouterArgs {
+    SaltTextModelGpuBackend backend;
+    void *command;
+    void *canonical;
+    size_t canonical_bytes;
+    SaltTextModelGpuTensorView expert_bias;
+    uint64_t logits_offset;
+    uint64_t selected_offset;
+    uint64_t weights_offset;
+    uint64_t grouped_offset;
+    uint64_t inverse_offset;
+    uint64_t scratch_offset;
+    uint64_t source_offset;
+    uint64_t routed_offset;
+    uint32_t rows;
+    uint32_t experts;
+    uint32_t topk;
+    uint32_t hidden;
+    int normalize_topk;
+    float router_scale;
+} SaltTextModelGpuRouterArgs;
+
+typedef struct SaltTextModelGpuExpertChainArgs {
+    SaltTextModelGpuBackend backend;
+    void *command;
+    void *canonical;
+    size_t canonical_bytes;
+    SaltTextModelGpuBufferView expert_table;
+    SaltTextModelGpuBufferView status;
+    uint64_t selected_offset;
+    uint64_t grouped_offset;
+    uint64_t input_offset;
+    uint64_t gate_offset;
+    uint64_t up_offset;
+    uint64_t chain_offset;
+    uint64_t output_jobs_offset;
+    uint32_t layer;
+    uint32_t rows;
+    uint32_t jobs;
+    uint32_t topk;
+    uint32_t experts;
+    uint32_t expert_table_stride;
+    uint32_t hidden;
+    uint32_t routed;
+    SaltActivationKind activation;
+    float activation_limit;
+    uint32_t *physical_launches;
+} SaltTextModelGpuExpertChainArgs;
+
+enum {
+    SALT_TEXT_MODEL_GPU_EXTENT_GRAPHS = 1u << 0,
+};
+
+typedef struct SaltTextModelGpuOps {
+    size_t state_bytes;
+    uint32_t flags;
+    int (*prepare)(void *context, const SaltTextModelGpuPrepareArgs *args,
+                   void *state, size_t state_bytes);
+    int (*project)(void *context, const SaltTextModelGpuProjectArgs *args,
+                   void *state, size_t state_bytes);
+    int (*embedding)(void *context, const SaltTextModelGpuEmbeddingArgs *args,
+                     void *state, size_t state_bytes);
+    int (*activation)(void *context, const SaltTextModelGpuActivationArgs *args,
+                      void *state, size_t state_bytes);
+    int (*router_topk)(void *context, const SaltTextModelGpuRouterArgs *args,
+                       void *state, size_t state_bytes);
+    int (*expert_chain)(void *context,
+                        const SaltTextModelGpuExpertChainArgs *args,
+                        void *state, size_t state_bytes);
+    int (*attention)(void *context,
+                     const SaltTextModelGpuAttentionArgs *args,
+                     void *state, size_t state_bytes);
+    int (*encode)(void *context, const SaltTextModelGpuEncodeArgs *args,
+                  void *state, size_t state_bytes);
+    void (*destroy)(void *context, SaltTextModelGpuBackend backend,
+                    void *state, size_t state_bytes);
+} SaltTextModelGpuOps;
+
 typedef struct SaltTextModelExecDesc {
     const SaltModelDesc *model;
     const SaltTextLayerExecDesc *layers;
@@ -220,6 +438,9 @@ typedef struct SaltTextModelExecDesc {
     SaltTextTensorDesc embedding;
     SaltTextTensorDesc final_norm;
     SaltTextTensorDesc output_head;
+    const SaltTextModelLayerOps *model_layer_ops;
+    const SaltTextModelGpuOps *model_gpu_ops;
+    void *model_gpu_context;
 } SaltTextModelExecDesc;
 
 typedef enum SaltTextExecutionUnit {
@@ -254,11 +475,12 @@ typedef enum SaltTextExecutionCellKind {
     SALT_TEXT_CELL_FFN_COMBINE,
     SALT_TEXT_CELL_FINAL_NORM,
     SALT_TEXT_CELL_FINAL_HEAD,
-    SALT_TEXT_CELL_LOGIT_SOFTCAP
+    SALT_TEXT_CELL_LOGIT_SOFTCAP,
+    SALT_TEXT_CELL_MODEL_LAYER
 } SaltTextExecutionCellKind;
 
 #define SALT_TEXT_EXECUTION_CELL_KIND_COUNT \
-    ((uint32_t)SALT_TEXT_CELL_LOGIT_SOFTCAP + 1u)
+    ((uint32_t)SALT_TEXT_CELL_MODEL_LAYER + 1u)
 
 typedef struct SaltTextExecutionSlice {
     uint32_t first;
@@ -346,6 +568,8 @@ typedef struct SaltTextCanonicalLayout {
     size_t position_logits;
     size_t attention_scores;
     size_t tensor_row;
+    size_t model_scratch;
+    size_t model_state;
     size_t tentative_kv;
     uint32_t maximum_query_width;
     uint32_t maximum_kv_width;
@@ -354,6 +578,8 @@ typedef struct SaltTextCanonicalLayout {
     uint32_t maximum_topk;
     uint32_t maximum_expert_width;
     uint32_t maximum_tensor_row;
+    uint32_t maximum_model_scratch_floats;
+    size_t model_state_bytes;
 } SaltTextCanonicalLayout;
 
 typedef struct SaltTextCompiledLayer {
@@ -362,6 +588,8 @@ typedef struct SaltTextCompiledLayer {
     uint32_t kv_width;
     size_t tentative_key_offset;
     size_t tentative_value_offset;
+    size_t model_state_offset;
+    size_t model_state_bytes;
     uint32_t first_cell;
     uint32_t cell_count;
 } SaltTextCompiledLayer;

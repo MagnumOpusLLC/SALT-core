@@ -904,7 +904,14 @@ static size_t g4_live_kv_capacity(const SaltGemma4Text *model, int layer) {
 
 static int g4_apply_kv_forecast_policy(SaltGemma4Text *model) {
     size_t total = 0;
-    if (!model || model->max_context < 1) return -1;
+    int gpu_attention = 0, gpu_kv_ring = 0;
+    if (!model || model->max_context < 1 ||
+        g4_recipe_int("SALT_PREFILL_GPU_ATTENTION", 0, 1,
+                      &gpu_attention) != 0 ||
+        g4_recipe_int("SALT_GEMMA_GPU_KV_RING", 0, 1,
+                      &gpu_kv_ring) != 0 ||
+        (gpu_kv_ring && (!model->full_gpu_intent || !gpu_attention)))
+        return -1;
     for (int i = 0; i < G4_LAYERS; i++) {
         const SaltKvLayerPlan *plan = &model->kv_plan[i];
         size_t capacity = g4_live_kv_capacity(model, i);

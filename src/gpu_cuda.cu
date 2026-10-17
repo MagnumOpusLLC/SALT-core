@@ -5,10 +5,13 @@
 
 #include <cuda_runtime.h>
 
+#include "gpu_cuda_text_kv.cuh"
+
 #include <chrono>
 #include <limits.h>
 #include <math.h>
 #include <stdint.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -43,6 +46,7 @@ typedef struct CudaTensor {
 typedef struct CudaSelectedResource {
     int active;
     uint64_t logical_resource_id;
+    uint32_t generation;
     const unsigned char *base;
     const unsigned char *payload;
     const unsigned char *device_payload;
@@ -56,25 +60,23 @@ typedef struct CudaBatchDesc {
     int rows, cols, batch;
 } CudaBatchDesc;
 
-/* The target-program realization is deliberately narrow and fail-closed.  It
- * admits only the authenticated Gemma-4 MLX4 text program whose complete
- * immutable graph is 689 cells (all 27 public kinds).  Keeping fixed bounds
- * here makes every descriptor and command byte a startup cost. */
-#define CUDA_TEXT_LAYERS 30u
-#define CUDA_TEXT_EXPERTS 128u
+/* Startup-fixed maxima for every admitted immutable text program. Model
+ * descriptors carry actual geometry; these constants bound storage only. */
+#define CUDA_TEXT_LAYERS 64u
+#define CUDA_TEXT_EXPERTS 256u
 #define CUDA_TEXT_TOPK 8u
 #define CUDA_TEXT_MAX_CANDIDATES 64u
-#define CUDA_TEXT_MAX_ROWS 256u
+#define CUDA_TEXT_MAX_ROWS 512u
 #define CUDA_TEXT_ATTENTION_SCORE_TILE 8192u
 #define CUDA_TEXT_ATTENTION_TASK_TILE 256u
-#define CUDA_TEXT_CELLS 689u
+#define CUDA_TEXT_CELLS 2048u
 #define CUDA_TEXT_HIDDEN 2816u
-#define CUDA_TEXT_DENSE 2112u
-#define CUDA_TEXT_ROUTED 704u
+#define CUDA_TEXT_DENSE 11776u
+#define CUDA_TEXT_ROUTED 1536u
 #define CUDA_TEXT_EXPERT_REFS \
     (CUDA_TEXT_LAYERS * CUDA_TEXT_EXPERTS * 3u)
 #define CUDA_TEXT_GRAPH_COUNT CUDA_TEXT_MAX_CANDIDATES
-#define CUDA_TEXT_GRAPH_MAX_NODES 1024u
+#define CUDA_TEXT_GRAPH_MAX_NODES 2048u
 #define CUDA_TEXT_MAX_EXTENTS (CUDA_TEXT_LAYERS * 2u + 1u)
 #define CUDA_TEXT_STATE_MAGIC UINT64_C(0x4355545854505247)
 
@@ -91,6 +93,15 @@ typedef struct CudaTextTensorRef {
     uint32_t reserved;
 } CudaTextTensorRef;
 
+static_assert(sizeof(CudaTextTensorRef) == sizeof(SaltTextModelGpuTensorView),
+    "model expert table entry size");
+static_assert(offsetof(CudaTextTensorRef, resource) ==
+    offsetof(SaltTextModelGpuTensorView, resource),
+    "model expert table resource offset");
+static_assert(offsetof(CudaTextTensorRef, encoding) ==
+    offsetof(SaltTextModelGpuTensorView, encoding),
+    "model expert table encoding offset");
+
 typedef struct CudaTextKvRef {
     float *keys;
     float *values;
@@ -106,6 +117,8 @@ typedef struct CudaTextKvRef {
 typedef struct CudaTextLayerRefs {
     CudaTextTensorRef q, k, v, o;
     CudaTextTensorRef dense_gate, dense_up, dense_down, router;
+    CudaTextTensorRef model_input_projection, model_kernel;
+    CudaTextTensorRef model_output_projection;
     CudaTextTensorRef pre_attention_norm, q_norm, k_norm;
     CudaTextTensorRef post_attention_norm;
     CudaTextTensorRef pre_ffn_norm_1, pre_ffn_norm_2;
@@ -114,6 +127,29 @@ typedef struct CudaTextLayerRefs {
     CudaTextTensorRef layer_scalar;
     CudaTextKvRef kv;
 } CudaTextLayerRefs;
+
+static SaltTextModelGpuTensorView cuda_text_model_view(
+        const CudaTextTensorRef *ref) {
+    SaltTextModelGpuTensorView view = {};
+    if (!ref) return view;
+    view.resource = (void *)ref->resource;
+    view.value_offset = ref->value_offset;
+    view.scale_offset = ref->scale_offset;
+    view.bias_offset = ref->bias_offset;
+    view.rows = ref->rows;
+    view.cols = ref->cols;
+    view.encoding = (SaltTensorEncoding)ref->encoding;
+    return view;
+}
+
+static SaltTextModelGpuBufferView cuda_text_buffer_view(
+        void *resource, uint64_t offset, uint64_t bytes) {
+    SaltTextModelGpuBufferView view = {};
+    view.resource = resource;
+    view.offset = offset;
+    view.bytes = bytes;
+    return view;
+}
 
 typedef struct CudaTextCellTemplate {
     const SaltTextExecutionCell *cell;
@@ -165,6 +201,10 @@ typedef struct CudaTextProgramState {
     CudaTextKvRef *device_kv;
     CudaTextTensorRef embedding, final_norm, output_head;
     CudaTextLayerRefs layers[CUDA_TEXT_LAYERS];
+    const SaltTextModelGpuOps *model_gpu_ops;
+    void *model_gpu_context;
+    void *model_gpu_state;
+    size_t model_gpu_state_bytes;
     CudaTextTensorRef expert_refs[CUDA_TEXT_EXPERT_REFS];
     CudaTextCellTemplate templates[CUDA_TEXT_CELLS];
     CudaTextGraphTemplate graphs[CUDA_TEXT_GRAPH_COUNT];
@@ -193,6 +233,7 @@ typedef struct CudaTextProgramCommand {
     uint32_t source_position;
     uint32_t input_count;
     uint32_t maximum_depth;
+    uint32_t frontier_linear;
     uint32_t attention_score_rows;
     uint32_t next_cell;
     uint32_t encoded_cells;
@@ -230,6 +271,7 @@ static CudaSelectedResource *cuda_selected_resources;
 static int *cuda_selected_logical_slots;
 static int cuda_selected_capacity;
 static int cuda_selected_logical_capacity;
+static uint32_t cuda_selected_generation;
 static int cuda_selected_retirement_fenced;
 /* One-shot proof that the text-program stream was synchronized immediately
  * before its synchronous SaltCache acquire.  The existing retirement hook
@@ -918,25 +960,34 @@ __global__ static void cuda_q4_warp_batch(
     }
 }
 
+#define SALT_BITMATH_EMBEDDED 1
+#define SALT_BITMATH_API __device__ static
+#define SALT_BITMATH_LOCAL __device__ static
+#define salt_expf cuda_owned_expf
+#define salt_logf cuda_owned_logf
+#define salt_powf cuda_owned_powf
+#define salt_rsqrtf cuda_owned_rsqrtf
+#define salt_sqrtf cuda_owned_sqrtf
+#define salt_tanhf cuda_owned_tanhf
+#define salt_sinf cuda_owned_sinf
+#define salt_cosf cuda_owned_cosf
+#define salt_log1pf cuda_owned_log1pf
+#include "bitmath.c"
+#undef salt_log1pf
+#undef salt_cosf
+#undef salt_sinf
+#undef salt_tanhf
+#undef salt_sqrtf
+#undef salt_rsqrtf
+#undef salt_powf
+#undef salt_logf
+#undef salt_expf
+#undef SALT_BITMATH_LOCAL
+#undef SALT_BITMATH_API
+#undef SALT_BITMATH_EMBEDDED
+
 __device__ static float cuda_salt_expf(float x) {
-    if (x != x) return x;
-    if (x > 88.722839f) return 3.402823466e+38f;
-    if (x < -87.336548f) return 0.0f;
-    double n = round((double)x *
-        1.442695040888963407359924681001892137426645954152985934135449406931);
-    double r = (double)x - n *
-        0.693147180559945309417232121458176568075500134360255254120680009;
-    float rf = (float)r;
-    float p = 2.48015873015873e-05f;
-    p = __fadd_rn(__fmul_rn(p, rf), 1.98412698412698e-04f);
-    p = __fadd_rn(__fmul_rn(p, rf), 1.38888888888889e-03f);
-    p = __fadd_rn(__fmul_rn(p, rf), 8.33333333333333e-03f);
-    p = __fadd_rn(__fmul_rn(p, rf), 4.16666666666667e-02f);
-    p = __fadd_rn(__fmul_rn(p, rf), 1.66666666666667e-01f);
-    p = __fadd_rn(__fmul_rn(p, rf), 5.0e-01f);
-    p = __fadd_rn(__fmul_rn(p, rf), 1.0f);
-    p = __fadd_rn(__fmul_rn(p, rf), 1.0f);
-    return ldexpf(p, (int)n);
+    return cuda_owned_expf(x);
 }
 
 __device__ static float cuda_round_bf16(float x) {
@@ -959,24 +1010,7 @@ __device__ static float cuda_bf16_add(float a, float b) {
 }
 
 __device__ static float cuda_salt_rsqrtf(float x) {
-    if (x != x) return x;
-    if (x < 0.0f) return 0.0f / 0.0f;
-    if (x == 0.0f) return 1.0f / 0.0f;
-    if (x == 1.0f) return 1.0f;
-    if (x < 0x1p-126f)
-        return __fmul_rn(cuda_salt_rsqrtf(__fmul_rn(x, 0x1p24f)),
-                         0x1p12f);
-    uint32_t bits = __float_as_uint(x);
-    bits = UINT32_C(0x5f3759df) - (bits >> 1);
-    double y = (double)__uint_as_float(bits);
-    double xd = (double)x;
-    for (int i = 0; i < 6; i++) {
-        double yy = __dmul_rn(y, y);
-        double half_product = __dmul_rn(0.5, __dmul_rn(xd, yy));
-        double correction = __dadd_rn(1.5, -half_product);
-        y = __dmul_rn(y, correction);
-    }
-    return (float)y;
+    return cuda_owned_rsqrtf(x);
 }
 
 __global__ static void cuda_attention_transform_exact(
@@ -1175,14 +1209,7 @@ __global__ static void cuda_attention_publish_exact(
 }
 
 __device__ static float cuda_salt_tanhf(float x) {
-    if (x != x) return x;
-    if (x >= 10.0f) return 1.0f;
-    if (x <= -10.0f) return -1.0f;
-    float magnitude = x < 0.0f ? -x : x;
-    float exponential = cuda_salt_expf(__fmul_rn(2.0f, magnitude));
-    float result = __fdiv_rn(__fadd_rn(exponential, -1.0f),
-                             __fadd_rn(exponential, 1.0f));
-    return x < 0.0f ? -result : result;
+    return cuda_owned_tanhf(x);
 }
 
 __device__ static float cuda_gemma4_gelu_tanh(float x) {
@@ -1196,115 +1223,20 @@ __device__ static float cuda_gemma4_gelu_tanh(float x) {
     return __fmul_rn(half_x, __fadd_rn(1.0f, tanh_value));
 }
 
-__device__ static double cuda_text_invsqrt64(float x) {
-    uint32_t bits = __float_as_uint(x);
-    bits = UINT32_C(0x5f3759df) - (bits >> 1);
-    double y = (double)__uint_as_float(bits);
-    double xd = (double)x;
-    for (int i = 0; i < 6; i++) {
-        double yy = __dmul_rn(y, y);
-        double correction = __dadd_rn(
-            1.5, -__dmul_rn(0.5, __dmul_rn(xd, yy)));
-        y = __dmul_rn(y, correction);
-    }
-    return y;
-}
-
 __device__ static float cuda_text_sqrtf(float x) {
-    if (x != x) return x;
-    if (x < 0.0f) return 0.0f / 0.0f;
-    if (x == 0.0f || x == 1.0f) return x;
-    if (x < 0x1p-126f)
-        return __fmul_rn(cuda_text_sqrtf(__fmul_rn(x, 0x1p24f)), 0x1p-12f);
-    return (float)__dmul_rn((double)x, cuda_text_invsqrt64(x));
-}
-
-__device__ static float cuda_text_logf(float x) {
-    if (x != x) return x;
-    if (x <= 0.0f) return -1.0f / 0.0f;
-    int exponent;
-    float mantissa = frexpf(x, &exponent);
-    double u = __ddiv_rn(__dadd_rn((double)mantissa, -1.0),
-                           __dadd_rn((double)mantissa, 1.0));
-    double s = __dmul_rn(u, u);
-    double z = 1.0 / 25.0;
-    z = __dadd_rn(__dmul_rn(z, s), 1.0 / 23.0);
-    z = __dadd_rn(__dmul_rn(z, s), 1.0 / 21.0);
-    z = __dadd_rn(__dmul_rn(z, s), 1.0 / 19.0);
-    z = __dadd_rn(__dmul_rn(z, s), 1.0 / 17.0);
-    z = __dadd_rn(__dmul_rn(z, s), 1.0 / 15.0);
-    z = __dadd_rn(__dmul_rn(z, s), 1.0 / 13.0);
-    z = __dadd_rn(__dmul_rn(z, s), 1.0 / 11.0);
-    z = __dadd_rn(__dmul_rn(z, s), 1.0 / 9.0);
-    z = __dadd_rn(__dmul_rn(z, s), 1.0 / 7.0);
-    z = __dadd_rn(__dmul_rn(z, s), 1.0 / 5.0);
-    z = __dadd_rn(__dmul_rn(z, s), 1.0 / 3.0);
-    z = __dadd_rn(__dmul_rn(z, s), 1.0);
-    double logarithm = __dmul_rn(2.0, __dmul_rn(u, z));
-    return (float)__dadd_rn(logarithm,
-        __dmul_rn((double)exponent,
-                  0.693147180559945309417232121458176568));
+    return cuda_owned_sqrtf(x);
 }
 
 __device__ static float cuda_text_powf(float x, float y) {
-    if (x == 1.0f || y == 0.0f) return 1.0f;
-    if (x > 0.0f && y == -0.5f) return cuda_salt_rsqrtf(x);
-    if (x > 0.0f) return cuda_salt_expf(__fmul_rn(y, cuda_text_logf(x)));
-    return x;
-}
-
-__device__ static void cuda_text_sincos_reduce(
-        float x, int *quadrant, float *reduced) {
-    const double pio2_hi = 1.57079632679489655800e+00;
-    const double pio2_lo = 6.12323399573676603587e-17;
-    const double inv_pio2 = 6.36619772367581382433e-01;
-    double n = round(__dmul_rn((double)x, inv_pio2));
-    double r = __dadd_rn((double)x, -__dmul_rn(n, pio2_hi));
-    r = __dadd_rn(r, -__dmul_rn(n, pio2_lo));
-    long long q = (long long)n % 4ll;
-    if (q < 0) q += 4;
-    *quadrant = (int)q;
-    *reduced = (float)r;
-}
-
-__device__ static float cuda_text_sin_poly(float x) {
-    float x2 = __fmul_rn(x, x);
-    float z = __fadd_rn(__fmul_rn(x2, -1.95152958910081473e-04f),
-                          8.33302275008926213e-03f);
-    z = __fadd_rn(__fmul_rn(x2, z), -1.66666666641626524e-01f);
-    z = __fmul_rn(x2, z);
-    return __fadd_rn(x, __fmul_rn(x, z));
-}
-
-__device__ static float cuda_text_cos_poly(float x) {
-    float x2 = __fmul_rn(x, x);
-    float z = __fadd_rn(__fmul_rn(x2, 2.44331571180994839e-05f),
-                         -1.38873162549376522e-03f);
-    z = __fadd_rn(__fmul_rn(x2, z), 4.16666679023301001e-02f);
-    z = __fadd_rn(__fmul_rn(x2, z), -0.5f);
-    return __fadd_rn(1.0f, __fmul_rn(x2, z));
+    return cuda_owned_powf(x, y);
 }
 
 __device__ static float cuda_text_sinf(float x) {
-    if (x != x) return x;
-    int quadrant;
-    float reduced;
-    cuda_text_sincos_reduce(x, &quadrant, &reduced);
-    if (quadrant == 0) return cuda_text_sin_poly(reduced);
-    if (quadrant == 1) return cuda_text_cos_poly(reduced);
-    if (quadrant == 2) return -cuda_text_sin_poly(reduced);
-    return -cuda_text_cos_poly(reduced);
+    return cuda_owned_sinf(x);
 }
 
 __device__ static float cuda_text_cosf(float x) {
-    if (x != x) return x;
-    int quadrant;
-    float reduced;
-    cuda_text_sincos_reduce(x, &quadrant, &reduced);
-    if (quadrant == 0) return cuda_text_cos_poly(reduced);
-    if (quadrant == 1) return -cuda_text_sin_poly(reduced);
-    if (quadrant == 2) return -cuda_text_cos_poly(reduced);
-    return cuda_text_sin_poly(reduced);
+    return cuda_owned_cosf(x);
 }
 
 __device__ static void cuda_text_fail(int *status) {
@@ -1315,15 +1247,28 @@ __device__ static void cuda_text_fail_code(int *status, int code) {
     atomicCAS(status, 0, code);
 }
 
+__device__ static float cuda_text_weight(
+        const unsigned char *weight, uint32_t encoding, uint32_t index) {
+    if (!weight) return 0.0f;
+    if (encoding == SALT_TENSOR_ENCODING_F32)
+        return ((const float *)(const void *)weight)[index];
+    if (encoding == SALT_TENSOR_ENCODING_BF16)
+        return cuda_bf16(weight + (size_t)index * 2u);
+    return NAN;
+}
+
 __device__ static void cuda_text_norm_block(
-        const float *input, const float *weight, float *output,
+        const float *input, const unsigned char *weight,
+        uint32_t weight_encoding, float *output,
         uint32_t width, float epsilon, int with_scale,
         float *inverse, int *status) {
     if (threadIdx.x == 0) {
         float sum = 0.0f;
         for (uint32_t column = 0; column < width; column++) {
             float value = input[column];
-            if (!isfinite(value) || (with_scale && !isfinite(weight[column])))
+            float scale = with_scale
+                ? cuda_text_weight(weight, weight_encoding, column) : 1.0f;
+            if (!isfinite(value) || (with_scale && !isfinite(scale)))
                 cuda_text_fail(status);
             sum = __fadd_rn(sum, __fmul_rn(value, value));
         }
@@ -1335,7 +1280,9 @@ __device__ static void cuda_text_norm_block(
     for (uint32_t column = threadIdx.x; column < width;
          column += blockDim.x) {
         float value = __fmul_rn(input[column], *inverse);
-        if (with_scale) value = __fmul_rn(value, weight[column]);
+        if (with_scale)
+            value = __fmul_rn(value,
+                cuda_text_weight(weight, weight_encoding, column));
         output[column] = value;
         if (!isfinite(value)) cuda_text_fail(status);
     }
@@ -1343,30 +1290,34 @@ __device__ static void cuda_text_norm_block(
 }
 
 __global__ static void cuda_text_rmsnorm_rows(
-        const float *input, size_t input_stride, const float *weight,
-        float *output, size_t output_stride, uint32_t rows, uint32_t width,
+        const float *input, size_t input_stride, const unsigned char *weight,
+        uint32_t weight_encoding, float *output, size_t output_stride,
+        uint32_t rows, uint32_t width,
         float epsilon, int with_scale, int *status) {
     uint32_t row = (uint32_t)blockIdx.x;
     __shared__ float inverse;
     if (row >= rows) return;
     cuda_text_norm_block(input + (size_t)row * input_stride, weight,
-        output + (size_t)row * output_stride, width, epsilon,
+        weight_encoding, output + (size_t)row * output_stride, width, epsilon,
         with_scale, &inverse, status);
 }
 
 __global__ static void cuda_text_rmsnorm_pair_rows(
         const float *input, size_t input_stride,
-        const float *weight0, const float *weight1,
+        const unsigned char *weight0, uint32_t weight0_encoding,
+        const unsigned char *weight1, uint32_t weight1_encoding,
         float *output0, float *output1, size_t output_stride,
         uint32_t rows, uint32_t width, float epsilon, int *status) {
     uint32_t row = (uint32_t)blockIdx.x;
     uint32_t plane = (uint32_t)blockIdx.y;
-    const float *weight = plane == 0u ? weight0 : weight1;
+    const unsigned char *weight = plane == 0u ? weight0 : weight1;
+    uint32_t weight_encoding = plane == 0u
+        ? weight0_encoding : weight1_encoding;
     float *output = plane == 0u ? output0 : output1;
     __shared__ float inverse;
     if (row >= rows || plane >= 2u || !weight || !output) return;
     cuda_text_norm_block(input + (size_t)row * input_stride, weight,
-        output + (size_t)row * output_stride, width, epsilon,
+        weight_encoding, output + (size_t)row * output_stride, width, epsilon,
         1, &inverse, status);
 }
 
@@ -1413,9 +1364,10 @@ __global__ static void cuda_text_attention_transform(
         const uint32_t *source_position_pointer, const uint32_t *depths,
         uint32_t rows,
         uint32_t query_width, uint32_t kv_width, float epsilon,
-        int shared_kv_projection,
+        int shared_kv_projection, int raw_values,
         float *queries, float *keys, float *values,
-        const float *q_weight, const float *k_weight,
+        const unsigned char *q_weight, uint32_t q_weight_encoding,
+        const unsigned char *k_weight, uint32_t k_weight_encoding,
         float *tentative_keys, float *tentative_values, int *status) {
     uint32_t tasks_per_row = n_heads + 2u * n_kv_heads;
     if (!source_position_pointer || !depths) {
@@ -1428,7 +1380,8 @@ __global__ static void cuda_text_attention_transform(
     uint32_t local = task - row_index * tasks_per_row;
     uint32_t kind, head;
     float *row;
-    const float *weight = NULL;
+    const unsigned char *weight = NULL;
+    uint32_t weight_encoding = SALT_TENSOR_ENCODING_F32;
     __shared__ float inverse;
     if (row_index >= rows) return;
     if (local < n_heads) {
@@ -1437,12 +1390,14 @@ __global__ static void cuda_text_attention_transform(
         row = queries + (size_t)row_index * query_width +
             (size_t)head * head_dim;
         weight = q_weight;
+        weight_encoding = q_weight_encoding;
     } else if (local < n_heads + n_kv_heads) {
         kind = 1u;
         head = local - n_heads;
         row = keys + (size_t)row_index * kv_width +
             (size_t)head * head_dim;
         weight = k_weight;
+        weight_encoding = k_weight_encoding;
     } else {
         kind = 2u;
         head = local - n_heads - n_kv_heads;
@@ -1455,8 +1410,9 @@ __global__ static void cuda_text_attention_transform(
                     (size_t)head * head_dim + column];
     }
     __syncthreads();
-    cuda_text_norm_block(row, weight, row, head_dim, epsilon,
-                         kind != 2u, &inverse, status);
+    if (kind != 2u || !raw_values)
+        cuda_text_norm_block(row, weight, weight_encoding, row, head_dim,
+                             epsilon, kind != 2u, &inverse, status);
     if (kind != 2u) {
         for (uint32_t column = threadIdx.x; column < head_dim;
              column += blockDim.x)
@@ -1495,42 +1451,6 @@ __global__ static void cuda_text_attention_transform(
              column += blockDim.x)
             tentative_values[(size_t)row_index * kv_width +
                 (size_t)head * head_dim + column] = row[column];
-}
-
-__device__ static const float *cuda_text_frontier_row(
-        const float *tentative, const uint32_t *parents,
-        const uint32_t *depths, uint32_t rows, uint32_t current,
-        uint32_t target_depth, uint32_t stride) {
-    uint32_t row = current, steps = 0u;
-    if (!tentative || !parents || !depths || current >= rows) return NULL;
-    while (depths[row] > target_depth) {
-        if (++steps > rows) return NULL;
-        row = parents[row];
-        if (row == UINT32_MAX || row >= rows) return NULL;
-    }
-    if (depths[row] != target_depth) return NULL;
-    return tentative + (size_t)row * stride;
-}
-
-__device__ static const float *cuda_text_committed_row(
-        const float *rows, uint32_t position, uint32_t source_position,
-        uint32_t width, uint32_t mode, uint32_t capacity) {
-    uint32_t index;
-    if (!rows || width == 0u || capacity == 0u ||
-        position >= source_position)
-        return NULL;
-    if (mode == SALT_TEXT_KV_PRIVATE_ABSOLUTE) {
-        if (position >= capacity) return NULL;
-        index = position;
-    } else if (mode == SALT_TEXT_KV_PRIVATE_RING) {
-        uint32_t oldest = source_position > capacity
-            ? source_position - capacity : 0u;
-        if (position < oldest) return NULL;
-        index = position % capacity;
-    } else {
-        return NULL;
-    }
-    return rows + (size_t)index * width;
 }
 
 __global__ static void cuda_text_publish_authoritative_kv(
@@ -2052,23 +1972,38 @@ __global__ static void cuda_text_attention_reduce_global_exact(
 }
 
 __global__ static void cuda_text_residual_postnorm_rows(
-        const float *residual, float *branch, const float *weight,
+        const float *residual, float *branch,
+        const unsigned char *weight, uint32_t weight_encoding,
         float *output, uint32_t rows, uint32_t width, float epsilon,
-        int *status) {
+        int with_norm, int *status) {
     uint32_t row = (uint32_t)blockIdx.x;
     __shared__ float inverse;
     if (row >= rows) return;
     residual += (size_t)row * width;
     branch += (size_t)row * width;
     output += (size_t)row * width;
-    cuda_text_norm_block(branch, weight, branch, width, epsilon, 1,
-                         &inverse, status);
+    if (with_norm)
+        cuda_text_norm_block(branch, weight, weight_encoding, branch, width,
+                             epsilon, 1, &inverse, status);
     for (uint32_t column = threadIdx.x; column < width;
          column += blockDim.x) {
         float value = __fadd_rn(residual[column], branch[column]);
         output[column] = value;
         if (!isfinite(value)) cuda_text_fail(status);
     }
+}
+
+__global__ static void cuda_text_ffn_add_rows(
+        const float *residual, const float *dense, const float *routed,
+        float *output, size_t elements, uint32_t mode, int *status) {
+    size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= elements) return;
+    float branch = 0.0f;
+    if (mode & 1u) branch = dense[index];
+    if (mode & 2u) branch = __fadd_rn(branch, routed[index]);
+    float value = __fadd_rn(residual[index], branch);
+    output[index] = value;
+    if (!isfinite(value)) cuda_text_fail(status);
 }
 
 __global__ static void cuda_text_router_input_rows(
@@ -2311,6 +2246,124 @@ __global__ static void cuda_text_expert_q4(
         output[(size_t)grouped * ref.rows + row] = __fadd_rn(even, odd);
 }
 
+__device__ static float cuda_text_warp_reduce_exact(float accumulator) {
+    unsigned int mask = 0xffffffffu;
+    int lane = (int)threadIdx.x & 31;
+    int base = lane & 3;
+    float lane_sum = 0.0f;
+    #pragma unroll
+    for (int source = 0; source < 8; source++)
+        lane_sum = __fadd_rn(lane_sum,
+            __shfl_sync(mask, accumulator, base + 4 * source));
+    float lane0 = __shfl_sync(mask, lane_sum, 0);
+    float lane1 = __shfl_sync(mask, lane_sum, 1);
+    float lane2 = __shfl_sync(mask, lane_sum, 2);
+    float lane3 = __shfl_sync(mask, lane_sum, 3);
+    return __fadd_rn(__fadd_rn(lane0, lane2),
+                     __fadd_rn(lane1, lane3));
+}
+
+__global__ static void cuda_text_expert_q4_matrix(
+        const CudaTextTensorRef *experts, uint32_t layer, uint32_t phase,
+        const int32_t *selected, const int32_t *grouped_to_canonical,
+        uint32_t jobs, const float *input, float *output,
+        uint32_t expected_rows, uint32_t expected_cols, int *status) {
+    uint32_t grouped0 = (uint32_t)blockIdx.y * 2u;
+    uint32_t grouped1 = grouped0 + 1u;
+    int lane = (int)threadIdx.x & 31;
+    int warp = (int)threadIdx.x >> 5;
+    uint32_t row = (uint32_t)blockIdx.x * 4u + (uint32_t)warp;
+    uint32_t canonical0, canonical1 = 0u;
+    int32_t expert0, expert1 = -1;
+    CudaTextTensorRef ref0 = {0}, ref1 = {0};
+    int has1 = grouped1 < jobs;
+    float accumulator0 = 0.0f, accumulator1 = 0.0f;
+    if (grouped0 >= jobs) return;
+    canonical0 = (uint32_t)grouped_to_canonical[grouped0];
+    if (canonical0 >= jobs) {
+        if (lane == 0 && warp == 0) cuda_text_fail(status);
+        return;
+    }
+    expert0 = selected[canonical0];
+    if (expert0 < 0 || expert0 >= (int32_t)CUDA_TEXT_EXPERTS) {
+        if (lane == 0 && warp == 0) cuda_text_fail(status);
+        return;
+    }
+    ref0 = experts[((size_t)layer * CUDA_TEXT_EXPERTS +
+        (uint32_t)expert0) * 3u + phase];
+    if (ref0.encoding != SALT_TENSOR_ENCODING_AFFINE_Q4 ||
+        ref0.rows != expected_rows || ref0.cols != expected_cols ||
+        !ref0.resource) {
+        if (lane == 0 && warp == 0) cuda_text_fail(status);
+        return;
+    }
+    if (has1) {
+        canonical1 = (uint32_t)grouped_to_canonical[grouped1];
+        if (canonical1 >= jobs) {
+            if (lane == 0 && warp == 0) cuda_text_fail(status);
+            return;
+        }
+        expert1 = selected[canonical1];
+        if (expert1 < 0 || expert1 >= (int32_t)CUDA_TEXT_EXPERTS) {
+            if (lane == 0 && warp == 0) cuda_text_fail(status);
+            return;
+        }
+        ref1 = experts[((size_t)layer * CUDA_TEXT_EXPERTS +
+            (uint32_t)expert1) * 3u + phase];
+        if (ref1.encoding != SALT_TENSOR_ENCODING_AFFINE_Q4 ||
+            ref1.rows != expected_rows || ref1.cols != expected_cols ||
+            !ref1.resource) {
+            if (lane == 0 && warp == 0) cuda_text_fail(status);
+            return;
+        }
+    }
+    if (row < expected_rows) {
+        for (uint32_t column = (uint32_t)lane; column < expected_cols;
+             column += 32u) {
+            uint64_t k = (uint64_t)row * expected_cols + column;
+            uint64_t group = k / 64u;
+            uint32_t packed0 = cuda_load_u32(ref0.resource +
+                ref0.value_offset + (k >> 3u) * 4u);
+            uint32_t quantized0 =
+                (packed0 >> ((k & 7u) * 4u)) & 15u;
+            float value0 = __fmul_rn((float)quantized0,
+                cuda_bf16(ref0.resource + ref0.scale_offset + group * 2u));
+            value0 = __fadd_rn(value0,
+                cuda_bf16(ref0.resource + ref0.bias_offset + group * 2u));
+            accumulator0 = __fadd_rn(accumulator0,
+                __fmul_rn(value0,
+                    input[(size_t)grouped0 * expected_cols + column]));
+            if (has1) {
+                float value1;
+                if (expert1 == expert0) {
+                    value1 = value0;
+                } else {
+                    uint32_t packed1 = cuda_load_u32(ref1.resource +
+                        ref1.value_offset + (k >> 3u) * 4u);
+                    uint32_t quantized1 =
+                        (packed1 >> ((k & 7u) * 4u)) & 15u;
+                    value1 = __fmul_rn((float)quantized1,
+                        cuda_bf16(ref1.resource +
+                            ref1.scale_offset + group * 2u));
+                    value1 = __fadd_rn(value1,
+                        cuda_bf16(ref1.resource +
+                            ref1.bias_offset + group * 2u));
+                }
+                accumulator1 = __fadd_rn(accumulator1,
+                    __fmul_rn(value1,
+                        input[(size_t)grouped1 * expected_cols + column]));
+            }
+        }
+    }
+    float reduced0 = cuda_text_warp_reduce_exact(accumulator0);
+    float reduced1 = cuda_text_warp_reduce_exact(accumulator1);
+    if (lane == 0 && row < expected_rows) {
+        output[(size_t)grouped0 * expected_rows + row] = reduced0;
+        if (has1)
+            output[(size_t)grouped1 * expected_rows + row] = reduced1;
+    }
+}
+
 __global__ static void cuda_text_expert_reduce(
         const float *weights, const int32_t *canonical_to_grouped,
         const float *job_outputs, float *output, uint32_t rows,
@@ -2357,17 +2410,23 @@ __global__ static void cuda_text_parallel_combine_rows(
     scratch_a += (size_t)row * width;
     scratch_b += (size_t)row * width;
     output += (size_t)row * width;
-    cuda_text_norm_block(dense, dense_weight, scratch_a, width, epsilon, 1,
-                         &inverse, status);
-    cuda_text_norm_block(routed, routed_weight, scratch_b, width, epsilon, 1,
-                         &inverse, status);
+    cuda_text_norm_block(dense,
+        (const unsigned char *)(const void *)dense_weight,
+        SALT_TENSOR_ENCODING_F32, scratch_a, width, epsilon, 1,
+        &inverse, status);
+    cuda_text_norm_block(routed,
+        (const unsigned char *)(const void *)routed_weight,
+        SALT_TENSOR_ENCODING_F32, scratch_b, width, epsilon, 1,
+        &inverse, status);
     for (uint32_t column = threadIdx.x; column < width;
          column += blockDim.x) {
         scratch_a[column] = __fadd_rn(scratch_a[column], scratch_b[column]);
         if (!isfinite(scratch_a[column])) cuda_text_fail(status);
     }
     __syncthreads();
-    cuda_text_norm_block(scratch_a, final_weight, scratch_b,
+    cuda_text_norm_block(scratch_a,
+                         (const unsigned char *)(const void *)final_weight,
+                         SALT_TENSOR_ENCODING_F32, scratch_b,
                          width, epsilon, 1, &inverse, status);
     for (uint32_t column = threadIdx.x; column < width;
          column += blockDim.x) {
@@ -4049,7 +4108,8 @@ extern "C" int salt_gpu_exact_cells(const SaltGpuExactCell *cells, int count) {
                     cell->n, &views[2]) != 0)
                 return -1;
             cuda_text_rmsnorm_rows<<<1, 256>>>(
-                (const float *)views[0], cell->n, (const float *)views[1],
+                (const float *)views[0], cell->n,
+                (const unsigned char *)views[1], SALT_TENSOR_ENCODING_F32,
                 (float *)views[2], cell->n, 1u, cell->n, cell->eps,
                 (int)cell->aux, cuda_attention_status);
             break;
@@ -4076,8 +4136,9 @@ extern "C" int salt_gpu_exact_cells(const SaltGpuExactCell *cells, int count) {
                     return -1;
             cuda_text_residual_postnorm_rows<<<1, 256>>>(
                 (const float *)views[0], (float *)views[1],
-                (const float *)views[2], (float *)views[3],
-                1u, cell->n, cell->eps, cuda_attention_status);
+                (const unsigned char *)views[2], SALT_TENSOR_ENCODING_F32,
+                (float *)views[3],
+                1u, cell->n, cell->eps, 1, cuda_attention_status);
             break;
         case SALT_GPU_EXACT_PARALLEL_COMBINE:
             for (int view = 0; view < 8; view++) {
@@ -4841,6 +4902,7 @@ extern "C" int salt_gpu_selected_resources_prepare(
         cuda_selected_logical_slots[logical] = -1;
     cuda_selected_capacity = capacity;
     cuda_selected_logical_capacity = logical_capacity;
+    cuda_selected_generation = 0;
     return 0;
 }
 
@@ -4885,9 +4947,12 @@ extern "C" int salt_gpu_selected_resource_bind(
             resource->device_payload == device_payload &&
             resource->nbytes == nbytes &&
             cuda_selected_logical_slots[logical_resource_id] == slot ? 0 : -1;
-    if (cuda_selected_logical_slots[logical_resource_id] != -1) return -1;
+    if (cuda_selected_logical_slots[logical_resource_id] != -1 ||
+        cuda_selected_generation == UINT32_MAX)
+        return -1;
     resource->active = 1;
     resource->logical_resource_id = logical_resource_id;
+    resource->generation = ++cuda_selected_generation;
     resource->base = (const unsigned char *)base;
     resource->payload = (const unsigned char *)payload;
     resource->device_payload = device_payload;
@@ -5272,6 +5337,8 @@ static int cuda_text_boot_check_program(CudaTextProgramState *state,
         if (!source) return -1;
 #define CHECK(field) BOOT_CHECK(&source->field, &target->field)
         CHECK(q); CHECK(k); CHECK(v); CHECK(o);
+        CHECK(model_input_projection); CHECK(model_kernel);
+        CHECK(model_output_projection);
         CHECK(dense_gate); CHECK(dense_up); CHECK(dense_down);
         CHECK(router); CHECK(pre_attention_norm); CHECK(q_norm);
         CHECK(k_norm); CHECK(post_attention_norm);
@@ -5304,21 +5371,22 @@ static int cuda_text_expert_spec(const SaltTextVerifyProgram *program,
     const SaltTextLayerExecDesc *source;
     const SaltTextExpertDesc *entry;
     const SaltTextTensorDesc *tensors[3];
-    uint64_t logical;
     if (!program || layer >= program->layer_count ||
         expert >= CUDA_TEXT_EXPERTS)
         return -1;
     source = program->layers[layer].descriptor;
     if (!source || !source->plan || !source->experts ||
-        source->expert_count != CUDA_TEXT_EXPERTS ||
-        source->plan->n_experts != (int)CUDA_TEXT_EXPERTS ||
-        source->plan->top_k_experts != (int)CUDA_TEXT_TOPK)
+        source->expert_count == 0u ||
+        source->expert_count > CUDA_TEXT_EXPERTS ||
+        expert >= source->expert_count ||
+        source->plan->n_experts != (int)source->expert_count ||
+        source->plan->top_k_experts < 1 ||
+        source->plan->top_k_experts > (int)CUDA_TEXT_TOPK)
         return -1;
     entry = &source->experts[expert];
     tensors[0] = &entry->gate;
     tensors[1] = &entry->up;
     tensors[2] = &entry->down;
-    logical = (uint64_t)layer * CUDA_TEXT_EXPERTS + expert;
     if (entry->expert_id != expert) return -1;
     for (uint32_t phase = 0; phase < 3u; phase++) {
         const SaltTextTensorDesc *tensor = tensors[phase];
@@ -5329,7 +5397,8 @@ static int cuda_text_expert_spec(const SaltTextVerifyProgram *program,
                 program->descriptor->tensor_resource_count) != 0 ||
             storage->source_class != SALT_TENSOR_SOURCE_SELECTED ||
             storage->encoding != SALT_TENSOR_ENCODING_AFFINE_Q4 ||
-            storage->logical_resource_id != logical ||
+            storage->logical_resource_id !=
+                entry->gate.storage.logical_resource_id ||
             storage->resource_kind != entry->gate.storage.resource_kind ||
             storage->resource_id != entry->gate.storage.resource_id ||
             tensor->rows != (phase == 2u ? program->hidden :
@@ -5418,24 +5487,68 @@ static int cuda_text_selected_refs(const SaltTextVerifyProgram *program,
 static int cuda_text_selected_address_book_realize(
         CudaTextProgramState *state,
         const SaltTextVerifyProgram *program) {
-    const uint32_t logical_count = CUDA_TEXT_LAYERS * CUDA_TEXT_EXPERTS;
+    uint64_t maximum_logical = 0u;
+    int have_logical = 0;
     if (!state || !program ||
         !cuda_selected_resources || !cuda_selected_logical_slots)
         return 0;
-    if (cuda_selected_capacity != (int)logical_count ||
-        cuda_selected_logical_capacity != (int)logical_count)
+    for (uint32_t layer = 0; layer < program->layer_count; layer++) {
+        const SaltTextLayerExecDesc *source = program->layers[layer].descriptor;
+        if (!source || source->expert_count > CUDA_TEXT_EXPERTS)
+            return -1;
+        for (uint32_t expert = 0; expert < source->expert_count; expert++) {
+            uint64_t logical =
+                source->experts[expert].gate.storage.logical_resource_id;
+            if (!have_logical || logical > maximum_logical)
+                maximum_logical = logical;
+            have_logical = 1;
+        }
+    }
+    if (!have_logical || maximum_logical >= INT_MAX)
         return 0;
-    for (uint32_t layer = 0; layer < CUDA_TEXT_LAYERS; layer++)
-        for (uint32_t expert = 0; expert < CUDA_TEXT_EXPERTS; expert++) {
-            uint32_t logical = layer * CUDA_TEXT_EXPERTS + expert;
+    if (maximum_logical >=
+            (uint64_t)(uint32_t)cuda_selected_logical_capacity)
+        return -1;
+    /* A complete address book need not occupy every logical ID.  Models with a
+     * dense prefix can have fewer physical expert slots than the logical-ID
+     * span while still binding every expert the compiled program references.
+     * First prove completeness without mutating the realized tensor table so a
+     * genuinely bounded address book can retain the dynamic-resource path. */
+    for (uint32_t layer = 0; layer < program->layer_count; layer++) {
+        const SaltTextLayerExecDesc *source = program->layers[layer].descriptor;
+        for (uint32_t expert = 0; expert < source->expert_count; expert++) {
+            uint32_t logical = (uint32_t)
+                source->experts[expert].gate.storage.logical_resource_id;
             int32_t slot = cuda_selected_logical_slots[logical];
-            size_t base = (size_t)logical * 3u;
-            if (slot < 0 ||
-                cuda_text_selected_refs(program, layer, expert, slot,
+            if (slot < 0)
+                return 0;
+            if (slot >= cuda_selected_capacity ||
+                !cuda_selected_resources[slot].active ||
+                cuda_selected_resources[slot].logical_resource_id != logical)
+                return -1;
+        }
+    }
+    for (uint32_t layer = 0; layer < program->layer_count; layer++) {
+        const SaltTextLayerExecDesc *source = program->layers[layer].descriptor;
+        for (uint32_t expert = 0; expert < source->expert_count; expert++) {
+            uint32_t logical = (uint32_t)
+                source->experts[expert].gate.storage.logical_resource_id;
+            int32_t slot = cuda_selected_logical_slots[logical];
+            size_t base = ((size_t)layer * CUDA_TEXT_EXPERTS + expert) * 3u;
+            if (cuda_text_selected_refs(program, layer, expert, slot,
                     &state->expert_refs[base]) != 0)
                 return -1;
         }
+    }
     return 1;
+}
+
+static const unsigned char *cuda_text_tensor_bytes(
+        const CudaTextTensorRef *ref) {
+    return ref && ref->resource &&
+        (ref->encoding == SALT_TENSOR_ENCODING_F32 ||
+         ref->encoding == SALT_TENSOR_ENCODING_BF16)
+        ? ref->resource + ref->value_offset : NULL;
 }
 
 static const float *cuda_text_tensor_f32(const CudaTextTensorRef *ref) {
@@ -5453,6 +5566,29 @@ static int cuda_text_project(
     if (!state || !ref || !ref->resource || !input || !output || batch == 0 ||
         ref->rows == 0 || ref->cols == 0)
         return -1;
+    if (ref->encoding == SALT_TENSOR_ENCODING_AFFINE_Q4 &&
+        state->model_gpu_ops && state->model_gpu_ops->project) {
+        SaltTextModelGpuProjectArgs args = {};
+        const unsigned char *canonical =
+            (const unsigned char *)state->canonical.backend;
+        const unsigned char *input_bytes =
+            (const unsigned char *)(const void *)input;
+        unsigned char *output_bytes = (unsigned char *)(void *)output;
+        if (input_bytes < canonical || output_bytes < canonical ||
+            (size_t)(input_bytes - canonical) > state->canonical_bytes ||
+            (size_t)(output_bytes - canonical) > state->canonical_bytes)
+            return -1;
+        args.backend = SALT_TEXT_MODEL_GPU_CUDA;
+        args.command = (void *)state->stream;
+        args.canonical = state->canonical.backend;
+        args.canonical_bytes = state->canonical_bytes;
+        args.tensor = cuda_text_model_view(ref);
+        args.input_offset = (uint64_t)(input_bytes - canonical);
+        args.output_offset = (uint64_t)(output_bytes - canonical);
+        args.rows = batch;
+        return state->model_gpu_ops->project(state->model_gpu_context, &args,
+            state->model_gpu_state, state->model_gpu_state_bytes);
+    }
     if (ref->encoding == SALT_TENSOR_ENCODING_AFFINE_Q4) {
         cuda_q4_warp_exact<<<grid, block, 0, state->stream>>>(
             ref->resource, ref->value_offset, ref->scale_offset,
@@ -5471,10 +5607,61 @@ static int cuda_text_project(
                 input + (size_t)row * ref->cols,
                 output + (size_t)row * ref->rows,
                 (int)ref->rows, (int)ref->cols);
+    } else if (state->model_gpu_ops && state->model_gpu_ops->project) {
+        SaltTextModelGpuProjectArgs args = {};
+        const unsigned char *canonical =
+            (const unsigned char *)state->canonical.backend;
+        const unsigned char *input_bytes =
+            (const unsigned char *)(const void *)input;
+        unsigned char *output_bytes = (unsigned char *)(void *)output;
+        if (input_bytes < canonical || output_bytes < canonical ||
+            (size_t)(input_bytes - canonical) > state->canonical_bytes ||
+            (size_t)(output_bytes - canonical) > state->canonical_bytes)
+            return -1;
+        args.backend = SALT_TEXT_MODEL_GPU_CUDA;
+        args.command = (void *)state->stream;
+        args.canonical = state->canonical.backend;
+        args.canonical_bytes = state->canonical_bytes;
+        args.tensor = cuda_text_model_view(ref);
+        args.input_offset = (uint64_t)(input_bytes - canonical);
+        args.output_offset = (uint64_t)(output_bytes - canonical);
+        args.rows = batch;
+        return state->model_gpu_ops->project(state->model_gpu_context, &args,
+            state->model_gpu_state, state->model_gpu_state_bytes);
     } else {
         return -1;
     }
     return cudaGetLastError() == cudaSuccess ? 0 : -1;
+}
+
+typedef struct CudaTextModelProjectContext {
+    CudaTextProgramState *state;
+} CudaTextModelProjectContext;
+
+static int cuda_text_model_project(void *opaque,
+        const SaltTextModelGpuTensorView *view,
+        uint64_t input_offset, uint64_t output_offset, uint32_t rows) {
+    CudaTextModelProjectContext *context =
+        (CudaTextModelProjectContext *)opaque;
+    CudaTextTensorRef ref = {};
+    if (!context || !context->state || !view || !view->resource ||
+        input_offset % sizeof(float) != 0u ||
+        output_offset % sizeof(float) != 0u ||
+        input_offset > context->state->canonical_bytes ||
+        output_offset > context->state->canonical_bytes)
+        return -1;
+    ref.resource = (const unsigned char *)view->resource;
+    ref.value_offset = view->value_offset;
+    ref.scale_offset = view->scale_offset;
+    ref.bias_offset = view->bias_offset;
+    ref.rows = view->rows;
+    ref.cols = view->cols;
+    ref.encoding = (uint32_t)view->encoding;
+    return cuda_text_project(context->state, &ref,
+        (const float *)((const unsigned char *)context->state->canonical.backend +
+            input_offset),
+        (float *)((unsigned char *)context->state->canonical.backend +
+            output_offset), rows);
 }
 
 /* Existing tensor bindings become by-value command arguments captured by the
@@ -5588,17 +5775,37 @@ static int cuda_text_requirements(
         const SaltTextDispatchPolicy *policy,
         SaltTextGpuProgramRequirements *requirements,
         size_t requirements_size) {
+    size_t backend_bytes = sizeof(CudaTextProgramState);
+    const SaltTextModelGpuOps *model_ops;
     if (!program || !program->ready || !program->descriptor ||
         !program->descriptor->model || !policy || !requirements ||
         requirements_size != sizeof *requirements || !cuda_ready ||
         policy->execution_class != SALT_TEXT_EXECUTION_GPU_ONLY ||
-        program->layer_count != CUDA_TEXT_LAYERS ||
+        program->layer_count == 0u ||
+        program->layer_count > CUDA_TEXT_LAYERS ||
         program->maximum_candidates > CUDA_TEXT_MAX_ROWS ||
-        program->dispatch.cell_count != CUDA_TEXT_CELLS ||
-        program->hidden != CUDA_TEXT_HIDDEN)
+        program->dispatch.cell_count == 0u ||
+        program->dispatch.cell_count > CUDA_TEXT_CELLS ||
+        program->hidden == 0u || program->hidden > CUDA_TEXT_HIDDEN)
         return -1;
+    for (uint32_t layer = 0; layer < program->layer_count; layer++) {
+        const SaltTextLayerExecDesc *source = program->layers[layer].descriptor;
+        if (!source || !source->plan ||
+            source->plan->dense_intermediate > (int)CUDA_TEXT_DENSE ||
+            source->plan->expert_intermediate > (int)CUDA_TEXT_ROUTED ||
+            source->plan->n_experts > (int)CUDA_TEXT_EXPERTS ||
+            source->plan->top_k_experts > (int)CUDA_TEXT_TOPK)
+            return -1;
+    }
+    model_ops = program->descriptor->model_gpu_ops;
+    if (model_ops) {
+        if (!model_ops->prepare || !model_ops->destroy ||
+            model_ops->state_bytes > SIZE_MAX - backend_bytes)
+            return -1;
+        backend_bytes += model_ops->state_bytes;
+    }
     memset(requirements, 0, sizeof *requirements);
-    requirements->backend_state_bytes = sizeof(CudaTextProgramState);
+    requirements->backend_state_bytes = backend_bytes;
     requirements->command_bytes = sizeof(CudaTextProgramCommand);
     requirements->maximum_commands = program->dispatch.cell_count;
     /* Selected reads remain in flight after expert-down encoding. The next
@@ -5610,6 +5817,10 @@ static int cuda_text_requirements(
 static void cuda_text_state_release(CudaTextProgramState *state) {
     if (!state) return;
     if (state->stream) (void)cudaStreamSynchronize(state->stream);
+    if (state->model_gpu_ops && state->model_gpu_ops->destroy)
+        state->model_gpu_ops->destroy(state->model_gpu_context,
+            SALT_TEXT_MODEL_GPU_CUDA, state->model_gpu_state,
+            state->model_gpu_state_bytes);
     for (uint32_t index = 0; index < CUDA_TEXT_GRAPH_COUNT; index++) {
         if (state->graphs[index].executable)
             (void)cudaGraphExecDestroy(state->graphs[index].executable);
@@ -5642,7 +5853,8 @@ static void cuda_text_state_release(CudaTextProgramState *state) {
 static int cuda_text_prepare_templates(
         CudaTextProgramState *state, const SaltTextVerifyProgram *program) {
     uint32_t selected_capacity = 0;
-    if (!state || !program || program->dispatch.cell_count != CUDA_TEXT_CELLS)
+    if (!state || !program || program->dispatch.cell_count == 0u ||
+        program->dispatch.cell_count > CUDA_TEXT_CELLS)
         return -1;
     memset(state->templates, 0, sizeof state->templates);
     for (uint32_t index = 0; index < program->dispatch.cell_count; index++) {
@@ -5664,14 +5876,21 @@ static int cuda_text_prepare_templates(
             const SaltTextLayerPlan *plan =
                 program->layers[cell->layer].descriptor->plan;
             uint64_t jobs;
-            if (!plan || plan->dense_intermediate < 1 ||
-                plan->expert_intermediate < 1 || plan->n_experts < 1 ||
-                plan->top_k_experts < 1)
+            if (!plan ||
+                (plan->dense_intermediate < 1 &&
+                 plan->expert_intermediate < 1) ||
+                (plan->expert_intermediate > 0 &&
+                 (plan->n_experts < 1 || plan->top_k_experts < 1)))
                 return -1;
-            target->dense = (uint32_t)plan->dense_intermediate;
-            target->routed = (uint32_t)plan->expert_intermediate;
-            target->experts = (uint32_t)plan->n_experts;
-            target->topk = (uint32_t)plan->top_k_experts;
+            target->dense = plan->dense_intermediate > 0
+                ? (uint32_t)plan->dense_intermediate : 0u;
+            target->routed = plan->expert_intermediate > 0
+                ? (uint32_t)plan->expert_intermediate : 0u;
+            target->experts = plan->n_experts > 0
+                ? (uint32_t)plan->n_experts : 0u;
+            target->topk = plan->top_k_experts > 0
+                ? (uint32_t)plan->top_k_experts : 0u;
+            if (target->routed == 0u) continue;
             jobs = (uint64_t)program->maximum_candidates * target->topk;
             if (jobs > UINT32_MAX) return -1;
             if ((uint32_t)jobs > selected_capacity)
@@ -5757,10 +5976,39 @@ static int cuda_text_prepare(
     state->attention_score_workspace_floats = score_floats;
     memset(state->canonical.contents, 0, bytes);
     state->program = program;
+    if (program->descriptor->model_gpu_ops) {
+        SaltTextModelGpuPrepareArgs args = {};
+        const SaltTextModelGpuOps *ops = program->descriptor->model_gpu_ops;
+        if (ops->state_bytes > backend_state_bytes - sizeof *state)
+            goto fail;
+        args.backend = SALT_TEXT_MODEL_GPU_CUDA;
+        args.device = NULL;
+        args.maximum_rows = program->maximum_candidates;
+        args.maximum_context = program->maximum_context;
+        state->model_gpu_ops = ops;
+        state->model_gpu_context = program->descriptor->model_gpu_context;
+        state->model_gpu_state = (unsigned char *)state + sizeof *state;
+        state->model_gpu_state_bytes = ops->state_bytes;
+        if (ops->prepare(state->model_gpu_context, &args,
+                state->model_gpu_state, state->model_gpu_state_bytes) != 0)
+            goto fail;
+    }
     expert_resource = salt_tensor_resource_find(
         program->descriptor->tensor_resources,
         program->descriptor->tensor_resource_count,
         SALT_TENSOR_RESOURCE_EXPERT, 0u);
+    if (!expert_resource) {
+        for (size_t resource_index = 0;
+             resource_index < program->descriptor->tensor_resource_count;
+             resource_index++) {
+            const SaltTensorResourceSpec *candidate =
+                &program->descriptor->tensor_resources[resource_index];
+            if (candidate->kind == SALT_TENSOR_RESOURCE_EXPERT) {
+                expert_resource = candidate;
+                break;
+            }
+        }
+    }
     if (!expert_resource ||
         (expert_resource->source_class != SALT_TENSOR_SOURCE_SELECTED &&
          expert_resource->source_class != SALT_TENSOR_SOURCE_STATIC))
@@ -5786,39 +6034,67 @@ static int cuda_text_prepare(
         const SaltTextCompiledLayer *compiled = &program->layers[layer];
         const SaltTextLayerExecDesc *source = compiled->descriptor;
         CudaTextLayerRefs *target = &state->layers[layer];
+        const SaltAttentionDesc *attention = &source->plan->attention;
 #define REALIZE(field) \
         if (cuda_text_realize_tensor(program, &source->field, \
                 &target->field) != 0) goto fail
 #define OPTIONAL(field) \
         if (cuda_text_realize_optional(program, &source->field, \
                 &target->field) != 0) goto fail
-        REALIZE(q); REALIZE(k); OPTIONAL(v); REALIZE(o);
-        REALIZE(dense_gate); REALIZE(dense_up); REALIZE(dense_down);
-        REALIZE(router); REALIZE(pre_attention_norm); REALIZE(q_norm);
-        REALIZE(k_norm); REALIZE(post_attention_norm);
-        REALIZE(pre_ffn_norm_1); REALIZE(pre_ffn_norm_2);
-        REALIZE(post_ffn_norm_1); REALIZE(post_ffn_norm_2);
-        REALIZE(post_ffn_norm); REALIZE(router_scale);
-        REALIZE(per_expert_scale); OPTIONAL(layer_scalar);
+        if (attention->kind == SALT_ATTN_MODEL) {
+            OPTIONAL(q); OPTIONAL(k); OPTIONAL(v); OPTIONAL(o);
+            REALIZE(model_input_projection); REALIZE(model_kernel);
+            REALIZE(model_output_projection);
+        } else {
+            REALIZE(q); REALIZE(k); OPTIONAL(v); REALIZE(o);
+            OPTIONAL(model_input_projection); OPTIONAL(model_kernel);
+            OPTIONAL(model_output_projection);
+        }
+        if (source->plan->dense_intermediate > 0) {
+            REALIZE(dense_gate); REALIZE(dense_up); REALIZE(dense_down);
+        } else {
+            OPTIONAL(dense_gate); OPTIONAL(dense_up); OPTIONAL(dense_down);
+        }
+        if (source->plan->pinned) {
+            OPTIONAL(router); OPTIONAL(per_expert_scale);
+        } else {
+            REALIZE(router); REALIZE(per_expert_scale);
+        }
+        REALIZE(pre_attention_norm);
+        if (attention->kind == SALT_ATTN_MODEL) {
+            OPTIONAL(q_norm); OPTIONAL(k_norm);
+        } else {
+            REALIZE(q_norm); REALIZE(k_norm);
+        }
+        OPTIONAL(post_attention_norm);
+        OPTIONAL(pre_ffn_norm_1); REALIZE(pre_ffn_norm_2);
+        OPTIONAL(post_ffn_norm_1); OPTIONAL(post_ffn_norm_2);
+        OPTIONAL(post_ffn_norm); OPTIONAL(router_scale);
+        OPTIONAL(layer_scalar);
 #undef REALIZE
 #undef OPTIONAL
         target->kv.width = compiled->kv_width;
-        if (!source->kv ||
-            cuda_text_map_kv(&source->kv->keys, compiled->kv_width,
-                &target->kv.keys) != 0 ||
-            cuda_text_map_kv(&source->kv->values, compiled->kv_width,
-                &target->kv.values) != 0 ||
-            source->kv->keys.private_mode != source->kv->values.private_mode ||
-            source->kv->keys.private_row_capacity !=
-                source->kv->values.private_row_capacity ||
-            source->expert_count != CUDA_TEXT_EXPERTS)
+        if (compiled->kv_width == 0u) {
+            memset(&target->kv, 0, sizeof target->kv);
+        } else {
+            if (!source->kv ||
+                cuda_text_map_kv(&source->kv->keys, compiled->kv_width,
+                    &target->kv.keys) != 0 ||
+                cuda_text_map_kv(&source->kv->values, compiled->kv_width,
+                    &target->kv.values) != 0 ||
+                source->kv->keys.private_mode != source->kv->values.private_mode ||
+                source->kv->keys.private_row_capacity !=
+                    source->kv->values.private_row_capacity)
+                goto fail;
+            target->kv.private_mode = source->kv->keys.private_mode;
+            target->kv.row_capacity = source->kv->keys.private_row_capacity;
+            target->kv.tentative_key_float_offset =
+                compiled->tentative_key_offset / sizeof(float);
+            target->kv.tentative_value_float_offset =
+                compiled->tentative_value_offset / sizeof(float);
+        }
+        if (source->expert_count > CUDA_TEXT_EXPERTS)
             goto fail;
-        target->kv.private_mode = source->kv->keys.private_mode;
-        target->kv.row_capacity = source->kv->keys.private_row_capacity;
-        target->kv.tentative_key_float_offset =
-            compiled->tentative_key_offset / sizeof(float);
-        target->kv.tentative_value_float_offset =
-            compiled->tentative_value_offset / sizeof(float);
         for (uint32_t expert = 0; expert < source->expert_count; expert++) {
             const SaltTextExpertDesc *entry = &source->experts[expert];
             size_t base = ((size_t)layer * CUDA_TEXT_EXPERTS + expert) * 3u;
@@ -5840,9 +6116,11 @@ static int cuda_text_prepare(
                 goto fail;
         }
     }
-    if (cuda_text_boot_check_program(state, program) != 0 ||
-        cuda_text_prepare_templates(state, program) != 0 ||
-        cuda_success(cudaMalloc((void **)&state->device_experts,
+    if (cuda_text_boot_check_program(state, program) != 0)
+        goto fail;
+    if (cuda_text_prepare_templates(state, program) != 0)
+        goto fail;
+    if (cuda_success(cudaMalloc((void **)&state->device_experts,
             sizeof state->expert_refs), "cudaMalloc text expert refs") != 0 ||
         cuda_success(cudaMalloc((void **)&state->device_kv,
             sizeof(CudaTextKvRef) * CUDA_TEXT_LAYERS),
@@ -5869,19 +6147,25 @@ static int cuda_text_prepare(
             sizeof state->expert_refs, cudaMemcpyHostToDevice),
             "cudaMemcpy text expert refs") != 0)
         goto fail;
-    for (uint32_t layer = 0; layer < CUDA_TEXT_LAYERS; layer++)
+    for (uint32_t layer = 0; layer < program->layer_count; layer++)
         if (cuda_success(cudaMemcpy(state->device_kv + layer,
                 &state->layers[layer].kv, sizeof(CudaTextKvRef),
                 cudaMemcpyHostToDevice), "cudaMemcpy text KV ref") != 0)
             goto fail;
     state->magic = CUDA_TEXT_STATE_MAGIC;
     state->ready = 1;
-    if (state->dynamic_experts && cuda_pageable_mmap) {
-        if (cuda_text_capture_extent_graphs(state, program, plan) != 0)
+    {
+        int model_extent_graphs = state->model_gpu_ops &&
+            (state->model_gpu_ops->flags &
+             SALT_TEXT_MODEL_GPU_EXTENT_GRAPHS) != 0u;
+        if (cuda_pageable_mmap && state->dynamic_experts &&
+                (!state->model_gpu_ops || model_extent_graphs)) {
+            if (cuda_text_capture_extent_graphs(state, program, plan) != 0)
+                goto fail;
+        } else if (!state->dynamic_experts &&
+                   cuda_text_capture_graphs(state, program, plan) != 0) {
             goto fail;
-    } else if (!state->dynamic_experts &&
-               cuda_text_capture_graphs(state, program, plan) != 0) {
-        goto fail;
+        }
     }
     *canonical_out = &state->canonical;
     return 0;
@@ -5894,8 +6178,10 @@ static int cuda_text_full_graph_eligible(
         const CudaTextProgramState *state, uint32_t input_count,
         uint32_t output_rows, uint32_t score_rows) {
     return state && state->graphs_ready && !state->capture_mode &&
-        input_count <= CUDA_TEXT_GRAPH_COUNT && output_rows == input_count &&
-        (size_t)score_rows <= state->attention_dynamic_limit / sizeof(float);
+        input_count <= state->graphs_ready && output_rows == input_count &&
+        ((state->model_gpu_ops && state->model_gpu_ops->attention) ||
+         (size_t)score_rows <=
+             state->attention_dynamic_limit / sizeof(float));
 }
 
 static int cuda_text_begin_depth(void *backend_state, void *command,
@@ -5986,6 +6272,7 @@ static int cuda_text_begin_depth(void *backend_state, void *command,
     cmd->source_position = source_position;
     cmd->input_count = input_count;
     cmd->maximum_depth = maximum_depth;
+    cmd->frontier_linear = 1u;
     cmd->authoritative_output_rows = output_rows;
     cmd->stats.backend_template_count = state->template_count;
     cmd->stats.backend_dynamic_patches = 4u;
@@ -6059,20 +6346,19 @@ static int cuda_text_begin_frontier(
     memcpy(staged_depths, depths, (size_t)input_count * sizeof(uint32_t));
     state->graph_source_positions[input_count - 1u] = source_position;
     cmd->source_position = source_position;
-    if (!cuda_text_full_graph_eligible(state, input_count,
-            cmd->authoritative_output_rows, cmd->attention_score_rows) &&
-        (cuda_success(cudaMemcpyAsync(cuda_text_bytes(state,
-            state->program->layout.target_parent_rows), staged_parents,
-            (size_t)input_count * sizeof(uint32_t), cudaMemcpyHostToDevice,
-            state->stream), "cudaMemcpy frontier parent rows") != 0 ||
-         cuda_success(cudaMemcpyAsync(cuda_text_bytes(state,
-            state->program->layout.target_depths), staged_depths,
-            (size_t)input_count * sizeof(uint32_t), cudaMemcpyHostToDevice,
-            state->stream), "cudaMemcpy frontier depths") != 0 ||
-         cuda_success(cudaMemcpyAsync(state->device_source_position,
-            &state->graph_source_positions[input_count - 1u],
-            sizeof(uint32_t), cudaMemcpyHostToDevice, state->stream),
-            "cudaMemcpy frontier source position") != 0))
+    cmd->frontier_linear = 0u;
+    if (cuda_success(cudaMemcpyAsync(cuda_text_bytes(state,
+                state->program->layout.target_parent_rows), staged_parents,
+                (size_t)input_count * sizeof(uint32_t), cudaMemcpyHostToDevice,
+                state->stream), "cudaMemcpy frontier parent rows") != 0 ||
+             cuda_success(cudaMemcpyAsync(cuda_text_bytes(state,
+                state->program->layout.target_depths), staged_depths,
+                (size_t)input_count * sizeof(uint32_t), cudaMemcpyHostToDevice,
+                state->stream), "cudaMemcpy frontier depths") != 0 ||
+             cuda_success(cudaMemcpyAsync(state->device_source_position,
+                &state->graph_source_positions[input_count - 1u],
+                sizeof(uint32_t), cudaMemcpyHostToDevice, state->stream),
+                "cudaMemcpy frontier source position") != 0)
         return -1;
     return 0;
 }
@@ -6096,16 +6382,19 @@ static int cuda_text_selected_live(const CudaTextProgramState *state,
         if (expert < 0 || expert >= (int32_t)CUDA_TEXT_EXPERTS ||
             slot < 0 || slot >= cuda_selected_capacity)
             return -1;
-        logical = (uint64_t)layer * CUDA_TEXT_EXPERTS + (uint32_t)expert;
+        logical = state->program->layers[layer].descriptor->
+            experts[(uint32_t)expert].gate.storage.logical_resource_id;
         if (logical >= (uint64_t)(uint32_t)cuda_selected_logical_capacity ||
             cuda_selected_logical_slots[logical] != slot)
             return -1;
         const CudaSelectedResource *live = &cuda_selected_resources[slot];
         if (!live->active || live->logical_resource_id != logical ||
             live->logical_resource_id != bound->logical_resource_id ||
+            live->generation != bound->generation ||
             live->base != bound->base || live->payload != bound->payload ||
             live->nbytes != bound->nbytes ||
-            state->expert_refs[(size_t)logical * 3u].resource != live->payload)
+            state->expert_refs[((size_t)layer * CUDA_TEXT_EXPERTS +
+                (uint32_t)expert) * 3u].resource != live->payload)
             return -1;
     }
     /* Validated selected-resource reads are about to enter the stream. */
@@ -6124,6 +6413,87 @@ static void cuda_text_record_matrix(
     } else {
         cmd->stats.area_m1_dispatches++;
     }
+}
+
+static int cuda_text_encode_model_layer(
+        CudaTextProgramState *state, const SaltTextCompiledLayer *compiled,
+        const CudaTextLayerRefs *refs, uint32_t layer, uint32_t rows) {
+    SaltTextModelGpuEncodeArgs args = {};
+    CudaTextModelProjectContext project = {};
+    const SaltTextCanonicalLayout *layout;
+    if (!state || !compiled || !compiled->descriptor || !refs ||
+        !state->model_gpu_ops || !state->model_gpu_ops->encode ||
+        !state->stream || rows == 0u)
+        return -1;
+    layout = &state->program->layout;
+    args.backend = SALT_TEXT_MODEL_GPU_CUDA;
+    args.command = (void *)state->stream;
+    args.canonical = state->canonical.backend;
+    project.state = state;
+    args.backend_context = &project;
+    args.project = cuda_text_model_project;
+    args.canonical_bytes = state->canonical_bytes;
+    args.layer = layer;
+    args.rows = rows;
+    args.hidden = state->program->hidden;
+    args.normalized_offset = layout->normalized;
+    args.scratch_offset = layout->model_scratch;
+    args.scratch_float_capacity =
+        (size_t)rows * layout->maximum_model_scratch_floats;
+    args.state_offset = compiled->model_state_offset;
+    args.state_bytes = compiled->model_state_bytes;
+    args.output_offset = layout->branch;
+    args.input_projection = cuda_text_model_view(
+        &refs->model_input_projection);
+    args.kernel = cuda_text_model_view(&refs->model_kernel);
+    args.output_projection = cuda_text_model_view(
+        &refs->model_output_projection);
+    return state->model_gpu_ops->encode(state->model_gpu_context, &args,
+        state->model_gpu_state, state->model_gpu_state_bytes);
+}
+
+static int cuda_text_model_expert_chain(CudaTextProgramState *state,
+        const CudaTextCellTemplate *cell_template,
+        const SaltTextLayerPlan *layer_plan, uint32_t input_count,
+        uint32_t *physical_launches) {
+    SaltTextModelGpuExpertChainArgs args = {};
+    const SaltTextCanonicalLayout *layout;
+    if (!state || !state->program || !cell_template || !layer_plan ||
+        !physical_launches || !state->model_gpu_ops ||
+        !state->model_gpu_ops->expert_chain || !state->device_experts ||
+        cell_template->layer >= state->program->layer_count || input_count == 0u)
+        return -1;
+    layout = &state->program->layout;
+    args.backend = SALT_TEXT_MODEL_GPU_CUDA;
+    args.command = (void *)state->stream;
+    args.canonical = state->canonical.backend;
+    args.canonical_bytes = state->canonical_bytes;
+    args.expert_table.resource = (void *)state->device_experts;
+    args.expert_table.offset = 0u;
+    args.expert_table.bytes = sizeof(CudaTextTensorRef) * CUDA_TEXT_EXPERT_REFS;
+    args.status.resource = state->canonical.backend;
+    args.status.offset = state->status_offset;
+    args.status.bytes = sizeof(int);
+    args.selected_offset = layout->selected_experts;
+    args.grouped_offset = layout->grouped_to_canonical;
+    args.input_offset = layout->routed_input;
+    args.gate_offset = layout->routed_gate;
+    args.up_offset = layout->routed_up;
+    args.chain_offset = layout->routed_chain;
+    args.output_jobs_offset = layout->routed_output_jobs;
+    args.layer = cell_template->layer;
+    args.rows = input_count;
+    args.jobs = input_count * cell_template->topk;
+    args.topk = cell_template->topk;
+    args.experts = cell_template->experts;
+    args.expert_table_stride = CUDA_TEXT_EXPERTS;
+    args.hidden = cell_template->hidden;
+    args.routed = cell_template->routed;
+    args.activation = layer_plan->activation;
+    args.activation_limit = layer_plan->activation_limit;
+    args.physical_launches = physical_launches;
+    return state->model_gpu_ops->expert_chain(state->model_gpu_context, &args,
+        state->model_gpu_state, state->model_gpu_state_bytes);
 }
 
 static int cuda_text_encode_cell(
@@ -6172,14 +6542,15 @@ static int cuda_text_encode_cell(
         cell->kind == SALT_TEXT_CELL_FINAL_HEAD ||
         cell->kind == SALT_TEXT_CELL_LOGIT_SOFTCAP;
     count = cell->unit == SALT_TEXT_EXECUTION_ROWS
-        ? input_count : input_count * CUDA_TEXT_TOPK;
+        ? input_count : input_count * cell_template->topk;
     if (terminal_output && cmd->authoritative_output_rows != input_count) {
         count = cmd->authoritative_output_rows;
         output_first = input_count - count;
     }
     if (assignment->gpu.count < count) return -1;
-    if (cuda_text_full_graph_eligible(state, input_count,
-            cmd->authoritative_output_rows, cmd->attention_score_rows)) {
+    if (cmd->frontier_linear &&
+            cuda_text_full_graph_eligible(state, input_count,
+                cmd->authoritative_output_rows, cmd->attention_score_rows)) {
         cmd->next_cell++;
         cmd->encoded_cells++;
         cmd->highest_completion = cell_template->completion_epoch;
@@ -6189,11 +6560,11 @@ static int cuda_text_encode_cell(
     layout = &program->layout;
     hidden = cell_template->hidden;
     count = cell->unit == SALT_TEXT_EXECUTION_ROWS
-        ? input_count : input_count * CUDA_TEXT_TOPK;
+        ? input_count : input_count * cell_template->topk;
     if (terminal_output && cmd->authoritative_output_rows != input_count)
         count = cmd->authoritative_output_rows;
     if (assignment->gpu.count < count) return -1;
-    jobs = input_count * CUDA_TEXT_TOPK;
+    jobs = input_count * cell_template->topk;
     destination = cuda_text_f32(state, cell_template->destination_offset);
     status = (int *)(void *)cuda_text_bytes(state, state->status_offset);
     if (cell->layer < program->layer_count) {
@@ -6216,25 +6587,50 @@ static int cuda_text_encode_cell(
     switch (cell->kind) {
     case SALT_TEXT_CELL_EMBEDDING: {
         size_t elements = (size_t)input_count * hidden;
-        if (state->embedding.encoding != SALT_TENSOR_ENCODING_AFFINE_Q4 ||
-            state->embedding.rows != program->vocabulary ||
+        if (state->embedding.rows != program->vocabulary ||
             state->embedding.cols != hidden)
             return -1;
-        cuda_text_embedding_q4<<<
-            (unsigned int)((elements + 255u) / 256u), 256, 0, state->stream>>>(
-            state->embedding.resource, state->embedding.value_offset,
-            state->embedding.scale_offset, state->embedding.bias_offset,
-            cuda_text_i32(state, layout->candidate_token_ids), input_count,
-            program->vocabulary, hidden, program->descriptor->embedding_scale,
-            destination, status);
+        if (state->embedding.encoding == SALT_TENSOR_ENCODING_AFFINE_Q4) {
+            cuda_text_embedding_q4<<<
+                (unsigned int)((elements + 255u) / 256u), 256, 0,
+                state->stream>>>(
+                state->embedding.resource, state->embedding.value_offset,
+                state->embedding.scale_offset, state->embedding.bias_offset,
+                cuda_text_i32(state, layout->candidate_token_ids), input_count,
+                program->vocabulary, hidden,
+                program->descriptor->embedding_scale, destination, status);
+        } else {
+            SaltTextModelGpuEmbeddingArgs args = {};
+            if (!state->model_gpu_ops || !state->model_gpu_ops->embedding)
+                return -1;
+            args.backend = SALT_TEXT_MODEL_GPU_CUDA;
+            args.command = (void *)state->stream;
+            args.canonical = state->canonical.backend;
+            args.canonical_bytes = state->canonical_bytes;
+            args.tensor = cuda_text_model_view(&state->embedding);
+            args.token_ids_offset = layout->candidate_token_ids;
+            args.output_offset = cell_template->destination_offset;
+            args.token_count = input_count;
+            args.scale = program->descriptor->embedding_scale;
+            if (state->model_gpu_ops->embedding(state->model_gpu_context,
+                    &args, state->model_gpu_state,
+                    state->model_gpu_state_bytes) != 0)
+                return -1;
+        }
         break;
     }
     case SALT_TEXT_CELL_PRE_ATTENTION_NORM:
         cuda_text_rmsnorm_rows<<<input_count, 256, 0, state->stream>>>(
             cuda_text_f32(state, layout->state_a), hidden,
-            cuda_text_tensor_f32(&refs->pre_attention_norm), destination,
+            cuda_text_tensor_bytes(&refs->pre_attention_norm),
+            refs->pre_attention_norm.encoding, destination,
             hidden, input_count, hidden, program->descriptor->norm_epsilon,
             1, status);
+        break;
+    case SALT_TEXT_CELL_MODEL_LAYER:
+        if (cuda_text_encode_model_layer(state, compiled, refs,
+                cell->layer, input_count) != 0)
+            return -1;
         break;
     case SALT_TEXT_CELL_QUERY_PROJECTION: {
         uint32_t group = input_count == 1u
@@ -6293,12 +6689,12 @@ static int cuda_text_encode_cell(
             input_count,
             compiled->query_width, compiled->kv_width,
             program->descriptor->norm_epsilon,
-            0,
+            attention->shared_kv_projection, attention->raw_values,
             cuda_text_f32(state, layout->queries),
             cuda_text_f32(state, layout->keys),
             cuda_text_f32(state, layout->values),
-            cuda_text_tensor_f32(&refs->q_norm),
-            cuda_text_tensor_f32(&refs->k_norm),
+            cuda_text_tensor_bytes(&refs->q_norm), refs->q_norm.encoding,
+            cuda_text_tensor_bytes(&refs->k_norm), refs->k_norm.encoding,
             cuda_text_f32(state, compiled->tentative_key_offset),
             cuda_text_f32(state, compiled->tentative_value_offset), status);
         break;
@@ -6309,7 +6705,65 @@ static int cuda_text_encode_cell(
             score_rows > attention->window)
             score_rows = attention->window;
         score_bytes = (size_t)score_rows * sizeof(float);
-        if (score_bytes <= state->attention_dynamic_limit)
+        if (state->model_gpu_ops && state->model_gpu_ops->attention) {
+            SaltTextModelGpuAttentionArgs args = {};
+            uint64_t rows_bytes = (uint64_t)input_count * sizeof(uint32_t);
+            uint64_t query_bytes = (uint64_t)input_count *
+                compiled->query_width * sizeof(float);
+            uint64_t tentative_bytes = (uint64_t)input_count *
+                compiled->kv_width * sizeof(float);
+            uint64_t committed_bytes = (uint64_t)refs->kv.row_capacity *
+                compiled->kv_width * sizeof(float);
+            uint64_t output_bytes = (uint64_t)input_count *
+                compiled->query_width * sizeof(float);
+            args.backend = SALT_TEXT_MODEL_GPU_CUDA;
+            args.command = (void *)state->stream;
+            args.source_position = cuda_text_buffer_view(
+                state->device_source_position, 0u, sizeof(uint32_t));
+            if (!cmd->frontier_linear)
+                args.parent_rows = cuda_text_buffer_view(
+                    state->canonical.backend,
+                    layout->target_parent_rows, rows_bytes);
+            args.depths = cuda_text_buffer_view(state->canonical.backend,
+                layout->target_depths, rows_bytes);
+            args.queries = cuda_text_buffer_view(state->canonical.backend,
+                layout->queries, query_bytes);
+            args.committed_keys = cuda_text_buffer_view(refs->kv.keys, 0u,
+                committed_bytes);
+            args.committed_values = cuda_text_buffer_view(refs->kv.values, 0u,
+                committed_bytes);
+            args.tentative_keys = cuda_text_buffer_view(
+                state->canonical.backend, compiled->tentative_key_offset,
+                tentative_bytes);
+            args.tentative_values = cuda_text_buffer_view(
+                state->canonical.backend, compiled->tentative_value_offset,
+                tentative_bytes);
+            args.score_workspace = cuda_text_buffer_view(
+                state->attention_score_workspace, 0u,
+                (uint64_t)state->attention_score_workspace_floats *
+                    sizeof(float));
+            args.output = cuda_text_buffer_view(state->canonical.backend,
+                cell_template->destination_offset, output_bytes);
+            args.status = cuda_text_buffer_view(state->canonical.backend,
+                state->status_offset, sizeof(int));
+            args.physical_launches = &physical_launches;
+            args.rows = input_count;
+            args.maximum_context = program->maximum_context;
+            args.query_width = compiled->query_width;
+            args.kv_width = compiled->kv_width;
+            args.n_heads = attention->n_heads;
+            args.n_kv_heads = attention->n_kv_heads;
+            args.head_dim = attention->head_dim;
+            args.window = attention->window;
+            args.kv_mode = refs->kv.private_mode;
+            args.kv_capacity = refs->kv.row_capacity;
+            args.score_scale = attention->score_scale;
+            args.full_attention = attention->kind == SALT_ATTN_FULL;
+            if (state->model_gpu_ops->attention(state->model_gpu_context,
+                    &args, state->model_gpu_state,
+                    state->model_gpu_state_bytes) != 0)
+                return -1;
+        } else if (score_bytes <= state->attention_dynamic_limit)
             cuda_text_attention_body<<<input_count * attention->n_heads, 256,
                 score_bytes, state->stream>>>(
                 attention->kind == SALT_ATTN_FULL,
@@ -6396,15 +6850,19 @@ static int cuda_text_encode_cell(
         cuda_text_residual_postnorm_rows<<<input_count, 256, 0,
             state->stream>>>(cuda_text_f32(state, layout->state_a),
             cuda_text_f32(state, layout->branch),
-            cuda_text_tensor_f32(&refs->post_attention_norm), destination,
-            input_count, hidden, program->descriptor->norm_epsilon, status);
+            cuda_text_tensor_bytes(&refs->post_attention_norm),
+            refs->post_attention_norm.encoding, destination,
+            input_count, hidden, program->descriptor->norm_epsilon,
+            layer_plan->residual_postnorm, status);
         break;
     case SALT_TEXT_CELL_DENSE_NORM:
         if (cmd->ffn_norm_wave_layer != UINT32_MAX) return -1;
         cuda_text_rmsnorm_pair_rows<<<dim3(input_count, 2u, 1u), 256,
             0, state->stream>>>(cuda_text_f32(state, layout->state_b), hidden,
-            cuda_text_tensor_f32(&refs->pre_ffn_norm_1),
-            cuda_text_tensor_f32(&refs->pre_ffn_norm_2),
+            cuda_text_tensor_bytes(&refs->pre_ffn_norm_1),
+            refs->pre_ffn_norm_1.encoding,
+            cuda_text_tensor_bytes(&refs->pre_ffn_norm_2),
+            refs->pre_ffn_norm_2.encoding,
             cuda_text_f32(state, layout->normalized),
             cuda_text_f32(state, layout->combine_a), hidden,
             input_count, hidden, program->descriptor->norm_epsilon, status);
@@ -6433,10 +6891,30 @@ static int cuda_text_encode_cell(
         break;
     case SALT_TEXT_CELL_DENSE_ACTIVATION: {
         size_t elements = (size_t)input_count * dense;
-        cuda_text_activate<<<(unsigned int)((elements + 255u) / 256u), 256,
-            0, state->stream>>>(cuda_text_f32(state, layout->dense_gate),
-            cuda_text_f32(state, layout->dense_up), destination,
-            elements, status);
+        if (layer_plan->activation == SALT_ACT_GELU_TANH) {
+            cuda_text_activate<<<(unsigned int)((elements + 255u) / 256u), 256,
+                0, state->stream>>>(cuda_text_f32(state, layout->dense_gate),
+                cuda_text_f32(state, layout->dense_up), destination,
+                elements, status);
+        } else {
+            SaltTextModelGpuActivationArgs args = {};
+            if (!state->model_gpu_ops || !state->model_gpu_ops->activation)
+                return -1;
+            args.backend = SALT_TEXT_MODEL_GPU_CUDA;
+            args.command = (void *)state->stream;
+            args.canonical = state->canonical.backend;
+            args.canonical_bytes = state->canonical_bytes;
+            args.gate_offset = layout->dense_gate;
+            args.up_offset = layout->dense_up;
+            args.output_offset = cell_template->destination_offset;
+            args.elements = elements;
+            args.activation = layer_plan->activation;
+            args.activation_limit = layer_plan->activation_limit;
+            if (state->model_gpu_ops->activation(state->model_gpu_context,
+                    &args, state->model_gpu_state,
+                    state->model_gpu_state_bytes) != 0)
+                return -1;
+        }
         break;
     }
     case SALT_TEXT_CELL_DENSE_DOWN:
@@ -6446,11 +6924,20 @@ static int cuda_text_encode_cell(
         cmd->stats.projection_dispatches++;
         break;
     case SALT_TEXT_CELL_ROUTER_INPUT:
-        cuda_text_router_input_rows<<<input_count, 256, 0, state->stream>>>(
-            cuda_text_f32(state, layout->state_b),
-            cuda_text_tensor_f32(&refs->router_scale), destination,
-            input_count, hidden, program->descriptor->norm_epsilon,
-            0.0f, status);
+        if (!layer_plan->router_rmsnorm) {
+            cuda_text_rmsnorm_rows<<<input_count, 256, 0, state->stream>>>(
+                cuda_text_f32(state, layout->state_b), hidden,
+                cuda_text_tensor_bytes(&refs->pre_ffn_norm_2),
+                refs->pre_ffn_norm_2.encoding, destination,
+                hidden, input_count, hidden,
+                program->descriptor->norm_epsilon, 1, status);
+        } else {
+            cuda_text_router_input_rows<<<input_count, 256, 0, state->stream>>>(
+                cuda_text_f32(state, layout->state_b),
+                cuda_text_tensor_f32(&refs->router_scale), destination,
+                input_count, hidden, program->descriptor->norm_epsilon,
+                0.0f, status);
+        }
         break;
     case SALT_TEXT_CELL_ROUTER_PROJECTION:
         if (cuda_text_project(state, &refs->router,
@@ -6459,35 +6946,78 @@ static int cuda_text_encode_cell(
         cmd->stats.projection_dispatches++;
         break;
     case SALT_TEXT_CELL_ROUTED_NORM:
-        if (cmd->ffn_norm_wave_layer != cell->layer) return -1;
-        cmd->ffn_norm_wave_layer = UINT32_MAX;
+        if (cmd->ffn_norm_wave_layer == cell->layer) {
+            cmd->ffn_norm_wave_layer = UINT32_MAX;
+        } else {
+            cuda_text_rmsnorm_rows<<<input_count, 256, 0, state->stream>>>(
+                cuda_text_f32(state, layout->state_b), hidden,
+                cuda_text_tensor_bytes(&refs->pre_ffn_norm_2),
+                refs->pre_ffn_norm_2.encoding, destination,
+                hidden, input_count, hidden,
+                program->descriptor->norm_epsilon, 1, status);
+        }
         break;
     case SALT_TEXT_CELL_ROUTER_TOPK:
-        cuda_text_topk_rows<<<input_count, 1, 0, state->stream>>>(
-            cuda_text_f32(state, layout->router_logits),
-            cuda_text_tensor_f32(&refs->per_expert_scale),
-            cuda_text_i32(state, layout->selected_experts),
-            cuda_text_f32(state, layout->selected_weights), input_count,
-            experts, topk, status);
-        cuda_text_group_maps<<<1, 1, 0, state->stream>>>(
-            cuda_text_i32(state, layout->selected_experts), input_count,
-            experts, topk,
-            cuda_text_i32(state, layout->grouped_to_canonical),
-            cuda_text_i32(state, layout->canonical_to_grouped),
-            cuda_text_i32(state, layout->tensor_row), status);
-        cuda_text_routed_gather<<<
-            (unsigned int)(((size_t)jobs * hidden + 255u) / 256u), 256,
-            0, state->stream>>>(
-            cuda_text_i32(state, layout->grouped_to_canonical),
-            cuda_text_f32(state, layout->combine_a),
-            cuda_text_f32(state, layout->routed_input), jobs, topk,
-            hidden, status);
+        if (layer_plan->router_kind == SALT_ROUTER_MODEL) {
+            SaltTextModelGpuRouterArgs args = {};
+            if (!state->model_gpu_ops || !state->model_gpu_ops->router_topk)
+                return -1;
+            args.backend = SALT_TEXT_MODEL_GPU_CUDA;
+            args.command = (void *)state->stream;
+            args.canonical = state->canonical.backend;
+            args.canonical_bytes = state->canonical_bytes;
+            args.expert_bias = cuda_text_model_view(&refs->per_expert_scale);
+            args.logits_offset = layout->router_logits;
+            args.selected_offset = layout->selected_experts;
+            args.weights_offset = layout->selected_weights;
+            args.grouped_offset = layout->grouped_to_canonical;
+            args.inverse_offset = layout->canonical_to_grouped;
+            args.scratch_offset = layout->tensor_row;
+            args.source_offset = layout->combine_a;
+            args.routed_offset = layout->routed_input;
+            args.rows = input_count;
+            args.experts = experts;
+            args.topk = topk;
+            args.hidden = hidden;
+            args.normalize_topk = layer_plan->router_normalize_topk;
+            args.router_scale = layer_plan->router_scale;
+            if (state->model_gpu_ops->router_topk(state->model_gpu_context,
+                    &args, state->model_gpu_state,
+                    state->model_gpu_state_bytes) != 0)
+                return -1;
+        } else {
+            cuda_text_topk_rows<<<input_count, 1, 0, state->stream>>>(
+                cuda_text_f32(state, layout->router_logits),
+                cuda_text_tensor_f32(&refs->per_expert_scale),
+                cuda_text_i32(state, layout->selected_experts),
+                cuda_text_f32(state, layout->selected_weights), input_count,
+                experts, topk, status);
+            cuda_text_group_maps<<<1, 1, 0, state->stream>>>(
+                cuda_text_i32(state, layout->selected_experts), input_count,
+                experts, topk,
+                cuda_text_i32(state, layout->grouped_to_canonical),
+                cuda_text_i32(state, layout->canonical_to_grouped),
+                cuda_text_i32(state, layout->tensor_row), status);
+            cuda_text_routed_gather<<<
+                (unsigned int)(((size_t)jobs * hidden + 255u) / 256u), 256,
+                0, state->stream>>>(
+                cuda_text_i32(state, layout->grouped_to_canonical),
+                cuda_text_f32(state, layout->combine_a),
+                cuda_text_f32(state, layout->routed_input), jobs, topk,
+                hidden, status);
+        }
         break;
     case SALT_TEXT_CELL_EXPERT_GATE:
     case SALT_TEXT_CELL_EXPERT_UP:
     case SALT_TEXT_CELL_EXPERT_DOWN: {
         uint32_t phase = cell->kind == SALT_TEXT_CELL_EXPERT_GATE ? 0u :
             cell->kind == SALT_TEXT_CELL_EXPERT_UP ? 1u : 2u;
+        int model_chain = state->model_gpu_ops &&
+            state->model_gpu_ops->expert_chain;
+        if (model_chain && phase > 0u && cmd->expert_chain_mask == 15u) {
+            physical_launches = 0u;
+            break;
+        }
         if (jobs == 0u || jobs > state->selected_job_capacity)
             return -1;
         if (state->dynamic_experts &&
@@ -6496,6 +7026,19 @@ static int cuda_text_encode_cell(
              cmd->expert_chain_mask != (phase == 0u ? 0u :
                  phase == 1u ? 1u : 7u)))
             return -1;
+        if (model_chain && phase == 0u) {
+            if (jobs > cmd->stats.backend_selected_jobs)
+                cmd->stats.backend_selected_jobs = jobs;
+            physical_launches = 0u;
+            if (cuda_text_model_expert_chain(state, cell_template, layer_plan,
+                    input_count, &physical_launches) != 0 ||
+                physical_launches == 0u)
+                return -1;
+            cmd->expert_chain_mask = 15u;
+            cmd->stats.expert_gate_up_dispatches++;
+            cmd->stats.expert_down_dispatches++;
+            break;
+        }
         if (jobs > cmd->stats.backend_selected_jobs)
             cmd->stats.backend_selected_jobs = jobs;
         uint32_t rows = phase == 2u ? hidden : routed;
@@ -6528,17 +7071,23 @@ static int cuda_text_encode_cell(
                     rows, cols, status);
             } else physical_launches = 0u;
         } else {
-            cuda_text_expert_q4<<<dim3((rows + 3u) / 4u, jobs, 1u), 128,
-                0, state->stream>>>(state->device_experts, cell->layer, phase,
+            cuda_text_expert_q4_matrix<<<
+                dim3((rows + 3u) / 4u, (jobs + 1u) / 2u, 1u), 128, 0,
+                state->stream>>>(state->device_experts, cell->layer, phase,
                 cuda_text_i32(state, layout->selected_experts),
-                cuda_text_i32(state, layout->grouped_to_canonical), jobs, topk,
-                input, destination, NULL, rows, cols, status);
+                cuda_text_i32(state, layout->grouped_to_canonical), jobs,
+                input, destination, rows, cols, status);
         }
         if (phase == 2u) cmd->stats.expert_down_dispatches++;
         else cmd->stats.expert_gate_up_dispatches++;
         break;
     }
     case SALT_TEXT_CELL_EXPERT_ACTIVATION: {
+        if (state->model_gpu_ops && state->model_gpu_ops->expert_chain &&
+            cmd->expert_chain_mask == 15u) {
+            physical_launches = 0u;
+            break;
+        }
         size_t elements = (size_t)jobs * routed;
         if (state->dynamic_experts) {
             if ((!state->capture_mode &&
@@ -6547,10 +7096,30 @@ static int cuda_text_encode_cell(
                 return -1;
             cmd->expert_chain_mask |= 4u;
         }
-        cuda_text_activate<<<(unsigned int)((elements + 255u) / 256u), 256,
-            0, state->stream>>>(cuda_text_f32(state, layout->routed_gate),
-            cuda_text_f32(state, layout->routed_up), destination,
-            elements, status);
+        if (layer_plan->activation == SALT_ACT_GELU_TANH) {
+            cuda_text_activate<<<(unsigned int)((elements + 255u) / 256u), 256,
+                0, state->stream>>>(cuda_text_f32(state, layout->routed_gate),
+                cuda_text_f32(state, layout->routed_up), destination,
+                elements, status);
+        } else {
+            SaltTextModelGpuActivationArgs args = {};
+            if (!state->model_gpu_ops || !state->model_gpu_ops->activation)
+                return -1;
+            args.backend = SALT_TEXT_MODEL_GPU_CUDA;
+            args.command = (void *)state->stream;
+            args.canonical = state->canonical.backend;
+            args.canonical_bytes = state->canonical_bytes;
+            args.gate_offset = layout->routed_gate;
+            args.up_offset = layout->routed_up;
+            args.output_offset = cell_template->destination_offset;
+            args.elements = elements;
+            args.activation = layer_plan->activation;
+            args.activation_limit = layer_plan->activation_limit;
+            if (state->model_gpu_ops->activation(state->model_gpu_context,
+                    &args, state->model_gpu_state,
+                    state->model_gpu_state_bytes) != 0)
+                return -1;
+        }
         break;
     }
     case SALT_TEXT_CELL_EXPERT_REDUCTION:
@@ -6565,26 +7134,44 @@ static int cuda_text_encode_cell(
             input_count, topk, hidden, status);
         break;
     case SALT_TEXT_CELL_FFN_COMBINE:
-        cuda_text_parallel_combine_rows<<<input_count, 256, 0,
-            state->stream>>>(cuda_text_f32(state, layout->state_b),
-            cuda_text_f32(state, layout->dense_output),
-            cuda_text_f32(state, layout->routed_output),
-            cuda_text_tensor_f32(&refs->post_ffn_norm_1),
-            cuda_text_tensor_f32(&refs->post_ffn_norm_2),
-            cuda_text_tensor_f32(&refs->post_ffn_norm),
-            cuda_text_f32(state, layout->combine_a),
-            cuda_text_f32(state, layout->combine_b), destination,
-            input_count, hidden, program->descriptor->norm_epsilon, 1.0f,
-            layer_plan->final_layer_scale
-                ? cuda_text_tensor_f32(&refs->layer_scalar) : NULL,
-            status);
+        if (cmd->ffn_norm_wave_layer != UINT32_MAX) {
+            if (cmd->ffn_norm_wave_layer != cell->layer)
+                return -1;
+            cmd->ffn_norm_wave_layer = UINT32_MAX;
+        }
+        if (!layer_plan->residual_postnorm) {
+            size_t elements = (size_t)input_count * hidden;
+            uint32_t mode = layer_plan->dense_intermediate > 0 ? 1u : 2u;
+            if (layer_plan->parallel_dense_routed) mode = 3u;
+            cuda_text_ffn_add_rows<<<
+                (unsigned int)((elements + 255u) / 256u), 256, 0,
+                state->stream>>>(cuda_text_f32(state, layout->state_b),
+                cuda_text_f32(state, layout->dense_output),
+                cuda_text_f32(state, layout->routed_output), destination,
+                elements, mode, status);
+        } else {
+            cuda_text_parallel_combine_rows<<<input_count, 256, 0,
+                state->stream>>>(cuda_text_f32(state, layout->state_b),
+                cuda_text_f32(state, layout->dense_output),
+                cuda_text_f32(state, layout->routed_output),
+                cuda_text_tensor_f32(&refs->post_ffn_norm_1),
+                cuda_text_tensor_f32(&refs->post_ffn_norm_2),
+                cuda_text_tensor_f32(&refs->post_ffn_norm),
+                cuda_text_f32(state, layout->combine_a),
+                cuda_text_f32(state, layout->combine_b), destination,
+                input_count, hidden, program->descriptor->norm_epsilon, 1.0f,
+                layer_plan->final_layer_scale
+                    ? cuda_text_tensor_f32(&refs->layer_scalar) : NULL,
+                status);
+        }
         break;
     case SALT_TEXT_CELL_FINAL_NORM:
         if (count > 0)
             cuda_text_rmsnorm_rows<<<count, 256, 0, state->stream>>>(
                 cuda_text_f32(state, layout->state_a) +
                     (size_t)output_first * hidden,
-                hidden, cuda_text_tensor_f32(&state->final_norm),
+                hidden, cuda_text_tensor_bytes(&state->final_norm),
+                state->final_norm.encoding,
                 destination + (size_t)output_first * hidden,
                 hidden, count, hidden, program->descriptor->norm_epsilon,
                 1, status);
@@ -6609,12 +7196,13 @@ static int cuda_text_encode_cell(
         float cap = program->layers[program->layer_count - 1u].descriptor->
             plan->logit_softcap;
         size_t elements = (size_t)count * program->vocabulary;
-        if (!(cap > 0.0f) || !isfinite(cap)) return -1;
-        if (elements > 0)
+        if (cap > 0.0f && isfinite(cap) && elements > 0)
             cuda_text_softcap<<<(unsigned int)((elements + 255u) / 256u), 256,
                 0, state->stream>>>(
                 destination + (size_t)output_first * program->vocabulary,
                 elements, cap, status);
+        else if (!(cap == 0.0f) || !isfinite(cap))
+            return -1;
         else
             physical_launches = 0u;
         break;
@@ -6626,7 +7214,7 @@ static int cuda_text_encode_cell(
     if (cell->kind == SALT_TEXT_CELL_ROUTED_NORM) {
         physical_launches = 0u;
     } else if (cell->kind == SALT_TEXT_CELL_ROUTER_TOPK) {
-        physical_launches = 3u;
+        physical_launches = 4u;
     } else {
         const CudaTextTensorRef *projection = NULL;
         switch (cell->kind) {
@@ -6714,14 +7302,19 @@ static int cuda_text_dependency_barrier(
                 state->program->layers[upcoming->layer].descriptor->plan;
             unsigned char *host = (unsigned char *)state->canonical.contents;
             uint32_t occupancies[CUDA_TEXT_EXPERTS] = {0};
-            uint32_t jobs;
+            uint32_t jobs, experts, topk;
             size_t bytes;
-            if (!plan || plan->n_experts != (int)CUDA_TEXT_EXPERTS ||
-                plan->top_k_experts != (int)CUDA_TEXT_TOPK ||
-                upcoming->layer >= state->program->layer_count ||
-                cmd->input_count > UINT32_MAX / CUDA_TEXT_TOPK)
+            if (!plan || upcoming->layer >= state->program->layer_count ||
+                plan->n_experts < 1 ||
+                plan->n_experts > (int)CUDA_TEXT_EXPERTS ||
+                plan->top_k_experts < 1 ||
+                plan->top_k_experts > (int)CUDA_TEXT_TOPK)
                 return -1;
-            jobs = cmd->input_count * CUDA_TEXT_TOPK;
+            experts = (uint32_t)plan->n_experts;
+            topk = (uint32_t)plan->top_k_experts;
+            if (cmd->input_count > UINT32_MAX / topk)
+                return -1;
+            jobs = cmd->input_count * topk;
             bytes = (size_t)jobs * sizeof(int32_t);
             if (!jobs || jobs > state->selected_job_capacity ||
                 layout->selected_experts > state->canonical_bytes ||
@@ -6738,16 +7331,16 @@ static int cuda_text_dependency_barrier(
             const int32_t *selected = (const int32_t *)(const void *)(
                 host + layout->selected_experts);
             for (uint32_t row = 0; row < cmd->input_count; row++)
-                for (uint32_t rank = 0; rank < CUDA_TEXT_TOPK; rank++) {
-                    uint32_t canonical = row * CUDA_TEXT_TOPK + rank;
+                for (uint32_t rank = 0; rank < topk; rank++) {
+                    uint32_t canonical = row * topk + rank;
                     int32_t expert = selected[canonical];
-                    if (expert < 0 || expert >= (int32_t)CUDA_TEXT_EXPERTS ||
+                    if (expert < 0 || expert >= (int32_t)experts ||
                         (rank > 0 && expert <= selected[canonical - 1u]))
                         return -1;
                     occupancies[(uint32_t)expert]++;
                 }
             cmd->request_count = 0;
-            for (uint32_t expert = 0; expert < CUDA_TEXT_EXPERTS; expert++) {
+            for (uint32_t expert = 0; expert < experts; expert++) {
                 uint32_t population = occupancies[expert];
                 if (!population) continue;
                 if (cmd->request_count >= CUDA_TEXT_EXPERTS)
@@ -6830,11 +7423,23 @@ static int cuda_text_resource_resume(
     memset(staged, 0, sizeof staged);
     for (uint32_t index = 0; index < expert_count; index++) {
         int32_t expert = experts[index];
+        const CudaSelectedResource *live;
         if (expert != cmd->request_experts[index] || expert < 0 ||
-            expert >= (int32_t)CUDA_TEXT_EXPERTS ||
+            expert >= (int32_t)CUDA_TEXT_EXPERTS || slots[index] < 0 ||
+            slots[index] >= cuda_selected_capacity ||
             cuda_text_selected_refs(state->program, layer,
                 (uint32_t)expert, slots[index], staged[index]) != 0)
             return -1;
+        live = &cuda_selected_resources[slots[index]];
+        if (!live->active || live->generation == 0u)
+            return -1;
+        /* The virtual address can be recycled after bounded mmap retirement.
+         * Make the mapping generation part of the device-visible handle so a
+         * remap always patches the expert table before graph execution, even
+         * when every address and tensor offset is byte-identical. Kernels
+         * ignore this reserved word; it is stream-order metadata only. */
+        for (uint32_t projection = 0; projection < 3u; projection++)
+            staged[index][projection].reserved = live->generation;
     }
     for (uint32_t index = 0; index < expert_count; index++) {
         size_t base = ((size_t)layer * CUDA_TEXT_EXPERTS +
@@ -6921,6 +7526,7 @@ static int cuda_text_encode_extent(void *backend_state, void *command,
         return -1;
     *encoded_cells = 0;
     if (state->extent_graphs_ready && !state->capture_mode &&
+        cmd->frontier_linear &&
         input_count <= CUDA_TEXT_GRAPH_COUNT &&
         cmd->authoritative_output_rows == input_count) {
         CudaTextExtentGraph *graph = NULL;
@@ -6939,8 +7545,8 @@ static int cuda_text_encode_extent(void *backend_state, void *command,
                 break;
             }
         }
-        if (!graph || !graph->executable ||
-            last->completion_epoch <= cmd->highest_completion)
+        if (!graph || !graph->executable) goto extent_fallback;
+        if (last->completion_epoch <= cmd->highest_completion)
             return -1;
         if (first->dependency_epoch > 0u) {
             if (barriers == 0u) return -1;
@@ -6949,6 +7555,7 @@ static int cuda_text_encode_extent(void *backend_state, void *command,
         if (UINT32_MAX - cmd->barrier_count < barriers)
             return -1;
         if (first->kind == SALT_TEXT_CELL_EXPERT_GATE &&
+            state->dynamic_experts &&
             (cuda_text_selected_live(state, cmd, first->layer) != 0 ||
              cmd->expert_chain_mask != 0u))
             return -1;
@@ -6980,8 +7587,10 @@ static int cuda_text_encode_extent(void *backend_state, void *command,
         *encoded_cells = cell_count;
         return SALT_TEXT_GPU_DEPENDENCY_READY;
     }
-    if (cuda_text_full_graph_eligible(state, input_count,
-            cmd->authoritative_output_rows, cmd->attention_score_rows)) {
+extent_fallback:
+    if (cmd->frontier_linear &&
+            cuda_text_full_graph_eligible(state, input_count,
+                cmd->authoritative_output_rows, cmd->attention_score_rows)) {
         const SaltTextExecutionCell *first =
             &program->dispatch.cells[first_cell];
         const SaltTextExecutionCell *last =
@@ -7030,11 +7639,15 @@ static int cuda_text_submit(void *backend_state, void *command) {
         cmd->next_cell != state->program->dispatch.cell_count ||
         cmd->encoded_cells != state->program->dispatch.cell_count)
         return -1;
-    if (cuda_text_full_graph_eligible(state, cmd->input_count,
-            cmd->authoritative_output_rows, cmd->attention_score_rows)) {
+    if (cmd->frontier_linear &&
+            cuda_text_full_graph_eligible(state, cmd->input_count,
+                cmd->authoritative_output_rows, cmd->attention_score_rows)) {
         CudaTextGraphTemplate *graph = &state->graphs[cmd->input_count - 1u];
+        uint32_t expected_attention_nodes =
+            state->model_gpu_ops && state->model_gpu_ops->attention
+                ? 0u : state->program->layer_count;
         if (!graph->executable || graph->kernel_nodes == 0u ||
-            graph->attention_node_count != state->program->layer_count)
+            graph->attention_node_count != expected_attention_nodes)
             return -1;
         for (uint32_t layer = 0; layer < graph->attention_node_count; layer++) {
             cudaKernelNodeParams parameters;
@@ -7086,10 +7699,11 @@ static int cuda_text_submit(void *backend_state, void *command) {
     return 0;
 }
 
-static int cuda_text_capture_nodes(CudaTextGraphTemplate *target) {
+static int cuda_text_capture_nodes(
+        const CudaTextProgramState *state, CudaTextGraphTemplate *target) {
     cudaGraphNode_t nodes[CUDA_TEXT_GRAPH_MAX_NODES];
     size_t node_count = CUDA_TEXT_GRAPH_MAX_NODES;
-    if (!target || !target->graph ||
+    if (!state || !target || !target->graph ||
         cuda_success(cudaGraphGetNodes(target->graph, nodes, &node_count),
             "cudaGraphGetNodes text") != 0 ||
         node_count == 0 || node_count > CUDA_TEXT_GRAPH_MAX_NODES)
@@ -7116,19 +7730,25 @@ static int cuda_text_capture_nodes(CudaTextGraphTemplate *target) {
             }
         }
     }
-    return target->kernel_nodes > 0u &&
-        target->attention_node_count == CUDA_TEXT_LAYERS ? 0 : -1;
+    if (target->kernel_nodes == 0u) return -1;
+    if (state->model_gpu_ops && state->model_gpu_ops->attention)
+        return target->attention_node_count == 0u ? 0 : -1;
+    return target->attention_node_count == CUDA_TEXT_LAYERS ? 0 : -1;
 }
 
 static int cuda_text_capture_graphs(
         CudaTextProgramState *state, const SaltTextVerifyProgram *program,
         const SaltTextExecutorPlan *plan) {
+    uint32_t graph_batches;
     if (!state || !program || !plan || plan->program != program ||
         plan->assignment_count != program->dispatch.cell_count ||
         !state->graph_tokens || !state->graph_parent_rows ||
         !state->graph_depths || !state->graph_source_positions ||
         !state->device_source_position || !state->stream)
         return -1;
+    graph_batches = program->maximum_candidates < CUDA_TEXT_GRAPH_COUNT
+        ? program->maximum_candidates : CUDA_TEXT_GRAPH_COUNT;
+    if (graph_batches == 0u) return -1;
     memset(state->graph_tokens, 0,
         (size_t)CUDA_TEXT_MAX_ROWS * CUDA_TEXT_MAX_ROWS *
             sizeof(int32_t));
@@ -7141,7 +7761,7 @@ static int cuda_text_capture_graphs(
     memset(state->graph_source_positions, 0,
         (size_t)CUDA_TEXT_MAX_ROWS * sizeof(uint32_t));
     state->capture_mode = 1u;
-    for (uint32_t batch = 1u; batch <= CUDA_TEXT_GRAPH_COUNT; batch++) {
+    for (uint32_t batch = 1u; batch <= graph_batches; batch++) {
         CudaTextProgramCommand command;
         CudaTextGraphTemplate *target = &state->graphs[batch - 1u];
         const int32_t *tokens = state->graph_tokens +
@@ -7170,14 +7790,14 @@ static int cuda_text_capture_graphs(
                 "cudaStreamEndCapture text") != 0 || !target->graph)
             goto fail;
         target->stats = command.stats;
-        if (cuda_text_capture_nodes(target) != 0 ||
+        if (cuda_text_capture_nodes(state, target) != 0 ||
             cuda_success(cudaGraphInstantiate(
                 &target->executable, target->graph, NULL, NULL, 0),
                 "cudaGraphInstantiate text") != 0 || !target->executable)
             goto fail;
     }
     state->capture_mode = 0u;
-    state->graphs_ready = CUDA_TEXT_GRAPH_COUNT;
+    state->graphs_ready = graph_batches;
     return 0;
 capture_fail:
     {
@@ -7226,12 +7846,16 @@ static int cuda_text_capture_extent_graphs(
         const SaltTextExecutorPlan *plan) {
     uint32_t extent_first[CUDA_TEXT_MAX_EXTENTS];
     uint32_t extent_count[CUDA_TEXT_MAX_EXTENTS];
-    uint32_t extents = 0u, cursor = 0u;
+    uint32_t extents = 0u, cursor = 0u, captured = 0u;
+    uint32_t graph_batches;
     if (!state || !program || !plan || plan->program != program ||
-        !state->dynamic_experts || !cuda_pageable_mmap ||
+        !cuda_pageable_mmap ||
         plan->assignment_count != program->dispatch.cell_count ||
         !state->stream)
         return -1;
+    graph_batches = program->maximum_candidates < CUDA_TEXT_GRAPH_COUNT
+        ? program->maximum_candidates : CUDA_TEXT_GRAPH_COUNT;
+    if (graph_batches == 0u) return -1;
     while (cursor < plan->assignment_count) {
         uint32_t count = plan->assignments[cursor].gpu_traversal_count;
         if (count == 0u || count > plan->assignment_count - cursor ||
@@ -7245,11 +7869,12 @@ static int cuda_text_capture_extent_graphs(
     if (cursor != plan->assignment_count || extents == 0u)
         return -1;
     state->capture_mode = 1u;
-    for (uint32_t batch = 1u; batch <= CUDA_TEXT_GRAPH_COUNT; batch++) {
+    for (uint32_t batch = 1u; batch <= graph_batches; batch++) {
         for (uint32_t extent = 0u; extent < extents; extent++) {
             CudaTextExtentGraph *target =
                 &state->extent_graphs[batch - 1u][extent];
             CudaTextProgramCommand command;
+            int encode_failed = 0;
             uint32_t first = extent_first[extent];
             uint32_t count = extent_count[extent];
             const SaltTextExecutionCell *first_cell =
@@ -7258,6 +7883,7 @@ static int cuda_text_capture_extent_graphs(
             command.generation = 1u;
             command.input_count = batch;
             command.maximum_depth = batch - 1u;
+            command.frontier_linear = 1u;
             command.authoritative_output_rows = batch;
             command.attention_score_rows = program->maximum_context;
             command.next_cell = first;
@@ -7279,37 +7905,51 @@ static int cuda_text_capture_extent_graphs(
                 uint32_t index = first + offset;
                 if (cuda_text_encode_cell(state, &command, program,
                         &program->dispatch.cells[index],
-                        &plan->assignments[index], batch) != 0)
-                    goto capture_fail;
+                        &plan->assignments[index], batch) != 0) {
+                    encode_failed = 1;
+                    break;
+                }
             }
-            if (command.next_cell != first + count ||
-                command.encoded_cells != count ||
-                cuda_success(cudaStreamEndCapture(state->stream, &target->graph),
+            if (encode_failed || command.next_cell != first + count ||
+                command.encoded_cells != count) {
+                cudaGraph_t abandoned = NULL;
+                (void)cudaStreamEndCapture(state->stream, &abandoned);
+                if (abandoned) (void)cudaGraphDestroy(abandoned);
+                memset(target, 0, sizeof *target);
+                if (!state->model_gpu_ops) goto fail;
+                continue;
+            }
+            if (cuda_success(cudaStreamEndCapture(state->stream, &target->graph),
                     "cudaStreamEndCapture text extent") != 0 ||
                 !target->graph)
                 goto fail;
             target->first_cell = first;
             target->cell_count = count;
             target->stats = command.stats;
-            if (cuda_text_extent_capture_nodes(target) != 0 ||
-                cuda_success(cudaGraphInstantiate(
+            if (cuda_text_extent_capture_nodes(target) != 0) {
+                (void)cudaGraphDestroy(target->graph);
+                memset(target, 0, sizeof *target);
+                if (!state->model_gpu_ops) goto fail;
+                continue;
+            }
+            if (cuda_success(cudaGraphInstantiate(
                     &target->executable, target->graph, NULL, NULL, 0),
                     "cudaGraphInstantiate text extent") != 0 ||
-                !target->executable)
-                goto fail;
+                !target->executable) {
+                if (target->executable)
+                    (void)cudaGraphExecDestroy(target->executable);
+                if (target->graph) (void)cudaGraphDestroy(target->graph);
+                memset(target, 0, sizeof *target);
+                if (!state->model_gpu_ops) goto fail;
+                continue;
+            }
+            captured++;
         }
     }
     state->capture_mode = 0u;
     state->extent_graph_count = extents;
-    if (extents > UINT32_MAX / CUDA_TEXT_GRAPH_COUNT) goto fail;
-    state->extent_graphs_ready = extents * CUDA_TEXT_GRAPH_COUNT;
+    state->extent_graphs_ready = captured;
     return 0;
-capture_fail:
-    {
-        cudaGraph_t abandoned = NULL;
-        (void)cudaStreamEndCapture(state->stream, &abandoned);
-        if (abandoned) (void)cudaGraphDestroy(abandoned);
-    }
 fail:
     state->capture_mode = 0u;
     return -1;

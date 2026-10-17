@@ -22,8 +22,8 @@ CUDA, and HIP physical backends.
 > safeguards or an amendment to the software license.
 
 The curated runtime source now matches merged private `main` revision
-`ce0363260a488c96b951b4d826a188e1014575d4`
-(`2026-10-02T10:58:17-04:00`) for the exported runtime paths. This updates
+`90b9c82b11eb18116f6dc4f18146c0e36100f58b`
+(`2026-10-17T08:23:20-04:00`) for the exported runtime paths. This updates
 source bytes, not the historical proof pins or platform qualification. It
 contains no model weights. Model artifacts retain their own licenses and must
 be obtained separately.

@@ -438,9 +438,12 @@ static int text_touched_span_plan_outputs(
         attention_score_rows, float);
     ADD_COUNT(program->layout.tensor_row, 1u,
         program->layout.maximum_tensor_row, float);
-    for (uint32_t layer = 0; layer < program->layer_count; layer++)
+    for (uint32_t layer = 0; layer < program->layer_count; layer++) {
+        if (program->layers[layer].kv_width == 0u)
+            continue;
         ADD_COUNT(program->layers[layer].tentative_value_offset,
             candidate_count, program->layers[layer].kv_width, float);
+    }
 #undef ADD_COUNT
     *total_bytes = 0;
     for (uint32_t index = 0; index < count; index++) {
@@ -780,10 +783,45 @@ static int descriptor_summary(const SaltTextModelExecDesc *descriptor,
         const SaltAttentionDesc *attention;
         uint32_t query_width, kv_width;
         size_t layer_tentative;
-        if (!plan || !layer->kv || plan->layer != (int)layer_index ||
+        if (!plan || plan->layer != (int)layer_index ||
             !readiness_bit(plan->runtime_ready) ||
             plan->runtime_ready != model->runtime_ready ||
             plan->hidden != model->hidden ||
+            plan->dense_intermediate < 0 || plan->n_experts < 1 ||
+            plan->top_k_experts < 1 ||
+            plan->top_k_experts > plan->n_experts ||
+            plan->expert_intermediate < 1 ||
+            !readiness_bit(plan->router_rmsnorm) ||
+            !readiness_bit(plan->residual_postnorm) ||
+            !readiness_bit(plan->router_rank_order) ||
+            plan->router_kind < SALT_ROUTER_SOFTMAX ||
+            plan->router_kind > SALT_ROUTER_MODEL ||
+            !readiness_bit(plan->router_normalize_topk) ||
+            (plan->router_kind == SALT_ROUTER_MODEL &&
+             (!(plan->router_scale > 0.0f) || !isfinite(plan->router_scale))) ||
+            !(plan->logit_softcap >= 0.0f) || !isfinite(plan->logit_softcap))
+            return -1;
+        attention = &plan->attention;
+        if (attention->kind == SALT_ATTN_MODEL) {
+            const SaltTextModelLayerOps *ops = descriptor->model_layer_ops;
+            query_width = 0u;
+            kv_width = 0u;
+            if (!ops || !ops->validate || !ops->forward ||
+                ops->validate(ops->context, layer_index, plan, layer) != 0 ||
+                layer->model_scratch_floats_per_row == 0u ||
+                layer->model_state_bytes == 0u ||
+                !tensor_shape(&layer->pre_attention_norm, 1u,
+                              (uint32_t)model->hidden) ||
+                !tensor_shape(&layer->pre_ffn_norm_2, 1u,
+                              (uint32_t)model->hidden) ||
+                !tensor_resolves(descriptor, &layer->pre_attention_norm) ||
+                !tensor_resolves(descriptor, &layer->model_input_projection) ||
+                !tensor_resolves(descriptor, &layer->model_kernel) ||
+                !tensor_resolves(descriptor, &layer->model_output_projection) ||
+                !tensor_resolves(descriptor, &layer->pre_ffn_norm_2))
+                return -1;
+        } else {
+        if (!layer->kv ||
             plan->attention.kind == SALT_ATTN_NONE ||
             (plan->attention.kind != SALT_ATTN_FULL &&
              plan->attention.kind != SALT_ATTN_SLIDING) ||
@@ -910,6 +948,12 @@ static int descriptor_summary(const SaltTextModelExecDesc *descriptor,
             (!tensor_absent(&layer->layer_scalar) &&
              !tensor_resolves(descriptor, &layer->layer_scalar)))
             return -1;
+        }
+        if ((plan->pinned && (layer->expert_count != 0u || layer->experts)) ||
+            (!plan->pinned &&
+             (layer->expert_count != (uint32_t)plan->n_experts ||
+              !layer->experts)))
+            return -1;
         for (uint32_t expert = 0; expert < layer->expert_count; expert++) {
             const SaltTextExpertDesc *entry = &layer->experts[expert];
             if (entry->expert_id != expert ||
@@ -949,6 +993,15 @@ static int descriptor_summary(const SaltTextModelExecDesc *descriptor,
             return -1;
         cell_count += attention->shared_kv_projection ? 22u : 23u;
         if (plan->dense_intermediate == 0) cell_count -= 5u;
+        if (plan->pinned) cell_count -= 9u;
+        if (attention->kind == SALT_ATTN_MODEL) cell_count -= 5u;
+        if (layer->model_scratch_floats_per_row >
+                result.maximum_model_scratch_floats)
+            result.maximum_model_scratch_floats =
+                layer->model_scratch_floats_per_row;
+        if (checked_add(result.model_state_bytes, layer->model_state_bytes,
+                        &result.model_state_bytes) != 0)
+            return -1;
         if (checked_mul(candidates, (size_t)kv_width, &layer_tentative) != 0 ||
             checked_mul(layer_tentative, 2u * sizeof(float),
                         &layer_tentative) != 0 ||
@@ -1001,6 +1054,18 @@ static int descriptor_summary(const SaltTextModelExecDesc *descriptor,
     RESERVE_FLOAT(position_logits, candidates, descriptor->vocabulary);
     RESERVE_FLOAT(attention_scores, 1u, descriptor->maximum_context);
     RESERVE_FLOAT(tensor_row, 1u, result.maximum_tensor_row);
+    if (result.maximum_model_scratch_floats > 0u)
+        RESERVE_FLOAT(model_scratch, candidates,
+                      result.maximum_model_scratch_floats);
+    else
+        result.model_scratch = cursor;
+    if (result.model_state_bytes > 0u) {
+        if (reserve_bytes(&cursor, result.model_state_bytes, 1u,
+                          &result.model_state) != 0)
+            return -1;
+    } else {
+        result.model_state = cursor;
+    }
 #undef RESERVE_FLOAT
 #undef RESERVE_I32
     if (align_size(cursor, TEXT_ALIGNMENT, &cursor) != 0)
@@ -1074,7 +1139,7 @@ int salt_text_verify_program_compile(
     SaltTextExecutionCell *cells;
     uintptr_t address, aligned_address;
     size_t need, padding, layers_bytes, metadata_cursor, tentative_cursor;
-    size_t tentative_bytes;
+    size_t tentative_bytes, model_state_cursor;
     uint32_t cell_capacity, cell_count = 0, epoch = 0;
     if (!program || !kv_state || !startup_arena ||
         salt_text_verify_program_arena_requirement(
@@ -1105,6 +1170,7 @@ int salt_text_verify_program_compile(
            layout.state_a, (size_t)descriptor->model->hidden * sizeof(float), 0);
     epoch++;
     tentative_cursor = layout.tentative_kv;
+    model_state_cursor = layout.model_state;
     for (uint32_t layer_index = 0; layer_index < descriptor->layer_count;
          layer_index++) {
         const SaltTextLayerExecDesc *layer = &descriptor->layers[layer_index];
@@ -1113,6 +1179,11 @@ int salt_text_verify_program_compile(
         uint32_t base, expert_ready;
         size_t layer_kv_elements, layer_kv_bytes;
         compiled->descriptor = layer;
+        compiled->model_state_offset = model_state_cursor;
+        compiled->model_state_bytes = layer->model_state_bytes;
+        if (checked_add(model_state_cursor, layer->model_state_bytes,
+                        &model_state_cursor) != 0)
+            return -1;
         (void)width_product(plan->attention.n_heads,
                             plan->attention.head_dim,
                             &compiled->query_width);
@@ -1135,6 +1206,21 @@ int salt_text_verify_program_compile(
         compiled->tentative_value_offset =
             tentative_cursor - layer_kv_bytes;
         base = epoch;
+        if (plan->attention.kind == SALT_ATTN_MODEL) {
+            APPEND(SALT_TEXT_CELL_PRE_ATTENTION_NORM,
+                   SALT_TEXT_EXECUTION_ROWS, maximum_candidates, layer_index,
+                   base, base + 1u, layout.normalized,
+                   (size_t)descriptor->model->hidden * sizeof(float), 0);
+            APPEND(SALT_TEXT_CELL_MODEL_LAYER,
+                   SALT_TEXT_EXECUTION_ROWS, maximum_candidates, layer_index,
+                   base + 1u, base + 2u, layout.branch,
+                   (size_t)descriptor->model->hidden * sizeof(float), 0);
+            APPEND(SALT_TEXT_CELL_ATTENTION_COMBINE,
+                   SALT_TEXT_EXECUTION_ROWS, maximum_candidates, layer_index,
+                   base + 2u, base + 3u, layout.state_b,
+                   (size_t)descriptor->model->hidden * sizeof(float), 0);
+            base += 3u;
+        } else {
         APPEND(SALT_TEXT_CELL_PRE_ATTENTION_NORM,
                SALT_TEXT_EXECUTION_ROWS, maximum_candidates, layer_index,
                base, base + 1u, layout.normalized,
@@ -1169,11 +1255,13 @@ int salt_text_verify_program_compile(
                base + 5u, base + 6u, layout.state_b,
                (size_t)descriptor->model->hidden * sizeof(float), 0);
         base += 6u;
+        }
         if (plan->dense_intermediate > 0)
         APPEND(SALT_TEXT_CELL_DENSE_NORM, SALT_TEXT_EXECUTION_ROWS,
                maximum_candidates, layer_index, base, base + 1u,
                layout.normalized,
                (size_t)descriptor->model->hidden * sizeof(float), 0);
+        if (!plan->pinned) {
         APPEND(SALT_TEXT_CELL_ROUTER_INPUT, SALT_TEXT_EXECUTION_ROWS,
                maximum_candidates, layer_index, base, base + 1u,
                layout.router_input,
@@ -1182,6 +1270,7 @@ int salt_text_verify_program_compile(
                maximum_candidates, layer_index, base, base + 1u,
                layout.combine_a,
                (size_t)descriptor->model->hidden * sizeof(float), 0);
+        }
         if (plan->dense_intermediate > 0) {
         APPEND(SALT_TEXT_CELL_DENSE_GATE, SALT_TEXT_EXECUTION_ROWS,
                maximum_candidates, layer_index, base + 1u, base + 2u,
@@ -1192,6 +1281,7 @@ int salt_text_verify_program_compile(
                layout.dense_up,
                (size_t)plan->dense_intermediate * sizeof(float), 0);
         }
+        if (!plan->pinned)
         APPEND(SALT_TEXT_CELL_ROUTER_PROJECTION, SALT_TEXT_EXECUTION_ROWS,
                maximum_candidates, layer_index, base + 1u, base + 2u,
                layout.router_logits,
@@ -1201,6 +1291,7 @@ int salt_text_verify_program_compile(
                maximum_candidates, layer_index, base + 2u, base + 3u,
                layout.dense_chain,
                (size_t)plan->dense_intermediate * sizeof(float), 0);
+        if (!plan->pinned)
         APPEND(SALT_TEXT_CELL_ROUTER_TOPK, SALT_TEXT_EXECUTION_ROWS,
                maximum_candidates, layer_index, base + 2u, base + 3u,
                layout.selected_experts,
@@ -1210,6 +1301,7 @@ int salt_text_verify_program_compile(
                maximum_candidates, layer_index, base + 3u, base + 4u,
                layout.dense_output,
                (size_t)descriptor->model->hidden * sizeof(float), 0);
+        if (!plan->pinned) {
         APPEND(SALT_TEXT_CELL_EXPERT_GATE, SALT_TEXT_EXECUTION_JOBS,
                maximum_candidates * (uint32_t)plan->top_k_experts,
                layer_index, base + 3u, base + 4u, layout.routed_gate,
@@ -1233,6 +1325,9 @@ int salt_text_verify_program_compile(
                layout.routed_output,
                (size_t)descriptor->model->hidden * sizeof(float), 0);
         expert_ready = base + 7u;
+        } else {
+            expert_ready = base + 4u;
+        }
         APPEND(SALT_TEXT_CELL_FFN_COMBINE, SALT_TEXT_EXECUTION_ROWS,
                maximum_candidates, layer_index, expert_ready,
                expert_ready + 1u, layout.state_a,
@@ -1254,7 +1349,8 @@ int salt_text_verify_program_compile(
            (size_t)descriptor->vocabulary * sizeof(float),
            SALT_TEXT_EXECUTION_CELL_FINAL_PUBLICATION);
     if (cell_count != cell_capacity ||
-        tentative_cursor != layout.tentative_kv + tentative_bytes)
+        tentative_cursor != layout.tentative_kv + tentative_bytes ||
+        model_state_cursor != layout.model_state + layout.model_state_bytes)
         return -1;
     memset(&built, 0, sizeof built);
     built.descriptor = descriptor;
@@ -1544,12 +1640,16 @@ static int commit_tentative_prefix(const SaltTextVerifyProgram *program,
     }
     for (uint32_t layer = 0; layer < program->layer_count; layer++) {
         const SaltTextCompiledLayer *compiled = &program->layers[layer];
-        const SaltTextKvLayerDesc *kv = compiled->descriptor->kv;
-        size_t row_bytes = (size_t)compiled->kv_width * sizeof(float);
-        const unsigned char *keys = view->canonical_base +
-            compiled->tentative_key_offset;
-        const unsigned char *values = view->canonical_base +
-            compiled->tentative_value_offset;
+        const SaltTextKvLayerDesc *kv;
+        size_t row_bytes;
+        const unsigned char *keys;
+        const unsigned char *values;
+        if (compiled->kv_width == 0u)
+            continue;
+        kv = compiled->descriptor->kv;
+        row_bytes = (size_t)compiled->kv_width * sizeof(float);
+        keys = view->canonical_base + compiled->tentative_key_offset;
+        values = view->canonical_base + compiled->tentative_value_offset;
         for (uint32_t row = 0; row < accepted; row++) {
             if (!view->backend_published_kv) {
                 float *key_destination =

@@ -33,7 +33,7 @@ int salt_tensor_storage_validate(const SaltTensorStorageSpec *storage,
         storage->source_class > SALT_TENSOR_SOURCE_SELECTED ||
         storage->resource_kind > SALT_TENSOR_RESOURCE_SHARED ||
         storage->encoding < SALT_TENSOR_ENCODING_F32 ||
-        storage->encoding > SALT_TENSOR_ENCODING_ROW_INT2 ||
+        storage->encoding > SALT_TENSOR_ENCODING_AFFINE_Q6 ||
         (storage->flags & ~(uint32_t)(SALT_TENSOR_STORAGE_OPTIONAL_BIAS |
                                      SALT_TENSOR_STORAGE_DECODED_F32)) != 0 ||
         multiply_u64(rows, cols, &elements) != 0)
@@ -65,9 +65,10 @@ int salt_tensor_storage_validate(const SaltTensorStorageSpec *storage,
             return -1;
         break;
     case SALT_TENSOR_ENCODING_AFFINE_Q4:
+    case SALT_TENSOR_ENCODING_AFFINE_Q6:
     case SALT_TENSOR_ENCODING_AFFINE_Q8: {
-        uint64_t bits = storage->encoding == SALT_TENSOR_ENCODING_AFFINE_Q4
-            ? 4u : 8u;
+        uint64_t bits = storage->encoding == SALT_TENSOR_ENCODING_AFFINE_Q4 ? 4u
+                      : storage->encoding == SALT_TENSOR_ENCODING_AFFINE_Q6 ? 6u : 8u;
         if (storage->group_size == 0 || cols % storage->group_size != 0 ||
             multiply_u64(elements, bits, &expected_values) != 0 ||
             expected_values % 8u != 0)

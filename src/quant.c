@@ -70,6 +70,7 @@ const SaltQuant *salt_quant_get(int bits) {
     switch (bits) {
         case 2:  return &salt_quant_int2;
         case 4:  return &salt_quant_q4;
+        case 6:  return &salt_quant_affine6;
         case 8:  return &salt_quant_q8;
         case 16: return &salt_quant_bf16;
         default: return NULL;

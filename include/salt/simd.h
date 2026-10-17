@@ -16,9 +16,8 @@
 
 #include <stdint.h>
 
-/* Fixed per-row affine-Q4 scale/bias scratch. The current widest qualified
- * projection is Gemma 4 full-attention O with C=8192 (128 groups). Wider
- * rows stay on the scalar path until separately qualified. */
+/* Fixed per-row affine-Q4 scale/bias scratch. Rows above this hoisted-metadata
+ * bound stream group scale/bias directly through the same SIMD arithmetic. */
 #define SALT_SIMD_Q4_MAX_GROUPS_PER_ROW 128
 
 /* Non-zero when a SIMD path is compiled in AND available at runtime. */
@@ -56,8 +55,8 @@ void salt_simd_f8_matvec(const uint8_t *W, const uint8_t *scales,
 void salt_simd_f8_matvec_bf16(const uint8_t *W, const uint16_t *scales,
                               int R, int C, int SR, int SC, const float *x,
                               float *y, int r0, int r1);
-/* MLX 4-bit matvec (SIMD). rows [r0, r1). C % 8 == 0 and at most
- * SALT_SIMD_Q4_MAX_GROUPS_PER_ROW groups per row are required. */
+/* MLX 4-bit matvec (SIMD). Rows [r0, r1); C % 8 == 0. Group metadata
+ * is hoisted for bounded rows and streamed for wider rows. */
 void salt_simd_q4_matvec(const uint32_t *vals, const uint16_t *scales,
                            const uint16_t *biases, int R, int C,
                            const float *x, float *y, int r0, int r1);

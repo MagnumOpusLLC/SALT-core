@@ -219,6 +219,77 @@ int salt_trunk_start(SaltTrunk *tr, int npin, int64_t slot, int nring) {
     return 0;
 }
 
+static int mapped_extent(const SaltTrunk *tr, int L, size_t page,
+                         uint64_t *map_off, size_t *map_nbytes,
+                         size_t *data_off, int64_t *charge) {
+    uint64_t off, nbytes, delta, span, rounded;
+    if (!tr || !tr->lay || L < 0 || L >= tr->n_layers || page < 1 ||
+        tr->lay[L].off < 0 || tr->lay[L].nbytes < 1)
+        return -1;
+    off = (uint64_t)tr->lay[L].off;
+    nbytes = (uint64_t)tr->lay[L].nbytes;
+    if (off > tr->source_nbytes || nbytes > tr->source_nbytes - off)
+        return -1;
+    delta = off % page;
+    if (delta > SIZE_MAX || nbytes > SIZE_MAX - (size_t)delta)
+        return -1;
+    span = delta + nbytes;
+    if (span > SIZE_MAX - (page - 1u)) return -1;
+    rounded = ((span + page - 1u) / page) * page;
+    if (rounded > INT64_MAX) return -1;
+    *map_off = off - delta;
+    *map_nbytes = (size_t)span;
+    *data_off = (size_t)delta;
+    *charge = (int64_t)rounded;
+    return 0;
+}
+
+int salt_trunk_plan_mapped(const SaltTrunk *tr, int64_t budget,
+                           int requested_pin, int *npin_out,
+                           int64_t *retained_bytes, int64_t *working_bytes) {
+    long page = sysconf(_SC_PAGESIZE);
+    int npin;
+    int64_t retained = 0, working = 0;
+    if (!tr || !tr->lay || tr->n_layers < 1 || budget < 1 || page < 1 ||
+        requested_pin < -1 || requested_pin > tr->n_layers ||
+        !npin_out || !retained_bytes || !working_bytes)
+        return -1;
+    npin = requested_pin < 0 ? tr->n_layers : requested_pin;
+    for (int L = 0; L < tr->n_layers; L++) {
+        uint64_t off;
+        size_t length, delta;
+        int64_t charge;
+        if (mapped_extent(tr, L, (size_t)page, &off, &length,
+                          &delta, &charge) != 0)
+            return -1;
+        if (L < npin) {
+            if (retained > INT64_MAX - charge) return -1;
+            retained += charge;
+        } else if (charge > working) {
+            working = charge;
+        }
+    }
+    /* Prefix-plus-largest-remainder is monotone in prefix length. Peeling
+     * from the end finds the largest fitting prefix without another table. */
+    while (requested_pin < 0 && npin > 0 &&
+           (retained > budget || working > budget - retained)) {
+        uint64_t off;
+        size_t length, delta;
+        int64_t charge;
+        if (mapped_extent(tr, npin - 1, (size_t)page, &off, &length,
+                          &delta, &charge) != 0)
+            return -1;
+        retained -= charge;
+        if (charge > working) working = charge;
+        npin--;
+    }
+    if (retained > budget || working > budget - retained) return -1;
+    *npin_out = npin;
+    *retained_bytes = retained;
+    *working_bytes = working;
+    return 0;
+}
+
 int salt_trunk_start_mapped(SaltTrunk *tr) {
     if (!tr || tr->fd < 0 || tr->th_started || tr->pin || tr->ring ||
         tr->map_base || tr->mapped_mode)
@@ -231,11 +302,51 @@ int salt_trunk_start_mapped(SaltTrunk *tr) {
     return 0;
 }
 
+int salt_trunk_start_mapped_retained(SaltTrunk *tr, int npin,
+                                     int64_t budget) {
+    int planned;
+    int64_t retained, working;
+    long page = sysconf(_SC_PAGESIZE);
+    if (npin < 0 || page < 1 ||
+        salt_trunk_plan_mapped(tr, budget, npin, &planned,
+                               &retained, &working) != 0 ||
+        planned != npin || salt_trunk_start_mapped(tr) != 0)
+        return -1;
+    tr->npin = npin;
+    for (int L = 0; L < npin; L++) {
+        SaltTrunkLayer *layer = &tr->lay[L];
+        uint64_t off;
+        size_t length, delta;
+        int64_t charge;
+        uint8_t *base;
+        if (mapped_extent(tr, L, (size_t)page, &off, &length,
+                          &delta, &charge) != 0)
+            return -1;
+        base = (uint8_t *)mmap(NULL, length, PROT_READ | PROT_WRITE,
+                              MAP_PRIVATE, tr->fd, (off_t)off);
+        if (base == MAP_FAILED) return -1;
+        layer->retained_map_base = base;
+        layer->retained_map_nbytes = length;
+        layer->retained_data_offset = delta;
+    }
+    return 0;
+}
+
 const uint8_t *salt_trunk_bind(SaltTrunk *tr, int L) {
     if (!tr || L < 0 || L >= tr->n_layers) return NULL;
     if (tr->mapped_mode) {
         if (tr->map_base) {
             if (tr->mapped_layer != L) return NULL;
+            return tr->map_base + tr->map_data_offset;
+        }
+        if (L < tr->npin) {
+            const SaltTrunkLayer *layer = &tr->lay[L];
+            if (!layer->retained_map_base || !layer->retained_map_nbytes)
+                return NULL;
+            tr->mapped_layer = L;
+            tr->map_base = layer->retained_map_base;
+            tr->map_nbytes = layer->retained_map_nbytes;
+            tr->map_data_offset = layer->retained_data_offset;
             return tr->map_base + tr->map_data_offset;
         }
         long page_size = sysconf(_SC_PAGESIZE);
@@ -288,9 +399,19 @@ const void *salt_trunk_mapping(const SaltTrunk *tr, size_t *nbytes_out) {
 int salt_trunk_unbind(SaltTrunk *tr) {
     if (!tr || !tr->mapped_mode) return 0;
     if ((!tr->map_base) != (tr->map_nbytes == 0)) return -1;
-    if (tr->map_base && tr->map_nbytes &&
-        munmap(tr->map_base, tr->map_nbytes) != 0)
-        return -1;
+    if (tr->map_base) {
+        if (tr->mapped_layer < 0 || tr->mapped_layer >= tr->n_layers)
+            return -1;
+        if (tr->mapped_layer < tr->npin) {
+            const SaltTrunkLayer *layer = &tr->lay[tr->mapped_layer];
+            if (tr->map_base != layer->retained_map_base ||
+                tr->map_nbytes != layer->retained_map_nbytes ||
+                tr->map_data_offset != layer->retained_data_offset)
+                return -1;
+        } else if (munmap(tr->map_base, tr->map_nbytes) != 0) {
+            return -1;
+        }
+    }
     tr->map_base = NULL;
     tr->map_nbytes = 0;
     tr->map_data_offset = 0;
@@ -301,6 +422,18 @@ int salt_trunk_unbind(SaltTrunk *tr) {
 int salt_trunk_close(SaltTrunk *tr) {
     if (!tr) return 0;
     if (salt_trunk_unbind(tr) != 0) return -1;
+    if (tr->mapped_mode) {
+        for (int L = 0; L < tr->npin; L++) {
+            SaltTrunkLayer *layer = &tr->lay[L];
+            if (layer->retained_map_base &&
+                munmap(layer->retained_map_base,
+                       layer->retained_map_nbytes) != 0)
+                return -1;
+            layer->retained_map_base = NULL;
+            layer->retained_map_nbytes = 0;
+            layer->retained_data_offset = 0;
+        }
+    }
     if (pthread_mutex_lock(&tr->mu) != 0) return -1;
     tr->stop = 1;
     int broadcast_rc = pthread_cond_broadcast(&tr->cv);

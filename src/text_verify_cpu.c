@@ -966,6 +966,21 @@ static int cpu_attention_cell(
             tensor_row, count,
             context->program->hidden,
             context->program->descriptor->norm_epsilon);
+    case SALT_TEXT_CELL_MODEL_LAYER: {
+        const SaltTextModelLayerOps *ops =
+            context->program->descriptor->model_layer_ops;
+        if (!ops || !ops->forward || compiled->model_state_bytes == 0u)
+            return -1;
+        return ops->forward(
+            ops->context, (uint32_t)cell->layer, count,
+            normalized + (size_t)first * context->program->hidden,
+            branch + (size_t)first * context->program->hidden,
+            cpu_floats(context, layout->model_scratch) +
+                (size_t)first * layout->maximum_model_scratch_floats,
+            (size_t)count * layout->maximum_model_scratch_floats,
+            context->arena + compiled->model_state_offset,
+            compiled->model_state_bytes);
+    }
     case SALT_TEXT_CELL_QUERY_PROJECTION: {
         SaltTextTensorHostBatch jobs[3];
         uint32_t job_count = attention->shared_kv_projection ? 2u : 3u;
@@ -1390,17 +1405,31 @@ static int cpu_ffn_cell(
             state_b + (size_t)first * hidden, tensor_row,
             count, hidden, context->program->descriptor->norm_epsilon);
     case SALT_TEXT_CELL_ROUTER_TOPK: {
+        const SaltTextModelLayerOps *model_ops =
+            context->program->descriptor->model_layer_ops;
+        int model_router = plan->router_kind == SALT_ROUTER_MODEL;
         int32_t *expert_next = (int32_t *)(void *)tensor_row;
         if (destination != (float *)(void *)selected ||
-            (!plan->router_rank_order && cpu_gather_row_zero(context,
-                &layer->per_expert_scale, tensor_row) != 0))
+            (model_router && (!model_ops || !model_ops->router_topk)) ||
+            ((model_router || !plan->router_rank_order) &&
+             cpu_gather_row_zero(context, &layer->per_expert_scale,
+                                 tensor_row) != 0))
             return -1;
-        for (uint32_t row = first; row < first + count; row++)
-            if (cpu_router_topk(router_logits + (size_t)row * experts,
+        for (uint32_t row = first; row < first + count; row++) {
+            int rc = model_router
+                ? model_ops->router_topk(
+                    model_ops->context,
+                    router_logits + (size_t)row * experts, tensor_row,
+                    experts, topk, selected + (size_t)row * topk,
+                    weights + (size_t)row * topk)
+                : cpu_router_topk(
+                    router_logits + (size_t)row * experts,
                     plan->router_rank_order ? NULL : tensor_row, experts, topk,
                     selected + (size_t)row * topk,
-                    weights + (size_t)row * topk, plan->router_rank_order) != 0)
+                    weights + (size_t)row * topk, plan->router_rank_order);
+            if (rc != 0)
                 return -1;
+        }
         if (first == 0 && count == candidate_count) {
             uint32_t jobs = candidate_count * topk;
             uint32_t next = 0;
@@ -1650,9 +1679,18 @@ static int cpu_ffn_cell(
     case SALT_TEXT_CELL_FFN_COMBINE: {
         float scalar = 1.0f;
         if (!plan->residual_postnorm) {
-            if (plan->dense_intermediate || plan->final_layer_scale) return -1;
-            for (size_t i = (size_t)first * hidden; i < (size_t)(first + count) * hidden; i++) {
-                destination[i] = state_b[i] + routed_output[i];
+            if (plan->final_layer_scale) return -1;
+            for (size_t i = (size_t)first * hidden;
+                 i < (size_t)(first + count) * hidden; i++) {
+                float branch;
+                if (plan->dense_intermediate > 0) {
+                    branch = dense_output[i];
+                    if (plan->parallel_dense_routed)
+                        branch += routed_output[i];
+                } else {
+                    branch = routed_output[i];
+                }
+                destination[i] = state_b[i] + branch;
                 if (!isfinite(destination[i])) return -1;
             }
             return 0;
@@ -1766,7 +1804,8 @@ static int cpu_dispatch_cell(
             assigned_complete.first, assigned_complete.count);
     if (cell->layer < program->layer_count &&
         cell->kind >= SALT_TEXT_CELL_PRE_ATTENTION_NORM &&
-        cell->kind <= SALT_TEXT_CELL_ATTENTION_COMBINE)
+        (cell->kind <= SALT_TEXT_CELL_ATTENTION_COMBINE ||
+         cell->kind == SALT_TEXT_CELL_MODEL_LAYER))
         return cpu_attention_cell(context, &program->layers[cell->layer], cell,
             source_position, assigned_complete.first,
             assigned_complete.count);

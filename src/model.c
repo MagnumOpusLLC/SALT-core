@@ -92,8 +92,15 @@ int salt_model_gqa_geometry(const SaltCfg *cfg, int q_rows, int k_rows,
 
 static int attention_valid(const SaltAttentionDesc *a) {
     if (!a || (a->kind != SALT_ATTN_SLIDING &&
-               a->kind != SALT_ATTN_FULL) ||
-        (a->causal != 0 && a->causal != 1) ||
+               a->kind != SALT_ATTN_FULL &&
+               a->kind != SALT_ATTN_MODEL))
+        return 0;
+    if (a->kind == SALT_ATTN_MODEL)
+        return a->causal == 1 && a->window >= 2 &&
+               a->n_heads == 0 && a->n_kv_heads == 0 && a->head_dim == 0 &&
+               a->rope_kind == SALT_ROPE_NONE && a->rope_dim == 0 &&
+               a->rope_base_dim == 0 && a->raw_values == 1;
+    if ((a->causal != 0 && a->causal != 1) ||
         a->n_heads < 1 || a->n_kv_heads < 1 ||
         a->n_heads % a->n_kv_heads != 0 || a->head_dim < 1 ||
         a->rope_dim < 0 || a->rope_dim > a->head_dim ||
@@ -105,6 +112,7 @@ static int attention_valid(const SaltAttentionDesc *a) {
          a->rope_kind != SALT_ROPE_NONE) ||
         (a->rope_kind == SALT_ROPE_NONE && a->rope_dim != 0) ||
         (a->raw_values != 0 && a->raw_values != 1) ||
+        (a->k_norm_absent != 0 && a->k_norm_absent != 1) ||
         !(a->rope_theta > 0.0) || !isfinite(a->rope_theta) ||
         !(a->score_scale > 0.0f) || !isfinite(a->score_scale))
         return 0;
@@ -137,6 +145,8 @@ int salt_model_text_layer_plan(const SaltModelDesc *m, int layer,
         m->hidden < 1 || m->n_experts < 1 || m->topk < 1 ||
         m->topk > m->n_experts || m->moe_inter < 1 ||
         g->dense_intermediate < 0 ||
+        g->dense_layers < 0 || g->dense_layers > m->n_layers ||
+        g->pinned_layers < 0 || g->pinned_layers > m->n_layers ||
         (g->dense_intermediate == 0 && g->parallel_dense_routed) ||
         (g->expert_activation != SALT_ACT_SILU &&
          g->expert_activation != SALT_ACT_GELU_TANH &&
@@ -144,6 +154,11 @@ int salt_model_text_layer_plan(const SaltModelDesc *m, int layer,
         (g->expert_activation == SALT_ACT_SILU_CLAMPED &&
          (!(g->activation_limit > 0.0f) || !isfinite(g->activation_limit))) ||
         !bool_field(g->router_rank_order) ||
+        g->router_kind < SALT_ROUTER_SOFTMAX ||
+        g->router_kind > SALT_ROUTER_MODEL ||
+        !bool_field(g->router_normalize_topk) ||
+        (g->router_kind == SALT_ROUTER_MODEL &&
+         (!(g->router_scale > 0.0f) || !isfinite(g->router_scale))) ||
         !bool_field(g->router_rmsnorm) ||
         !bool_field(g->parallel_dense_routed) ||
         !bool_field(g->residual_postnorm) ||
@@ -165,7 +180,9 @@ int salt_model_text_layer_plan(const SaltModelDesc *m, int layer,
     plan.n_experts = m->n_experts;
     plan.top_k_experts = m->topk;
     plan.expert_intermediate = m->moe_inter;
-    plan.dense_intermediate = g->dense_intermediate;
+    plan.dense_intermediate = (g->dense_layers == 0 || layer < g->dense_layers)
+        ? g->dense_intermediate : 0;
+    plan.pinned = layer < g->pinned_layers;
     plan.activation = g->expert_activation;
     plan.router_rmsnorm = g->router_rmsnorm;
     plan.parallel_dense_routed = g->parallel_dense_routed;
@@ -176,6 +193,9 @@ int salt_model_text_layer_plan(const SaltModelDesc *m, int layer,
     plan.logit_softcap = g->logit_softcap;
     plan.activation_limit = g->activation_limit;
     plan.router_rank_order = g->router_rank_order;
+    plan.router_kind = g->router_kind;
+    plan.router_normalize_topk = g->router_normalize_topk;
+    plan.router_scale = g->router_scale;
     *out = plan;
     return 0;
 }
@@ -215,6 +235,13 @@ int salt_model_kv_plan(const SaltModelDesc *m, size_t max_tokens,
         size_t tokens, kw, vw, width, count;
         if (salt_model_attention(m, layer, &a) != 0)
             return -1;
+        if (a.kind == SALT_ATTN_MODEL) {
+            plan[layer].offset_floats = off;
+            plan[layer].token_capacity = 0;
+            plan[layer].k_width = 0;
+            plan[layer].v_width = 0;
+            continue;
+        }
         tokens = max_tokens;
         if (a.kind == SALT_ATTN_SLIDING) {
             size_t retained;

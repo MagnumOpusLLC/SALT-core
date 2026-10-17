@@ -40,5 +40,6 @@ extern const SaltQuant salt_quant_q8;   /* the mlx8 8-bit track */
 extern const SaltQuant salt_quant_bf16; /* the reference bf16 */
 extern const SaltQuant salt_quant_fp8;  /* the fp8 track */
 extern const SaltQuant salt_quant_int2; /* row-scaled packed ternary container */
+extern const SaltQuant salt_quant_affine6; /* model-provided affine group-64 6-bit */
 
 #endif /* SALT_QUANT_H */
