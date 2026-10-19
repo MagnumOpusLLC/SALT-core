@@ -7,7 +7,7 @@
       "snapshot_path": "models/gemma4-26b-a4b/compat/v6/Makefile",
       "snapshot_sha256": "f34e7285395963b84600379f3a3a1065c3f1d5d38dc8d04c2f7776b07fb8e212",
       "live_projection": "pin-live-source-v1",
-      "live_sha256": "362b106cd26d209727e1433ffa3260860a10f09feead4927417c2f231b30213c"
+      "live_sha256": "c14fd3e790050124f12375eca10decc61f1e39663ceb307608be2aa918f671ee"
     },
     {
       "logical_path": "include/salt/model.h",

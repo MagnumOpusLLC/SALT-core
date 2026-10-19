@@ -128,11 +128,14 @@ authenticated identities without rescanning weight payloads.
 ## Build and gate
 
 ```bash
-make lfm-server   # -> $LFM_BIN_DIR/lfm-server + receipt
-make test         # curated public smoke, including the LFM descriptor gate
+make lfm-server   # CPU default -> $LFM_BIN_DIR/lfm-server + receipt
+LFM_BACKEND=metal make lfm-server  # Darwin Metal build; same state/arithmetic contract
+make test         # curated public smoke, including LFM descriptor + Darwin Metal gates
 ```
 
-`lfm-server` is the authenticated native CPU inference entry. It validates the
+`lfm-server` is the authenticated native inference entry; CPU is the default and
+`LFM_BACKEND=metal` selects the complete Metal realization without changing the
+model package or state authority. It validates the
 pool header and per-layer expert bases, audits `index.txt` against the declared
 geometry, maps the bounded package, compiles the complete engine program, and
 runs a tokenizer-backed semantic PREFILL/decode probe. Its build receipt records
