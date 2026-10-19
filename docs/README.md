@@ -34,20 +34,24 @@ arbitrary contexts, prompts, or hardware.
 
 1. [`../README.md`](../README.md) — project entry point, first-use path, and
    current release boundary.
-2. [`COGNITIVE-STATE-RISK.md`](COGNITIVE-STATE-RISK.md) — KV Cache and
+2. [`../models/README.md`](../models/README.md) — exported model package and
+   model-documentation index.
+3. [`../PERFORMANCE.md`](../PERFORMANCE.md) — source-pinned performance ledger;
+   private receipt paths are labeled rather than exported.
+4. [`COGNITIVE-STATE-RISK.md`](COGNITIVE-STATE-RISK.md) — KV Cache and
    Persistent Agent State Statement: beyond-prompt state, consent, risk, and the
    separation of computational continuity from authority to act.
-3. [`ARCHITECTURE.md`](ARCHITECTURE.md) — authoritative storage, execution,
+5. [`ARCHITECTURE.md`](ARCHITECTURE.md) — authoritative storage, execution,
    resource, and state ownership.
-4. [`TERMINOLOGY.md`](TERMINOLOGY.md) — canonical NFQ, X-TARGET, DPR, and engine
+6. [`TERMINOLOGY.md`](TERMINOLOGY.md) — canonical NFQ, X-TARGET, DPR, and engine
    vocabulary.
-5. [`FORMAL-PROOFS.md`](FORMAL-PROOFS.md) — curated TLA+/TLAPS sources,
+7. [`FORMAL-PROOFS.md`](FORMAL-PROOFS.md) — curated TLA+/TLAPS sources,
    reproduced proof results, and explicit limits on runtime correspondence.
-6. [`TRANSMUTATION.md`](TRANSMUTATION.md) — curated transmutation findings and
+8. [`TRANSMUTATION.md`](TRANSMUTATION.md) — curated transmutation findings and
    the scoped loader-proof boundary.
-7. [`EC2-START.md`](EC2-START.md) — status/start notes for the specifically named
+9. [`EC2-START.md`](EC2-START.md) — status/start notes for the specifically named
    historical EC2 hosts; it is not a provisioning or serving guide.
-8. [`../experiments/reports/README.md`](../experiments/reports/README.md) —
+10. [`../experiments/reports/README.md`](../experiments/reports/README.md) —
    explicitly exported, source-indexed historical reports. Reports do not
    override current source or runtime qualification.
 
