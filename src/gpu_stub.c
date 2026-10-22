@@ -163,12 +163,16 @@ int salt_gpu_attention_batch(
     const SaltGpuSharedBuffer *kv, size_t key_float_offset,
     size_t value_float_offset, int start_position, int batch,
     int query_stride, int kv_stride, SaltGpuSharedBuffer *outputs,
-    size_t output_float_offset) {
+    size_t output_float_offset, SaltGpuSharedBuffer *score_workspace,
+    size_t score_float_offset, size_t score_stride,
+    int score_task_capacity) {
     (void)full_attention; (void)n_heads; (void)n_kv_heads;
     (void)head_dim; (void)window; (void)queries; (void)query_float_offset;
     (void)kv; (void)key_float_offset; (void)value_float_offset;
     (void)start_position; (void)batch; (void)query_stride; (void)kv_stride;
     (void)outputs; (void)output_float_offset;
+    (void)score_workspace; (void)score_float_offset; (void)score_stride;
+    (void)score_task_capacity;
     return -1;
 }
 

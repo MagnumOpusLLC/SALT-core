@@ -35,7 +35,7 @@
       "snapshot_path": "models/gemma4-26b-a4b/compat/v6/models/gemma4-26b-a4b/gemma4_text.c",
       "snapshot_sha256": "2276829cd1e01df341577ea3e1b0227e2c54b171174ea3c74098d2543c3b6952",
       "live_projection": "pin-live-source-v1",
-      "live_sha256": "b11d92b252fde62afd6f411ca693b832f6a4a9dd9bbcbddc025e36b40a9436ed"
+      "live_sha256": "c3d2d78f4f25f7289659b45b67119ae2fefc9778faa886bebcd9f8d895d5f321"
     },
     {
       "logical_path": "models/gemma4-26b-a4b/gemma4_text.h",

@@ -15,12 +15,20 @@
 #ifndef LFM_METAL_Q6_WARP
 #define LFM_METAL_Q6_WARP 0
 #endif
+#ifndef LFM_METAL_F32_TILE
+#define LFM_METAL_F32_TILE 0
+#endif
+#ifndef LFM_METAL_Q4_MATRIX
+#define LFM_METAL_Q4_MATRIX 0
+#endif
 
 typedef struct {
     id<MTLComputePipelineState> conv;
     id<MTLComputePipelineState> q6;
     id<MTLComputePipelineState> q6_warp;
     id<MTLComputePipelineState> f32;
+    id<MTLComputePipelineState> f32_tile;
+    id<MTLComputePipelineState> q4_matrix;
     id<MTLComputePipelineState> bf16;
     id<MTLComputePipelineState> activation;
     id<MTLComputePipelineState> router_scores;
@@ -94,6 +102,8 @@ static const char *const LFM_METAL_SOURCE =
     "kernel void lfm_short_conv(device float *canonical[[buffer(0)]],device const uchar *weights[[buffer(1)]],constant A &a[[buffer(2)]],uint ch[[thread_position_in_grid]]){if(ch>=a.hidden)return;device float *win=canonical+a.state_float+ulong(ch)*a.kernel_size;for(uint row=0;row<a.rows;row++){ulong base=a.scratch_float+ulong(row)*3u*a.hidden;float b=canonical[base+ch],c=canonical[base+a.hidden+ch],x=canonical[base+2u*a.hidden+ch];for(uint j=0;j+1u<a.kernel_size;j++)win[j]=win[j+1u];win[a.kernel_size-1u]=b*x;float acc=0.0f;for(uint j=0;j<a.kernel_size;j++){float product=bf16(weights+a.kernel_byte+(ulong(ch)*a.kernel_size+j)*2u)*win[j];acc+=product;}canonical[a.scratch_float+ulong(a.rows)*3u*a.hidden+ulong(row)*a.hidden+ch]=c*acc;}}\n"
     "struct Q{ulong value_offset,scale_offset,bias_offset;uint rows,cols,jobs;};\n"
     "kernel void lfm_f32_project(device const uchar *weights[[buffer(0)]],device const float *x[[buffer(1)]],device float *y[[buffer(2)]],constant Q &a[[buffer(3)]],uint index[[thread_position_in_grid]]){uint job=index/a.rows,row=index%a.rows;if(job>=a.jobs)return;device const float *w=reinterpret_cast<device const float *>(weights+a.value_offset)+ulong(row)*a.cols;float acc=0.0f;for(uint col=0;col<a.cols;col++){float product=w[col]*x[ulong(job)*a.cols+col];acc+=product;}y[ulong(job)*a.rows+row]=acc;}\n"
+    "kernel void lfm_f32_tile_exact(device const uchar *weights[[buffer(0)]],device const float *x[[buffer(1)]],device float *y[[buffer(2)]],constant Q &a[[buffer(3)]],threadgroup float *products[[threadgroup(0)]],uint tid[[thread_index_in_threadgroup]],uint3 group[[threadgroup_position_in_grid]]){uint row=group.x,job=group.y;if(row>=a.rows||job>=a.jobs)return;device const float *w=reinterpret_cast<device const float *>(weights+a.value_offset)+ulong(row)*a.cols;device const float *input=x+ulong(job)*a.cols;for(uint col=tid;col<a.cols;col+=256u)products[col]=w[col]*input[col];threadgroup_barrier(mem_flags::mem_threadgroup);if(tid==0u){float acc=0.0f;for(uint col=0;col<a.cols;col++)acc+=products[col];y[ulong(job)*a.rows+row]=acc;}}\n"
+    "kernel void lfm_q4_matrix_exact(device const uchar *values[[buffer(0)]],device const uchar *scales[[buffer(1)]],device const uchar *biases[[buffer(2)]],device const float *x[[buffer(3)]],device float *y[[buffer(4)]],constant Q &a[[buffer(5)]],uint index[[thread_position_in_grid]]){uint blocks=(a.jobs+5u)/6u,job_block=index/a.rows,row=index%a.rows;if(job_block>=blocks)return;uint job_base=job_block*6u;float4 a0[6],a1[6],a2[6],a3[6],a4[6],a5[6],a6[6],a7[6];for(uint item=0;item<6u;item++){a0[item]=float4(0.0f);a1[item]=float4(0.0f);a2[item]=float4(0.0f);a3[item]=float4(0.0f);a4[item]=float4(0.0f);a5[item]=float4(0.0f);a6[item]=float4(0.0f);a7[item]=float4(0.0f);}for(uint c=0u;c+31u<a.cols;c+=32u){ulong k=ulong(row)*a.cols+c,grp=k/64u,word=a.value_offset+(k>>3u)*4u;float s=bf16(scales+a.scale_offset+grp*2u),b=bf16(biases+a.bias_offset+grp*2u);uint u0=uint(values[word])|(uint(values[word+1u])<<8u)|(uint(values[word+2u])<<16u)|(uint(values[word+3u])<<24u),u1=uint(values[word+4u])|(uint(values[word+5u])<<8u)|(uint(values[word+6u])<<16u)|(uint(values[word+7u])<<24u),u2=uint(values[word+8u])|(uint(values[word+9u])<<8u)|(uint(values[word+10u])<<16u)|(uint(values[word+11u])<<24u),u3=uint(values[word+12u])|(uint(values[word+13u])<<8u)|(uint(values[word+14u])<<16u)|(uint(values[word+15u])<<24u);float4 q0=float4((u0>>0u)&15u,(u0>>4u)&15u,(u0>>8u)&15u,(u0>>12u)&15u),q1=float4((u0>>16u)&15u,(u0>>20u)&15u,(u0>>24u)&15u,(u0>>28u)&15u),q2=float4((u1>>0u)&15u,(u1>>4u)&15u,(u1>>8u)&15u,(u1>>12u)&15u),q3=float4((u1>>16u)&15u,(u1>>20u)&15u,(u1>>24u)&15u,(u1>>28u)&15u),q4=float4((u2>>0u)&15u,(u2>>4u)&15u,(u2>>8u)&15u,(u2>>12u)&15u),q5=float4((u2>>16u)&15u,(u2>>20u)&15u,(u2>>24u)&15u,(u2>>28u)&15u),q6=float4((u3>>0u)&15u,(u3>>4u)&15u,(u3>>8u)&15u,(u3>>12u)&15u),q7=float4((u3>>16u)&15u,(u3>>20u)&15u,(u3>>24u)&15u,(u3>>28u)&15u);float4 w0=q0*s;w0+=b;float4 w1=q1*s;w1+=b;float4 w2=q2*s;w2+=b;float4 w3=q3*s;w3+=b;float4 w4=q4*s;w4+=b;float4 w5=q5*s;w5+=b;float4 w6=q6*s;w6+=b;float4 w7=q7*s;w7+=b;for(uint item=0;item<6u;item++){uint job=job_base+item;if(job>=a.jobs)continue;device const float *xi=x+ulong(job)*a.cols+c;float4 p0=w0*float4(xi[0],xi[1],xi[2],xi[3]);float4 p1=w1*float4(xi[4],xi[5],xi[6],xi[7]);float4 p2=w2*float4(xi[8],xi[9],xi[10],xi[11]);float4 p3=w3*float4(xi[12],xi[13],xi[14],xi[15]);float4 p4=w4*float4(xi[16],xi[17],xi[18],xi[19]);float4 p5=w5*float4(xi[20],xi[21],xi[22],xi[23]);float4 p6=w6*float4(xi[24],xi[25],xi[26],xi[27]);float4 p7=w7*float4(xi[28],xi[29],xi[30],xi[31]);a0[item]+=p0;a1[item]+=p1;a2[item]+=p2;a3[item]+=p3;a4[item]+=p4;a5[item]+=p5;a6[item]+=p6;a7[item]+=p7;}}for(uint item=0;item<6u;item++){uint job=job_base+item;if(job>=a.jobs)continue;float4 s4=float4(0.0f);s4+=a0[item];s4+=a1[item];s4+=a2[item];s4+=a3[item];s4+=a4[item];s4+=a5[item];s4+=a6[item];s4+=a7[item];float2 tt=s4.xy+s4.zw;y[ulong(job)*a.rows+row]=tt.x+tt.y;}}\n"
     "kernel void lfm_bf16_project(device const uchar *weights[[buffer(0)]],device const float *x[[buffer(1)]],device float *y[[buffer(2)]],constant Q &a[[buffer(3)]],uint index[[thread_position_in_grid]]){uint job=index/a.rows,row=index%a.rows;if(job>=a.jobs)return;device const uchar *w=weights+a.value_offset+ulong(row)*a.cols*2u;float acc=0.0f;for(uint col=0;col<a.cols;col++){float product=bf16(w+ulong(col)*2u)*x[ulong(job)*a.cols+col];acc+=product;}y[ulong(job)*a.rows+row]=acc;}\n"
     "kernel void lfm_q6_project(device const uchar *weights[[buffer(0)]],device const float *x[[buffer(1)]],device float *y[[buffer(2)]],constant Q &a[[buffer(3)]],uint index[[thread_position_in_grid]]){uint job=index/a.rows,row=index%a.rows;if(job>=a.jobs)return;float acc=0.0f;ulong rowbase=ulong(row)*a.cols;for(uint group_base=0;group_base<a.cols;group_base+=64u){ulong group=(rowbase+group_base)/64u;float scale=bf16(weights+a.scale_offset+group*2u),bias=bf16(weights+a.bias_offset+group*2u);uint stop=min(group_base+64u,a.cols);for(uint col=group_base;col<stop;col++){ulong p=rowbase+col,bit=p*6u,byte=bit>>3u;uint packed=uint(weights[a.value_offset+byte]);if((bit&7u)>2u)packed|=uint(weights[a.value_offset+byte+1u])<<8u;uint code=(packed>>uint(bit&7u))&63u;float input=x[ulong(job)*a.cols+col];float left=float(code)*scale;left*=input;float right=bias*input;float term=left+right;acc+=term;}}y[ulong(job)*a.rows+row]=acc;}\n"
     "kernel void lfm_q6_warp(device const uchar *weights[[buffer(0)]],device const float *x[[buffer(1)]],device float *y[[buffer(2)]],constant Q &a[[buffer(3)]],uint lane[[thread_index_in_simdgroup]],uint warp[[simdgroup_index_in_threadgroup]],uint3 group[[threadgroup_position_in_grid]]){uint row=group.x*4u+warp,job=group.y;float acc=0.0f;for(uint base=0;base<a.cols;base+=32u){uint col=base+lane;float product=0.0f;if(row<a.rows&&job<a.jobs&&col<a.cols){ulong p=ulong(row)*a.cols+col,bit=p*6u,byte=bit>>3u,grp=p/64u;uint packed=uint(weights[a.value_offset+byte]);if((bit&7u)>2u)packed|=uint(weights[a.value_offset+byte+1u])<<8u;uint code=(packed>>uint(bit&7u))&63u;float input=x[ulong(job)*a.cols+col];float left=float(code)*bf16(weights+a.scale_offset+grp*2u);left*=input;float right=bf16(weights+a.bias_offset+grp*2u)*input;product=left+right;}uint count=a.cols-base;if(count>32u)count=32u;for(uint source=0;source<count;source++){float selected=simd_shuffle(product,source);if(lane==0u)acc+=selected;}}if(lane==0u&&row<a.rows&&job<a.jobs)y[ulong(job)*a.rows+row]=acc;}\n"
@@ -193,6 +203,30 @@ static int lfm_metal_prepare(void *context,
     state->f32 = [device newComputePipelineStateWithFunction:function error:&error];
     [function release];
     if (!state->f32) {
+        [library release];
+        return -1;
+    }
+    function = [library newFunctionWithName:@"lfm_f32_tile_exact"];
+    if (!function) {
+        [library release];
+        return -1;
+    }
+    state->f32_tile = [device newComputePipelineStateWithFunction:function
+        error:&error];
+    [function release];
+    if (!state->f32_tile) {
+        [library release];
+        return -1;
+    }
+    function = [library newFunctionWithName:@"lfm_q4_matrix_exact"];
+    if (!function) {
+        [library release];
+        return -1;
+    }
+    state->q4_matrix = [device newComputePipelineStateWithFunction:function
+        error:&error];
+    [function release];
+    if (!state->q4_matrix) {
         [library release];
         return -1;
     }
@@ -326,7 +360,7 @@ static int lfm_metal_project(void *context,
     LfmMetalState *state = (LfmMetalState *)state_memory;
     id<MTLCommandBuffer> command;
     id<MTLComputeCommandEncoder> encoder;
-    id<MTLBuffer> weights, canonical;
+    id<MTLBuffer> weights, scales, biases, canonical;
     LfmMetalQ6Args q6;
     uint64_t input_bytes, output_bytes, elements;
     (void)context;
@@ -335,6 +369,7 @@ static int lfm_metal_project(void *context,
         state_bytes != sizeof *state || args->rows == 0u ||
         (args->tensor.encoding != SALT_TENSOR_ENCODING_F32 &&
          args->tensor.encoding != SALT_TENSOR_ENCODING_BF16 &&
+         args->tensor.encoding != SALT_TENSOR_ENCODING_AFFINE_Q4 &&
          args->tensor.encoding != SALT_TENSOR_ENCODING_AFFINE_Q6) ||
         args->tensor.rows == 0u || args->tensor.cols == 0u ||
         !(weights = (id<MTLBuffer>)args->tensor.resource))
@@ -358,22 +393,60 @@ static int lfm_metal_project(void *context,
     encoder = [command computeCommandEncoder];
     if (!encoder) return -1;
     [encoder setComputePipelineState:
-        args->tensor.encoding == SALT_TENSOR_ENCODING_F32 ? state->f32 :
+        args->tensor.encoding == SALT_TENSOR_ENCODING_F32
+            ? (LFM_METAL_F32_TILE ? state->f32_tile : state->f32) :
+        args->tensor.encoding == SALT_TENSOR_ENCODING_AFFINE_Q4
+            ? state->q4_matrix :
         args->tensor.encoding == SALT_TENSOR_ENCODING_BF16 ? state->bf16 :
         (LFM_METAL_Q6_WARP ? state->q6_warp : state->q6)];
-    [encoder setBuffer:weights offset:0 atIndex:0];
-    [encoder setBuffer:canonical offset:(NSUInteger)args->input_offset atIndex:1];
-    [encoder setBuffer:canonical offset:(NSUInteger)args->output_offset atIndex:2];
-    [encoder setBytes:&q6 length:sizeof q6 atIndex:3];
-    if (args->tensor.encoding == SALT_TENSOR_ENCODING_AFFINE_Q6 &&
-        LFM_METAL_Q6_WARP)
-        [encoder dispatchThreadgroups:
-            MTLSizeMake(((NSUInteger)args->tensor.rows + 3u) / 4u,
-                        (NSUInteger)args->rows, 1)
-             threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
-    else
-        [encoder dispatchThreads:MTLSizeMake((NSUInteger)elements, 1, 1)
+    if (args->tensor.encoding == SALT_TENSOR_ENCODING_AFFINE_Q4) {
+        scales = (id<MTLBuffer>)args->tensor.scale_resource;
+        biases = (id<MTLBuffer>)args->tensor.bias_resource;
+        if (!scales || !biases) {
+            [encoder endEncoding];
+            return -1;
+        }
+        [encoder setBuffer:weights offset:0 atIndex:0];
+        [encoder setBuffer:scales offset:0 atIndex:1];
+        [encoder setBuffer:biases offset:0 atIndex:2];
+        [encoder setBuffer:canonical
+                    offset:(NSUInteger)args->input_offset atIndex:3];
+        [encoder setBuffer:canonical
+                    offset:(NSUInteger)args->output_offset atIndex:4];
+        [encoder setBytes:&q6 length:sizeof q6 atIndex:5];
+        [encoder dispatchThreads:
+            MTLSizeMake((NSUInteger)args->tensor.rows *
+                        (((NSUInteger)args->rows + 5u) / 6u), 1, 1)
              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    } else {
+        [encoder setBuffer:weights offset:0 atIndex:0];
+        [encoder setBuffer:canonical
+                    offset:(NSUInteger)args->input_offset atIndex:1];
+        [encoder setBuffer:canonical
+                    offset:(NSUInteger)args->output_offset atIndex:2];
+        [encoder setBytes:&q6 length:sizeof q6 atIndex:3];
+        if (args->tensor.encoding == SALT_TENSOR_ENCODING_F32 &&
+            LFM_METAL_F32_TILE) {
+            if ((uint64_t)args->tensor.cols * sizeof(float) > NSUIntegerMax) {
+                [encoder endEncoding];
+                return -1;
+            }
+            [encoder setThreadgroupMemoryLength:
+                (NSUInteger)args->tensor.cols * sizeof(float) atIndex:0];
+            [encoder dispatchThreadgroups:
+                MTLSizeMake((NSUInteger)args->tensor.rows,
+                            (NSUInteger)args->rows, 1)
+                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        } else if (args->tensor.encoding == SALT_TENSOR_ENCODING_AFFINE_Q6 &&
+            LFM_METAL_Q6_WARP)
+            [encoder dispatchThreadgroups:
+                MTLSizeMake(((NSUInteger)args->tensor.rows + 3u) / 4u,
+                            (NSUInteger)args->rows, 1)
+                 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        else
+            [encoder dispatchThreads:MTLSizeMake((NSUInteger)elements, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    }
     [encoder endEncoding];
     return 0;
 }
@@ -767,6 +840,8 @@ static void lfm_metal_destroy(void *context, SaltTextModelGpuBackend backend,
     if (state->q6) [state->q6 release];
     if (state->q6_warp) [state->q6_warp release];
     if (state->f32) [state->f32 release];
+    if (state->f32_tile) [state->f32_tile release];
+    if (state->q4_matrix) [state->q4_matrix release];
     if (state->bf16) [state->bf16 release];
     if (state->activation) [state->activation release];
     if (state->router_scores) [state->router_scores release];
@@ -781,6 +856,7 @@ static void lfm_metal_destroy(void *context, SaltTextModelGpuBackend backend,
 
 static const SaltTextModelGpuOps LFM_METAL_OPS = {
     .state_bytes = sizeof(LfmMetalState),
+    .flags = LFM_METAL_Q4_MATRIX ? SALT_TEXT_MODEL_GPU_Q4_PROJECT : 0u,
     .prepare = lfm_metal_prepare,
     .project = lfm_metal_project,
     .embedding = lfm_metal_embedding,

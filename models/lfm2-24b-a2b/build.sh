@@ -43,12 +43,41 @@ esac
 FLAGS=(-std=c99 -O2 -flto -Wall -Wextra -Werror -pedantic -pthread -ffp-contract=off
   -D_POSIX_C_SOURCE=200809L -Iinclude -Isrc -Imodels/lfm2-24b-a2b)
 if [[ $BACKEND == metal ]]; then
+  MODEL_METAL_MIXED_DECODE=
+  while IFS='=' read -r key value; do
+    if [[ $key == LFM_METAL_MIXED_DECODE ]]; then
+      MODEL_METAL_MIXED_DECODE=$value
+      break
+    fi
+  done < models/lfm2-24b-a2b/engine.config
+  [[ -n $MODEL_METAL_MIXED_DECODE ]] || {
+    echo 'LFM_BUILD_FAIL model Metal decode policy is missing' >&2
+    exit 2
+  }
+  LFM_METAL_MIXED_DECODE=${LFM_METAL_MIXED_DECODE:-$MODEL_METAL_MIXED_DECODE}
+  case "$LFM_METAL_MIXED_DECODE" in
+    0|1) ;;
+    *) echo 'LFM_BUILD_FAIL LFM_METAL_MIXED_DECODE must be 0 or 1' >&2; exit 2 ;;
+  esac
+  export LFM_METAL_MIXED_DECODE
   FLAGS+=(-Wno-overlength-strings -DLFM_GPU_METAL=1)
   if [[ ${LFM_METAL_TILED_ATTENTION:-0} == 1 ]]; then
     FLAGS+=(-DLFM_METAL_TILED_ATTENTION=1)
   fi
   if [[ ${LFM_METAL_Q6_WARP:-0} == 1 ]]; then
     FLAGS+=(-DLFM_METAL_Q6_WARP=1)
+  fi
+  if [[ ${LFM_METAL_F32_TILE:-0} == 1 ]]; then
+    FLAGS+=(-DLFM_METAL_F32_TILE=1)
+  fi
+  if [[ ${LFM_METAL_Q4_MATRIX:-0} == 1 ]]; then
+    FLAGS+=(-DLFM_METAL_Q4_MATRIX=1)
+  fi
+  if [[ ${LFM_METAL_DEFER_EXPERT_RELEASE:-0} == 1 ]]; then
+    FLAGS+=(-DSALT_METAL_DEFER_EXPERT_RELEASE=1)
+  fi
+  if [[ ${LFM_METAL_MIXED_DECODE:-0} == 1 ]]; then
+    FLAGS+=(-DLFM_METAL_MIXED_DECODE=1)
   fi
 fi
 if [[ $(uname -s) == Linux ]]; then FLAGS+=(-D_GNU_SOURCE); fi
@@ -147,7 +176,15 @@ receipt = {
     'source_sha256': {p: hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest()
                       for p in sorted(paths)},
     'flags': ('C99 O2 pthread ffp-contract=off backend=' +
-              os.environ['LFM_RECEIPT_BACKEND']),
+              os.environ['LFM_RECEIPT_BACKEND'] +
+              ' metal_f32_tile=' +
+              os.environ.get('LFM_METAL_F32_TILE', '0') +
+              ' metal_q4_matrix=' +
+              os.environ.get('LFM_METAL_Q4_MATRIX', '0') +
+              ' metal_defer_expert_release=' +
+              os.environ.get('LFM_METAL_DEFER_EXPERT_RELEASE', '0') +
+              ' metal_mixed_decode=' +
+              os.environ.get('LFM_METAL_MIXED_DECODE', '0')),
     'entry_scope': 'authenticated-native-inference',
     'inference_ready': True,
     'runtime_qualified': True,

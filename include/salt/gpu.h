@@ -242,7 +242,9 @@ int salt_gpu_attention_batch(
     const SaltGpuSharedBuffer *kv, size_t key_float_offset,
     size_t value_float_offset, int start_position, int batch,
     int query_stride, int kv_stride, SaltGpuSharedBuffer *outputs,
-    size_t output_float_offset);
+    size_t output_float_offset, SaltGpuSharedBuffer *score_workspace,
+    size_t score_float_offset, size_t score_stride,
+    int score_task_capacity);
 /* Allocate the backend-owned device mirror for one fixed canonical KV arena.
  * Must run at model initialization before any attention submission. */
 int salt_gpu_attention_prepare(const SaltGpuSharedBuffer *kv);
