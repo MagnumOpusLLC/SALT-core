@@ -74,6 +74,10 @@ static float lfm_bf16(uint16_t bits) {
 #define LFM_INDEX_CAPACITY (4096 + LFM_MOE_LAYERS * LFM_EXPERTS * 4)
 #define LFM_RESOURCE_COUNT (1 + LFM_MOE_LAYERS * LFM_EXPERTS)
 
+#ifndef LFM_METAL_MIXED_DECODE
+#define LFM_METAL_MIXED_DECODE 0
+#endif
+
 struct LfmRuntime {
     const SaltModelDesc *model;
     uint32_t context, batch, workers, slots;
@@ -108,6 +112,9 @@ struct LfmRuntime {
     void *program_arena;
     size_t program_bytes;
     SaltTextVerifyProgram program;
+    void *decode_program_arena;
+    size_t decode_program_bytes;
+    SaltTextVerifyProgram decode_program;
 
     void *cpu_arena;
     size_t cpu_bytes;
@@ -122,8 +129,12 @@ struct LfmRuntime {
     int gpu_trunk_bound;
     int gpu_trunk_window;
     SaltTextVerifyExecutor executor;
+    SaltTextVerifyExecutor cpu_decode_executor;
+    int mixed_decode;
+    int cpu_decode_active;
 
     SaltTextTargetPolicy policy;
+    SaltTextTargetPolicy decode_policy;
     SaltTextDispatchPolicy dispatch_policy;
     SaltTextTokenEpochController controller;
     SaltTextSchedulerBindings bindings;
@@ -193,12 +204,41 @@ static int lfm_parallel_run(void *parallel_context, int active_workers,
 /* The forward entry: one prefill over the supplied rows, and the hidden state
  * of the last row when the caller asks for logits. */
 static int lfm_execute_rows(LfmRuntime *m, const int32_t *ids, uint32_t count,
-                            int head, float *logits) {
+                            int head, int decode, float *logits) {
     SaltTextExecuteAllResult r;
+    SaltTextVerifyExecutor *executor;
+    const SaltTextVerifyProgram *program;
     uint64_t generation;
     memset(&r, 0, sizeof r);
+    executor = &m->executor;
+    program = &m->program;
+#if defined(LFM_GPU_METAL)
+    if (m->mixed_decode && (decode || m->cpu_decode_active)) {
+        if (!m->cpu_decode_active) {
+            size_t source_offset = m->program.layout.model_state;
+            size_t destination_offset = m->decode_program.layout.model_state;
+            size_t bytes = m->program.layout.model_state_bytes;
+            if (!m->canonical_base || !m->cpu.ready || !m->cpu.arena ||
+                !m->decode_program.ready ||
+                bytes != m->decode_program.layout.model_state_bytes ||
+                source_offset > m->program.layout.total_bytes ||
+                bytes > m->program.layout.total_bytes - source_offset ||
+                destination_offset > m->decode_program.layout.total_bytes ||
+                bytes > m->decode_program.layout.total_bytes - destination_offset ||
+                m->cpu.arena_bytes < m->decode_program.layout.total_bytes)
+                return -1;
+            memcpy(m->cpu.arena + destination_offset,
+                   m->canonical_base + source_offset, bytes);
+            m->cpu_decode_active = 1;
+        }
+        executor = &m->cpu_decode_executor;
+        program = &m->decode_program;
+    }
+#else
+    (void)decode;
+#endif
     generation = m->state.transition_generation + 1u;
-    if (salt_text_execute_prefill(&m->program, &m->executor,
+    if (salt_text_execute_prefill(program, executor,
                                   generation,
                                   m->state.position, ids, count,
                                   (uint32_t)head, &r)) {
@@ -227,14 +267,14 @@ static int lfm_execute_rows(LfmRuntime *m, const int32_t *ids, uint32_t count,
      * tied head again in the wrapper. */
     if (head && logits)
         memcpy(logits,
-               r.view.canonical_base + m->program.layout.position_logits +
+               r.view.canonical_base + program->layout.position_logits +
                    (size_t)(count - 1u) * (size_t)LFM_VOCAB * sizeof(float),
                (size_t)LFM_VOCAB * sizeof(float));
     return lfm_memory_gate(m);
 }
 
 static int lfm_step_known(void *context, int32_t token, float *logits) {
-    return lfm_execute_rows((LfmRuntime *)context, &token, 1u, 1, logits);
+    return lfm_execute_rows((LfmRuntime *)context, &token, 1u, 1, 1, logits);
 }
 
 static int lfm_is_stop(void *context, int32_t token) {
@@ -563,6 +603,9 @@ int lfm_runtime_open(LfmRuntime **out, int trunk_fd, int pool_fd, int index_fd,
     m->rss_limit = rss_limit;
     m->model_gpu_ops = lfm_gpu_ops();
     m->gpu_mode = m->model_gpu_ops != NULL;
+#if defined(LFM_GPU_METAL)
+    m->mixed_decode = m->gpu_mode && LFM_METAL_MIXED_DECODE;
+#endif
 #if defined(LFM_GPU_CUDA)
     m->full_resident = m->gpu_mode && slots == LFM_EXPERT_COUNT;
 #endif
@@ -797,6 +840,19 @@ int lfm_runtime_open(LfmRuntime **out, int trunk_fd, int pool_fd, int index_fd,
                                          batch, m->program_arena,
                                          m->program_bytes))
         goto fail;
+#if defined(LFM_GPU_METAL)
+    if (m->mixed_decode) {
+        if (salt_text_verify_program_arena_requirement(&m->descriptor, workers,
+                &m->decode_program_bytes) != 0)
+            goto fail;
+        m->decode_program_arena = calloc(1u, m->decode_program_bytes);
+        if (!m->decode_program_arena ||
+            salt_text_verify_program_compile(&m->decode_program,
+                &m->descriptor, &m->state, workers, m->decode_program_arena,
+                m->decode_program_bytes) != 0)
+            goto fail;
+    }
+#endif
     m->open_stage = 7;
 
     /* One immutable program; CPU and GPU are alternative physical executors. */
@@ -822,6 +878,24 @@ int lfm_runtime_open(LfmRuntime **out, int trunk_fd, int pool_fd, int index_fd,
     m->policy.ready = 1;
     if (salt_text_verify_program_bind_target_policy(&m->program, &m->policy))
         goto fail;
+#if defined(LFM_GPU_METAL)
+    if (m->mixed_decode) {
+        memset(&m->decode_policy, 0, sizeof m->decode_policy);
+        m->decode_policy.execution_class = SALT_TEXT_EXECUTION_CPU_ONLY;
+        m->decode_policy.worker_budget = workers;
+        m->decode_policy.sequence_tiles = workers;
+        m->decode_policy.target_rows = 1u;
+        m->decode_policy.route_count = 1u;
+        m->decode_policy.queue_length = 1u;
+        m->decode_policy.candidate_count = workers;
+        m->decode_policy.kv_warmup_rows = 1u;
+        m->decode_policy.warm_target_rows = 1u;
+        m->decode_policy.ready = 1;
+        if (salt_text_verify_program_bind_target_policy(
+                &m->decode_program, &m->decode_policy) != 0)
+            goto fail;
+    }
+#endif
     m->open_stage = 71;
     m->pool_threads.nthreads = (int)workers;
     m->pool_threads.apool_threads = (int)workers;
@@ -876,6 +950,27 @@ int lfm_runtime_open(LfmRuntime **out, int trunk_fd, int pool_fd, int index_fd,
             m->open_stage = 717;
             goto fail;
         }
+#if defined(LFM_GPU_METAL)
+        if (m->mixed_decode) {
+            if (salt_text_verify_cpu_arena_requirement(
+                    &m->decode_program, &m->cpu_bytes) != 0) {
+                m->open_stage = 719;
+                goto fail;
+            }
+            m->cpu_arena = calloc(1u, m->cpu_bytes);
+            if (!m->cpu_arena ||
+                salt_text_verify_cpu_compile(&m->cpu, &m->decode_program,
+                    m->cpu_arena, m->cpu_bytes) != 0 ||
+                salt_text_verify_cpu_parallel_bind(&m->cpu, lfm_parallel_run,
+                    &m->pool_threads, m->pool_threads.asc8,
+                    (size_t)8u * context, workers) != 0 ||
+                salt_text_verify_cpu_executor_init(
+                    &m->cpu_decode_executor, &m->cpu) != 0) {
+                m->open_stage = 720;
+                goto fail;
+            }
+        }
+#endif
         {
             SaltTextTouchedSpan spans[SALT_TEXT_MAX_TOUCHED_SPANS];
             uint32_t score_rows = 0u, span_count = 0u;
@@ -940,7 +1035,8 @@ int lfm_runtime_open(LfmRuntime **out, int trunk_fd, int pool_fd, int index_fd,
             "LFM_READY backend=%s expert_mode=%s context=%u batch=%u workers=%u "
             "expert_slots=%d expert_bytes=%lld live_kv_bytes=%zu "
             "index_entries=%d\n",
-            m->gpu_mode ? "gpu" : "cpu",
+            m->gpu_mode ? (m->mixed_decode ? "gpu-prefill-cpu-decode" : "gpu")
+                        : "cpu",
             m->full_resident ? "full-resident" : "limited",
             context, batch, workers, slots, (long long)LFM_EXPERT_BYTES,
             m->live_floats * sizeof(float), m->index.count);
@@ -995,8 +1091,10 @@ int lfm_runtime_generate(LfmRuntime *m, const int32_t *prompt_ids,
             uint32_t active = prompt_count - first;
             int final;
             if (active > m->batch) active = m->batch;
+            if (m->cpu_decode_active && active > m->workers)
+                active = m->workers;
             final = first + active == prompt_count;
-            if (lfm_execute_rows(m, prompt_ids + first, active, final,
+            if (lfm_execute_rows(m, prompt_ids + first, active, final, 0,
                     final ? m->logits : NULL))
                 return -1;
             first += active;
@@ -1013,7 +1111,7 @@ int lfm_runtime_generate(LfmRuntime *m, const int32_t *prompt_ids,
             break;
         if (m->state.position + 1u > m->context)
             break;
-        if (lfm_execute_rows(m, &next, 1u, 1, m->logits))
+        if (lfm_execute_rows(m, &next, 1u, 1, 1, m->logits))
             return -1;
     }
     request_end = lfm_clock_ns();
@@ -1046,12 +1144,14 @@ static void lfm_digest_hex(const uint8_t digest[32], char out[65]) {
 
 int lfm_runtime_state_digests(const LfmRuntime *m,
         LfmRuntimeStateDigests *digests) {
+    const SaltTextVerifyProgram *active_program;
     SaltSha256 kv_hash;
     uint8_t state_bytes[12], digest[32];
     uint64_t kv_bytes = 0u;
     if (!m || !digests || !m->canonical_base || !m->live ||
         m->state.position > m->context)
         return -1;
+    active_program = m->cpu_decode_active ? &m->decode_program : &m->program;
     memset(digests, 0, sizeof *digests);
 #if defined(LFM_GPU_HIP)
     if (m->gpu_mode) {
@@ -1097,21 +1197,21 @@ int lfm_runtime_state_digests(const LfmRuntime *m,
     }
     salt_sha256_final(&kv_hash, digest);
     lfm_digest_hex(digest, digests->kv_sha256);
-    if (m->gpu_mode) {
+    if (m->gpu_mode && !m->cpu_decode_active) {
         const SaltGpuSharedBuffer *canonical = m->gpu.canonical;
         if (!canonical || canonical->contents != m->canonical_base ||
             !canonical->backend ||
-            m->program.layout.model_state > canonical->nbytes ||
-            m->program.layout.model_state_bytes > canonical->nbytes -
-                m->program.layout.model_state ||
-            lfm_gpu_canonical_readback(canonical->contents,
-                canonical->backend, m->program.layout.model_state,
-                m->program.layout.model_state_bytes) != 0)
+            active_program->layout.model_state > canonical->nbytes ||
+            active_program->layout.model_state_bytes > canonical->nbytes -
+                active_program->layout.model_state ||
+            lfm_gpu_canonical_readback(canonical->contents, canonical->backend,
+                active_program->layout.model_state,
+                active_program->layout.model_state_bytes) != 0)
             return -1;
     }
     if (salt_sha256_bytes(
-            m->canonical_base + m->program.layout.model_state,
-            m->program.layout.model_state_bytes, digest) != 0)
+            m->canonical_base + active_program->layout.model_state,
+            active_program->layout.model_state_bytes, digest) != 0)
         return -1;
     lfm_digest_hex(digest, digests->model_state_sha256);
     if (!m->logits || salt_sha256_bytes(m->logits,
@@ -1119,7 +1219,7 @@ int lfm_runtime_state_digests(const LfmRuntime *m,
         return -1;
     lfm_digest_hex(digest, digests->logits_sha256);
     digests->kv_bytes = kv_bytes;
-    digests->model_state_bytes = m->program.layout.model_state_bytes;
+    digests->model_state_bytes = active_program->layout.model_state_bytes;
     digests->transition_generation = m->state.transition_generation;
     digests->position = m->state.position;
     return 0;
@@ -1150,6 +1250,7 @@ void lfm_runtime_close(LfmRuntime *m) {
     if (m->trunk)
         munmap(m->trunk, m->trunk_bytes);
     free(m->program_arena);
+    free(m->decode_program_arena);
     free(m->cpu_arena);
     free(m->gpu_arena);
     free(m->conv_kernels);

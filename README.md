@@ -21,9 +21,10 @@ CUDA, and HIP physical backends.
 > This is a disclosure and responsible-use standard, not a claim of implemented
 > safeguards or an amendment to the software license.
 
-The curated runtime source now matches merged private `main` revision
-`90b9c82b11eb18116f6dc4f18146c0e36100f58b`
-(`2026-10-17T08:23:20-04:00`) for the exported runtime paths. This updates
+The curated runtime source now includes private Salt review commit
+`f58d6fd5059e9046cb462a7eaff7441b19bf56eb`
+(`2026-10-22T01:19:21-04:00`) for the exported runtime paths, based on merged
+private `main` revision `90b9c82b11eb18116f6dc4f18146c0e36100f58b`. This updates
 source bytes, not the historical proof pins or platform qualification. It
 contains no model weights. Model artifacts retain their own licenses and must
 be obtained separately.

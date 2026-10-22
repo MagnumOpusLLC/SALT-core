@@ -64,6 +64,13 @@ curated public smoke suite; explicit model builds remain separate targets.
 Passing source/build/smoke checks does not substitute for authenticated ordinary
 inference and complete KV/state comparison on a real model package.
 
+On Darwin, `make test` compiles `src/gpu_metal.m` and executes the mapped routed-
+MoE and mapped-trunk lifecycle gates against the real Metal device. The backend
+compiles its embedded MSL through the Metal framework at runtime; the optional
+`salt-gpu.metallib` target is not a prerequisite for Gemma QA or public smoke
+validation. These are component/resource gates, not a new real-model performance
+claim.
+
 The formal bundle preserves its own source hashes and historical proof results.
 Advancing the exported runtime pin does not turn those historical proofs into a
 current native-source refinement or a concrete KV bit-identity certificate.

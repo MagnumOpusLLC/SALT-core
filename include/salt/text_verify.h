@@ -235,6 +235,8 @@ typedef enum SaltTextModelGpuBackend {
 
 typedef struct SaltTextModelGpuTensorView {
     void *resource;
+    void *scale_resource;
+    void *bias_resource;
     uint64_t value_offset;
     uint64_t scale_offset;
     uint64_t bias_offset;
@@ -398,6 +400,8 @@ typedef struct SaltTextModelGpuExpertChainArgs {
 
 enum {
     SALT_TEXT_MODEL_GPU_EXTENT_GRAPHS = 1u << 0,
+    /* The model callback owns an exact affine-Q4 projection lowering. */
+    SALT_TEXT_MODEL_GPU_Q4_PROJECT = 1u << 1,
 };
 
 typedef struct SaltTextModelGpuOps {

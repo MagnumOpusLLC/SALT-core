@@ -48,6 +48,11 @@ endif
 VISION_LIBS =
 GEMMA4_BUILD_BLAS_ABI = none
 endif
+ifeq ($(shell uname),Darwin)
+PUBLIC_METAL_TEST = test-gpu-trunk
+else
+PUBLIC_METAL_TEST =
+endif
 ARCHFLAGS ?=
 CFLAGS += $(ARCHFLAGS)
 OBJCFLAGS += $(ARCHFLAGS)
@@ -199,7 +204,7 @@ GEMMA4_QA_SRC = models/gemma4-26b-a4b/src/gemma4_text.c \
 # SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
 GEMMA4_QA_SRC += src/gpu_residency.c
 # SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
-gemma4-qa: tools/gemma4-qa.c models/gemma4-26b-a4b/src/gemma4_kv_file.h $(GEMMA4_QA_SRC) $(HDR) $(METAL_LIB) \
+gemma4-qa: tools/gemma4-qa.c models/gemma4-26b-a4b/src/gemma4_kv_file.h $(GEMMA4_QA_SRC) $(HDR) \
 		$(GEMMA4_KV_COMPAT_TOOL) $(GEMMA4_KV_COMPAT_MANIFEST) \
 		$(GEMMA4_KV_COMPAT_DEPS)
 	$(CC) $(GEMMA4_CFLAGS) $(GEMMA4_KV_COMPAT_CFLAG) $(INC) -o $@ \
@@ -699,17 +704,6 @@ test-gpu-rocm-residency: test-gpu-rocm-exact
 		/tmp/salt-gpu-rocm-residency.o /tmp/salt-gpu-rocm-bitmath.o \
 		/tmp/salt-gpu-rocm-gemma4.o
 # SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
-test-gpu-metal-exact: src/gpu_metal.o $(METAL_LIB)
-	$(CC) $(GEMMA4_CFLAGS) $(INC) \
-		tools/test/gpu-cuda-exact-test.c src/kernels.c src/simd.c \
-		src/gpu_resource.c src/bitmath.c \
-		models/gemma4-26b-a4b/src/gemma4.c src/gpu_metal.o \
-		-lpthread -lm -framework Metal -framework Foundation \
-		-o /tmp/salt-gpu-metal-exact-test
-	SALT_METAL_LIBRARY=$(abspath $(METAL_LIB)) \
-		SALT_METAL_Q4_SIMDGROUPS=0 SALT_METAL_Q4_MAX_DESCRIPTORS=128 \
-		SALT_METAL_Q4_WEIGHT_STATIONARY_MIN_B=16 \
-		SALT_TEST_PRODUCTION_SHAPES_ONLY=1 /tmp/salt-gpu-metal-exact-test
 
 test-gpu-cuda-heterogeneous: src/gpu_cuda.o $(CUDA_TEXT_SUPPORT_OBJS)
 	$(CC) $(GEMMA4_CFLAGS) $(INC) \
@@ -848,7 +842,7 @@ test-lfm-public:
 			src/model.c -lm; \
 		"$$binary"
 
-test-public-smoke: test-lfm-public
+test-public-smoke: test-lfm-public $(PUBLIC_METAL_TEST)
 	env -u PYTHONPATH "$(GEMMA4_E2E_PYTHON)" tools/test/engine-config-test.py
 	env -u PYTHONPATH "$(GEMMA4_E2E_PYTHON)" tools/test/gemma4-tools-test.py
 	env -u PYTHONPATH "$(GEMMA4_E2E_PYTHON)" tools/test/gpu-metal-selected-capacity-test.py

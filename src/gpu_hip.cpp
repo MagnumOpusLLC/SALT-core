@@ -163,6 +163,8 @@ static SaltTextModelGpuTensorView hip_text_model_view(
     SaltTextModelGpuTensorView view = {};
     if (!ref) return view;
     view.resource = (void *)ref->resource;
+    view.scale_resource = view.resource;
+    view.bias_resource = view.resource;
     view.value_offset = ref->value_offset;
     view.scale_offset = ref->scale_offset;
     view.bias_offset = ref->bias_offset;
@@ -5779,13 +5781,19 @@ extern "C" int salt_gpu_attention_batch(
     const SaltGpuSharedBuffer *kv, size_t key_float_offset,
     size_t value_float_offset, int start_position, int batch,
     int query_stride, int kv_stride, SaltGpuSharedBuffer *outputs,
-    size_t output_float_offset) {
+    size_t output_float_offset, SaltGpuSharedBuffer *score_workspace,
+    size_t score_float_offset, size_t score_stride,
+    int score_task_capacity) {
     float *host_queries, *host_keys, *host_values, *host_outputs;
     uint64_t query_count, kv_count, output_count, tasks, new_kv_count;
     HipAttentionKvSync *sync = NULL;
     int staged, deferred_publish;
     int failure = 0;
     size_t kv_rows, score_rows, score_bytes;
+    (void)score_workspace;
+    (void)score_float_offset;
+    (void)score_stride;
+    (void)score_task_capacity;
     if (!hip_ready || (full_attention != 0 && full_attention != 1) ||
         n_heads < 1 || n_kv_heads < 1 || n_heads % n_kv_heads != 0 ||
         head_dim < 1 || head_dim > 512 || (!full_attention && window < 1) ||

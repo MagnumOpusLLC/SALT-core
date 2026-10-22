@@ -577,6 +577,9 @@ struct SaltGemma4Text {
     float *prefill_attention_outputs;
     float *prefill_attention_branches;
     int prefill_attention_capacity;
+    size_t prefill_attention_score_offset;
+    size_t prefill_attention_score_stride;
+    int prefill_attention_score_tasks;
 
     int prefill_capacity;
     uint64_t prefill_ffn_arena_bytes;
@@ -3318,6 +3321,23 @@ static int init_compute_pool(SaltGemma4Text *model) {
                 (float *)model->compute_scratch_shared.contents,
                 (long)scratch_floats) != 0)
             return -1;
+        if (model->gpu_attention_enabled) {
+            size_t attention_floats = attention_bytes / sizeof(float);
+            size_t available_floats;
+            size_t tasks;
+            if (attention_bytes % sizeof(float) != 0 ||
+                attention_floats > scratch_floats)
+                return -1;
+            available_floats = scratch_floats - attention_floats;
+            tasks = available_floats / (size_t)model->max_context;
+            if (tasks > 2048u) tasks = 2048u;
+            if (tasks < 1u || tasks > INT_MAX)
+                return -1;
+            model->prefill_attention_score_offset = attention_floats;
+            model->prefill_attention_score_stride =
+                (size_t)model->max_context;
+            model->prefill_attention_score_tasks = (int)tasks;
+        }
     } else if (salt_kv_scratch_init(
             &model->compute_pool, (long)scratch_floats) != 0) {
         return -1;
@@ -6882,7 +6902,12 @@ static int g4_gpu_attention_body_rows(
             plan->window, query_buffer, query_offset,
             &model->kv_shared, key_offset, value_offset,
             start, batch, layer->q_dim, layer->kv_dim,
-            output_buffer, output_offset) != 0)
+            output_buffer, output_offset,
+            model->prefill_attention_score_tasks > 0
+                ? &model->compute_scratch_shared : NULL,
+            model->prefill_attention_score_offset,
+            model->prefill_attention_score_stride,
+            model->prefill_attention_score_tasks) != 0)
         return -1;
     model->gpu_attention_batches++;
     model->gpu_attention_tasks +=

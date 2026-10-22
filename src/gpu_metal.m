@@ -21,6 +21,10 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifndef SALT_METAL_DEFER_EXPERT_RELEASE
+#define SALT_METAL_DEFER_EXPERT_RELEASE 0
+#endif
 #include <unistd.h>
 
 static void metal_release(id object) {
@@ -79,6 +83,9 @@ static id<MTLBuffer> _bx, _by;    /* per-token x / y */
 static int _R = -1, _C = -1;
 static int _has_bias = 0;
 static id<MTLComputePipelineState> _transform_pso, _attention_pso;
+static id<MTLComputePipelineState> _attention_long_pso;
+static id<MTLComputePipelineState> _attention_scores_global_pso;
+static id<MTLComputePipelineState> _attention_reduce_global_pso;
 static id<MTLComputePipelineState> _activation_pso, _text_activation_pso, _q8_pso;
 static id<MTLComputePipelineState> _text_embedding_pso, _text_route_maps_pso;
 static id<MTLComputePipelineState> _text_routed_gather_pso;
@@ -95,6 +102,7 @@ static id<MTLComputePipelineState> _text_topk_rows_pso;
 static id<MTLComputePipelineState> _text_softcap_pso;
 static id<MTLComputePipelineState> _text_transform_view_pso;
 static id<MTLComputePipelineState> _text_attention_view_pso;
+static id<MTLComputePipelineState> _text_attention_view_long_pso;
 static id<MTLComputePipelineState> _exact_rms_pso, _exact_topk_pso;
 static id<MTLComputePipelineState> _exact_residual_pso, _exact_combine_pso;
 static id<MTLComputePipelineState> _exact_softcap_pso, _exact_router_pso;
@@ -105,6 +113,7 @@ typedef struct {
     size_t nbytes;
 } MetalSharedSlot;
 #define METAL_SHARED_SLOTS 8
+#define METAL_ATTENTION_SCORE_TILE 8192u
 static MetalSharedSlot _shared_slots[METAL_SHARED_SLOTS];
 
 static id<MTLLibrary> metal_library_for_source_mode(const char *source,
@@ -130,7 +139,9 @@ static id<MTLLibrary> metal_library_for_source(const char *source,
 }
 
 static int metal_ops_prepare(void) {
-    if (_transform_pso && _attention_pso && _activation_pso &&
+    if (_transform_pso && _attention_pso && _attention_long_pso &&
+        _attention_scores_global_pso && _attention_reduce_global_pso &&
+        _activation_pso &&
         _text_activation_pso && _q8_pso &&
         _text_embedding_pso && _text_route_maps_pso &&
         _text_routed_gather_pso && _text_expert_reduce_pso &&
@@ -139,7 +150,8 @@ static int metal_ops_prepare(void) {
         _text_residual_multi_pso && _text_router_multi_pso &&
         _text_rms_rows_pso && _text_residual_rows_pso &&
         _text_router_rows_pso && _text_topk_rows_pso && _text_softcap_pso &&
-        _text_transform_view_pso && _text_attention_view_pso)
+        _text_transform_view_pso && _text_attention_view_pso &&
+        _text_attention_view_long_pso)
         return 0;
     @autoreleasepool {
         NSError *err = nil;
@@ -153,6 +165,9 @@ static int metal_ops_prepare(void) {
         struct { const char *name; id<MTLComputePipelineState> *slot; } specs[] = {
             {"attention_transform", &_transform_pso},
             {"attention_exact", &_attention_pso},
+            {"attention_exact_long_parallel", &_attention_long_pso},
+            {"attention_scores_global_exact", &_attention_scores_global_pso},
+            {"attention_reduce_global_exact", &_attention_reduce_global_pso},
             {"moe_activate", &_activation_pso},
             {"text_activate", &_text_activation_pso},
             {"q8batch", &_q8_pso},
@@ -172,6 +187,7 @@ static int metal_ops_prepare(void) {
             {"text_softcap", &_text_softcap_pso},
             {"attention_transform_view", &_text_transform_view_pso},
             {"attention_exact_view", &_text_attention_view_pso},
+            {"attention_exact_view_long_parallel", &_text_attention_view_long_pso},
         };
         for (size_t i = 0; i < sizeof specs / sizeof specs[0]; i++) {
             id<MTLFunction> fn = [lib newFunctionWithName:
@@ -2803,14 +2819,22 @@ int salt_gpu_attention_batch(
     const SaltGpuSharedBuffer *kv, size_t key_float_offset,
     size_t value_float_offset, int start_position, int batch,
     int query_stride, int kv_stride, SaltGpuSharedBuffer *outputs,
-    size_t output_float_offset) {
-    id<MTLBuffer> qbuffer, kvbuffer, obuffer;
+    size_t output_float_offset, SaltGpuSharedBuffer *score_workspace,
+    size_t score_float_offset, size_t score_stride,
+    int score_task_capacity) {
+    id<MTLBuffer> qbuffer, kvbuffer, obuffer, score_buffer = nil;
     uint64_t qcount, kvcount, tasks;
-    size_t score_bytes;
+    size_t score_bytes, score_count = 0;
+    int global_scores;
     struct MetalAttentionArgs {
         uint32_t full, n_heads, n_kv_heads, head_dim, window;
         uint32_t start, batch, qstride, kvstride;
     } args;
+    struct MetalAttentionGlobalArgs {
+        uint32_t full, n_heads, n_kv_heads, head_dim, window;
+        uint32_t start, batch, qstride, kvstride;
+        uint32_t task_first, task_count, score_stride;
+    } global_args;
     if ((full_attention != 0 && full_attention != 1) || n_heads < 1 ||
         n_kv_heads < 1 || n_heads % n_kv_heads != 0 || head_dim < 1 ||
         head_dim > 512 || (!full_attention && window < 1) ||
@@ -2823,8 +2847,21 @@ int salt_gpu_attention_batch(
         (uint32_t)kv_stride;
     tasks = (uint64_t)(uint32_t)batch * (uint32_t)n_heads;
     score_bytes = (size_t)(start_position + batch) * sizeof(float);
+    global_scores = score_workspace && score_task_capacity > 0 &&
+        score_stride >= (size_t)(start_position + batch);
+    if (global_scores) {
+        if (score_stride > UINT32_MAX ||
+            (size_t)score_task_capacity > SIZE_MAX / score_stride)
+            return -1;
+        score_count = (size_t)score_task_capacity * score_stride;
+    } else if (score_bytes >
+            (size_t)METAL_ATTENTION_SCORE_TILE * sizeof(float)) {
+        score_bytes = (size_t)METAL_ATTENTION_SCORE_TILE * sizeof(float);
+    }
     if (qcount > SIZE_MAX || kvcount > SIZE_MAX || tasks > NSUIntegerMax ||
-        score_bytes > 32u * 1024u ||
+        (global_scores &&
+         (!_attention_scores_global_pso || !_attention_reduce_global_pso)) ||
+        (!global_scores && !_attention_long_pso) ||
         metal_shared_range(queries, query_float_offset, (size_t)qcount,
             &qbuffer) != 0 ||
         metal_shared_range(kv, key_float_offset, (size_t)kvcount,
@@ -2832,7 +2869,9 @@ int salt_gpu_attention_batch(
         value_float_offset > kv->nbytes / sizeof(float) ||
         (size_t)kvcount > kv->nbytes / sizeof(float) - value_float_offset ||
         metal_shared_range(outputs, output_float_offset, (size_t)qcount,
-            &obuffer) != 0)
+            &obuffer) != 0 ||
+        (global_scores && metal_shared_range(score_workspace,
+            score_float_offset, score_count, &score_buffer) != 0))
         return -1;
     *(uint32_t *)[_op_status contents] = 0;
     args = (struct MetalAttentionArgs) {
@@ -2843,24 +2882,73 @@ int salt_gpu_attention_batch(
     };
     @autoreleasepool {
         id<MTLCommandBuffer> cb = [_queue commandBuffer];
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-        if (!cb || !enc) return -1;
-        [enc setComputePipelineState:_attention_pso];
-        [enc setBuffer:qbuffer offset:query_float_offset * sizeof(float)
-                atIndex:0];
-        [enc setBuffer:kvbuffer offset:key_float_offset * sizeof(float)
-                atIndex:1];
-        [enc setBuffer:kvbuffer offset:value_float_offset * sizeof(float)
-                atIndex:2];
-        [enc setBuffer:obuffer offset:output_float_offset * sizeof(float)
-                atIndex:3];
-        [enc setBuffer:_op_status offset:0 atIndex:4];
-        [enc setBytes:&args length:sizeof args atIndex:5];
-        [enc setThreadgroupMemoryLength:score_bytes atIndex:0];
-        [enc setThreadgroupMemoryLength:2u * sizeof(float) atIndex:1];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)tasks, 1, 1)
-             threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
-        [enc endEncoding];
+        if (!cb) return -1;
+        if (global_scores) {
+            NSUInteger task_first = 0;
+            global_args = (struct MetalAttentionGlobalArgs) {
+                (uint32_t)full_attention, (uint32_t)n_heads,
+                (uint32_t)n_kv_heads, (uint32_t)head_dim,
+                (uint32_t)window, (uint32_t)start_position,
+                (uint32_t)batch, (uint32_t)query_stride,
+                (uint32_t)kv_stride, 0u, 0u, (uint32_t)score_stride,
+            };
+            while (task_first < (NSUInteger)tasks) {
+                NSUInteger remaining = (NSUInteger)tasks - task_first;
+                NSUInteger task_count = remaining < (NSUInteger)score_task_capacity
+                    ? remaining : (NSUInteger)score_task_capacity;
+                id<MTLComputeCommandEncoder> score = [cb computeCommandEncoder];
+                id<MTLComputeCommandEncoder> reduce;
+                if (!score) return -1;
+                global_args.task_first = (uint32_t)task_first;
+                global_args.task_count = (uint32_t)task_count;
+                [score setComputePipelineState:_attention_scores_global_pso];
+                [score setBuffer:qbuffer offset:query_float_offset * sizeof(float)
+                       atIndex:0];
+                [score setBuffer:kvbuffer offset:key_float_offset * sizeof(float)
+                       atIndex:1];
+                [score setBuffer:score_buffer
+                       offset:score_float_offset * sizeof(float) atIndex:2];
+                [score setBytes:&global_args length:sizeof global_args atIndex:3];
+                [score dispatchThreadgroups:MTLSizeMake(task_count, 1, 1)
+                       threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+                [score endEncoding];
+                reduce = [cb computeCommandEncoder];
+                if (!reduce) return -1;
+                [reduce setComputePipelineState:_attention_reduce_global_pso];
+                [reduce setBuffer:kvbuffer offset:value_float_offset * sizeof(float)
+                        atIndex:0];
+                [reduce setBuffer:obuffer offset:output_float_offset * sizeof(float)
+                        atIndex:1];
+                [reduce setBuffer:score_buffer
+                        offset:score_float_offset * sizeof(float) atIndex:2];
+                [reduce setBuffer:_op_status offset:0 atIndex:3];
+                [reduce setBytes:&global_args length:sizeof global_args atIndex:4];
+                [reduce setThreadgroupMemoryLength:2u * sizeof(float) atIndex:0];
+                [reduce dispatchThreadgroups:MTLSizeMake(task_count, 1, 1)
+                        threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+                [reduce endEncoding];
+                task_first += task_count;
+            }
+        } else {
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            if (!enc) return -1;
+            [enc setComputePipelineState:_attention_long_pso];
+            [enc setBuffer:qbuffer offset:query_float_offset * sizeof(float)
+                    atIndex:0];
+            [enc setBuffer:kvbuffer offset:key_float_offset * sizeof(float)
+                    atIndex:1];
+            [enc setBuffer:kvbuffer offset:value_float_offset * sizeof(float)
+                    atIndex:2];
+            [enc setBuffer:obuffer offset:output_float_offset * sizeof(float)
+                    atIndex:3];
+            [enc setBuffer:_op_status offset:0 atIndex:4];
+            [enc setBytes:&args length:sizeof args atIndex:5];
+            [enc setThreadgroupMemoryLength:score_bytes atIndex:0];
+            [enc setThreadgroupMemoryLength:2u * sizeof(float) atIndex:1];
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)tasks, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+            [enc endEncoding];
+        }
         [cb commit];
         [cb waitUntilCompleted];
         if (metal_command_succeeded(cb) != 0) return -1;
@@ -3597,6 +3685,11 @@ static int salt_gpu_free_impl(void) {
     metal_release(_bqueue2); _bqueue2 = nil;
     metal_release(_transform_pso); _transform_pso = nil;
     metal_release(_attention_pso); _attention_pso = nil;
+    metal_release(_attention_long_pso); _attention_long_pso = nil;
+    metal_release(_attention_scores_global_pso);
+    _attention_scores_global_pso = nil;
+    metal_release(_attention_reduce_global_pso);
+    _attention_reduce_global_pso = nil;
     metal_release(_activation_pso); _activation_pso = nil;
     metal_release(_text_activation_pso); _text_activation_pso = nil;
     metal_release(_q8_pso); _q8_pso = nil;
@@ -3616,6 +3709,8 @@ static int salt_gpu_free_impl(void) {
     metal_release(_text_softcap_pso); _text_softcap_pso = nil;
     metal_release(_text_transform_view_pso); _text_transform_view_pso = nil;
     metal_release(_text_attention_view_pso); _text_attention_view_pso = nil;
+    metal_release(_text_attention_view_long_pso);
+    _text_attention_view_long_pso = nil;
     metal_release(_exact_rms_pso); _exact_rms_pso = nil;
     metal_release(_exact_topk_pso); _exact_topk_pso = nil;
     metal_release(_exact_residual_pso); _exact_residual_pso = nil;
@@ -4220,6 +4315,8 @@ static SaltTextModelGpuTensorView metal_text_model_view(
     memset(&view, 0, sizeof view);
     if (!ref) return view;
     view.resource = (void *)ref->value;
+    view.scale_resource = (void *)ref->scale;
+    view.bias_resource = (void *)ref->bias;
     view.value_offset = (uint64_t)ref->value_offset;
     view.scale_offset = (uint64_t)ref->scale_offset;
     view.bias_offset = (uint64_t)ref->bias_offset;
@@ -4442,7 +4539,12 @@ static int metal_text_requirements(
     requirements->backend_state_bytes = backend_bytes;
     requirements->command_bytes = sizeof(MetalTextProgramCommand);
     requirements->maximum_commands = program->dispatch.cell_count;
-    requirements->flags = 0;
+    /* Optional CUDA-parity control: expert consumers remain ordered in the
+     * current command buffer through reduction/combine.  The next
+     * NEED_RESOURCE completion (or final finish) is then the existing fence
+     * that makes their slots reusable. */
+    requirements->flags = SALT_METAL_DEFER_EXPERT_RELEASE
+        ? SALT_TEXT_GPU_DEFER_EXPERT_RELEASE : 0u;
     return 0;
 }
 
@@ -4917,8 +5019,12 @@ static int metal_text_encode_projection(
         ref->cols == 0 || input_offset % sizeof(float) != 0 ||
         output_offset % sizeof(float) != 0)
         return -1;
-    if (ref->encoding != SALT_TENSOR_ENCODING_AFFINE_Q4 &&
-        ref->encoding != SALT_TENSOR_ENCODING_AFFINE_Q8) {
+    if ((ref->encoding != SALT_TENSOR_ENCODING_AFFINE_Q4 &&
+         ref->encoding != SALT_TENSOR_ENCODING_AFFINE_Q8) ||
+        (ref->encoding == SALT_TENSOR_ENCODING_AFFINE_Q4 &&
+         state->model_gpu_ops && state->model_gpu_ops->project &&
+         (state->model_gpu_ops->flags &
+             SALT_TEXT_MODEL_GPU_Q4_PROJECT) != 0u)) {
         SaltTextModelGpuProjectArgs args;
         int rc;
         if (!state->model_gpu_ops || !state->model_gpu_ops->project)
@@ -5427,6 +5533,7 @@ static int metal_text_encode_attention_body(
     size_t private_ko, private_vo, shared_ko, shared_vo;
     uint32_t shared_kr, shared_vr, shared_ks, shared_vs;
     id<MTLComputeCommandEncoder> encoder;
+    id<MTLComputePipelineState> attention_pipeline;
     struct {
         uint32_t full, n_heads, n_kv_heads, head_dim, window;
         uint32_t source, batch, qstride, kvstride;
@@ -5436,6 +5543,7 @@ static int metal_text_encode_attention_body(
     } args;
     uint64_t tasks;
     size_t score_bytes;
+    int long_attention;
     if (!kv || metal_text_kv_rows(&kv->keys, compiled->kv_width,
             &private_k, &private_ko, &shared_k, &shared_ko,
             &shared_kr, &shared_ks) != 0 ||
@@ -5464,11 +5572,17 @@ static int metal_text_encode_attention_body(
     args.score_scale = attention->score_scale;
     tasks = (uint64_t)command->input_count * attention->n_heads;
     score_bytes = (size_t)command->attention_score_rows * sizeof(float);
-    if (tasks == 0 || tasks > NSUIntegerMax || score_bytes > 32u * 1024u)
+    long_attention = score_bytes >
+        (size_t)METAL_ATTENTION_SCORE_TILE * sizeof(float);
+    attention_pipeline = long_attention
+        ? _text_attention_view_long_pso : _text_attention_view_pso;
+    if (long_attention)
+        score_bytes = (size_t)METAL_ATTENTION_SCORE_TILE * sizeof(float);
+    if (tasks == 0 || tasks > NSUIntegerMax || !attention_pipeline)
         return -1;
     encoder = [command->command computeCommandEncoder];
     if (!encoder) return -1;
-    [encoder setComputePipelineState:_text_attention_view_pso];
+    [encoder setComputePipelineState:attention_pipeline];
     [encoder setBuffer:(id<MTLBuffer>)state->canonical.backend
                 offset:layout->queries atIndex:0];
     [encoder setBuffer:private_k offset:private_ko atIndex:1];
@@ -5849,8 +5963,9 @@ static int metal_text_dependency_barrier(
     if (upcoming->kind == SALT_TEXT_CELL_EXPERT_REDUCTION &&
         command->phase == METAL_TEXT_RECORDING_EXPERT) {
         if (command->expert_chain_mask != 15u ||
-            metal_text_complete_command(command) != 0 ||
-            metal_text_new_command(command) != 0)
+            (!SALT_METAL_DEFER_EXPERT_RELEASE &&
+             (metal_text_complete_command(command) != 0 ||
+              metal_text_new_command(command) != 0)))
             return -1;
         command->phase = METAL_TEXT_RECORDING_SUFFIX;
         command->active_layer = UINT32_MAX;
