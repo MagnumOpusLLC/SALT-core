@@ -33,3 +33,14 @@ __pycache__/
 /bench-kernels
 /validate-shapes
 /tools/tokenc
+.DS_Store
+
+# Rotation runtime products and offline evidence
+/rotation/bin/
+/rotation/validation/
+/rotation/manifest-viewer/
+/rotation/tools/
+/rotation/*.md
+/rotation/**/*.md
+/rotation/mtp/artifact-q4/
+/salt-manifest-*.txt
