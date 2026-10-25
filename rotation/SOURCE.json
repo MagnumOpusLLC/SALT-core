@@ -1,0 +1,22 @@
+{
+  "schema": "salt.rotation.open-core-source.v1",
+  "source_commit": "367eb668db1b9e27021c1b1ba613279f3bf75dc6",
+  "source_timestamp": "2026-10-25 00:08:17 -0400",
+  "source_merged_main_base": "32b0ed497b6cd82e89a8f9ef7a9535e0f9faa24f",
+  "source_merged_main_timestamp": "2026-10-23 17:11:20 -0400",
+  "exported_paths": 116,
+  "public_adaptations": {
+    "rotation/build-server.sh": "Use the repository .venv Python by default.",
+    "rotation/build-server-cpu.sh": "Use the repository .venv Python by default.",
+    "rotation/engine.config": "Keep the external MTP assistant disabled until its separately supplied artifact is authenticated.",
+    "server/serve-launch.sh": "Canonicalize and forward the exact preload-state file validated by the public launcher."
+  },
+  "excluded": [
+    "rotation/validation",
+    "rotation/bin",
+    "rotation/manifest-viewer",
+    "rotation/tools",
+    "rotation Markdown working notes",
+    "model weights and generated state artifacts"
+  ]
+}

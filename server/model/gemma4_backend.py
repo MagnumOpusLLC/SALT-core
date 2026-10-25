@@ -4588,8 +4588,11 @@ class Gemma4Backend:
             },
             "failure_recovery": "dead-until-explicit-reset",
             "state_classes": {
-                "mindset_mode": "prefix",
-                "mindset_end": 0,
+                "mindset_mode": self.mindset_mode or "prefix",
+                "mindset_end": self.mindset_end,
+                "mindset_sha256": self.mindset_sha256 or None,
+                "shared_position": self.shared_position,
+                "startup_preloaded": self.shared_position > 0,
                 "separate_delta_state_qualified": False,
                 "facts": "optional-live-kv",
                 "clear_facts": "in-place-scrub",
