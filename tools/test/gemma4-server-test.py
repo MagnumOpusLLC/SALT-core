@@ -94,6 +94,88 @@ def main() -> None:
     assert sampled.top_k == 20
     assert sampled.rng_abi == "splitmix64-counter-v1"
 
+    logit_output = module.resolve_controls(
+        {"response_format": {"type": "salt_token_logits", "top_k": 8}},
+        server_kv_budget_gb=1.0,
+    )
+    assert logit_output.output_tokens == controls.output_tokens
+    assert logit_output.top_logprobs == 8
+    assert module.resolve_controls(
+        {"response_format": {"type": "text"}},
+        server_kv_budget_gb=1.0,
+    ).top_logprobs == 0
+    expect_request_error(
+        lambda: module.resolve_controls(
+            {"response_format": {"type": "salt_token_logits", "top_k": 9}},
+            server_kv_budget_gb=1.0,
+        ),
+        "integer from 1 to 8",
+    )
+    expect_request_error(
+        lambda: module.resolve_controls(
+            {"response_format": {"type": "salt_token_logits"}},
+            server_kv_budget_gb=1.0,
+        ),
+        "text or salt_token_logits",
+    )
+    native_logits = module._native_token_logits({
+        "request": "1", "seq": "1", "token_id": "7",
+        "selected_logit_bits": "3f800000",
+        "selected_probability_ppm": "600000", "top_k": "2",
+        "top_ids": "7,9", "top_logit_bits": "3f800000,3f000000",
+        "top_probability_ppm": "600000,300000", "runtime_ready": "true",
+    }, 2)
+    assert native_logits["sequence"] == 1
+    assert native_logits["selected"]["logit"] == 1.0
+    assert native_logits["selected"]["probability_pct"] == 60.0
+    assert [item["token_id"] for item in native_logits["top"]] == [7, 9]
+    invalid_logits = {
+        "request": "1", "seq": "1", "token_id": "999999999",
+        "selected_logit_bits": "3f800000",
+        "selected_probability_ppm": "600000", "top_k": "2",
+        "top_ids": "7,9", "top_logit_bits": "3f800000,3f000000",
+        "top_probability_ppm": "600000,300000", "runtime_ready": "true",
+    }
+    expect_backend_error(
+        lambda: module._native_token_logits(invalid_logits, 2),
+        "identity or probability drift",
+    )
+    inconsistent_logits = dict(invalid_logits)
+    inconsistent_logits.update({
+        "token_id": "7", "selected_logit_bits": "40000000",
+    })
+    expect_backend_error(
+        lambda: module._native_token_logits(inconsistent_logits, 2),
+        "selected/top logit drift",
+    )
+    impossible_mass = dict(invalid_logits)
+    impossible_mass.update({
+        "token_id": "7", "top_probability_ppm": "1000000,1000000",
+        "selected_probability_ppm": "1000000",
+    })
+    expect_backend_error(
+        lambda: module._native_token_logits(impossible_mass, 2),
+        "reported probability mass drift",
+    )
+    selected_outside = dict(invalid_logits)
+    selected_outside.update({
+        "token_id": "11", "selected_logit_bits": "3e800000",
+        "selected_probability_ppm": "100000",
+    })
+    assert module._native_token_logits(selected_outside, 2)["token_id"] == 11
+    outside_excess_mass = dict(selected_outside)
+    outside_excess_mass["selected_probability_ppm"] = "150000"
+    expect_backend_error(
+        lambda: module._native_token_logits(outside_excess_mass, 2),
+        "reported probability mass drift",
+    )
+    outside_above_top = dict(selected_outside)
+    outside_above_top["selected_logit_bits"] = "40000000"
+    expect_backend_error(
+        lambda: module._native_token_logits(outside_above_top, 2),
+        "exceeds reported top logits",
+    )
+
     low = module.resolve_controls({"reasoning_effort": "low"},
                                   server_kv_budget_gb=1.0)
     medium = module.resolve_controls({"reasoning": {"effort": "medium"}},
@@ -298,6 +380,11 @@ def main() -> None:
     module.Gemma4Backend._validate_request_schema(
         {"messages": [], "stream": True,
          "stream_options": {"include_usage": True}}, endpoint="chat",
+    )
+    module.Gemma4Backend._validate_request_schema(
+        {"messages": [], "response_format": {
+            "type": "salt_token_logits", "top_k": 8,
+        }}, endpoint="chat",
     )
     expect_request_error(
         lambda: module.Gemma4Backend._validate_request_schema(

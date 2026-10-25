@@ -1,6 +1,8 @@
 #ifndef SALT_TEXT_VERIFY_H
 #define SALT_TEXT_VERIFY_H
 
+#define SALT_TEXT_COMMITTED_LOGIT_OBSERVER 1
+
 #include "salt/area_scan.h"
 #include "salt/model.h"
 #include "salt/tensorops.h"
@@ -874,6 +876,18 @@ typedef struct SaltTextGenerationBinding {
     int (*target)(void *context, SaltTextTokenEpochController *controller,
                   const int32_t *tokens, uint32_t count,
                   const float *parent, SaltTextTokenEpochResult *result);
+
+    /* Optional bounded observations around an existing target call. They own
+     * no execution, selection, state, allocation, or publication authority. */
+    int (*observe_parent_logits)(
+        void *context, uint32_t accepted_base, int32_t token,
+        const float *parent_logits, uint32_t vocabulary);
+    int (*observe_committed_logits)(
+        void *context, uint32_t accepted_base,
+        const int32_t *tokens, uint32_t accepted_count,
+        const float *projection_logits, uint32_t projection_rows,
+        uint32_t vocabulary);
+    void *observe_committed_logits_context;
 
     /* Optional model-owned causal drafter. It proposes token IDs only and may
      * read immutable weights plus borrowed committed target state. It must not

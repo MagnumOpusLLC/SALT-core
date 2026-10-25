@@ -44,9 +44,10 @@
 #define G4_MAX_SOFT_TOKENS 70
 #define G4_KV_BYTES_PER_TOKEN 450560
 
-#define G4_PROTOCOL 5
+#define G4_PROTOCOL 6
 #define G4_SHA256_HEX 64
 #define G4_JOURNAL_CAPACITY 256
+#define G4_LOGIT_TOP_K_MAX 8u
 #define G4_RESPONSE_TOKEN_BYTES 64u
 #define G4_RESPONSE_OVERHEAD 1024u
 #define G4_DPR_MAX_HORIZON SALT_DPR_MAX_WALK_HORIZON
@@ -171,6 +172,22 @@ static int fill_state_digests(const SaltGemma4Text *model,
         model, state_sha256, facts_sha256);
 }
 
+typedef struct G4LogitEntry {
+    int32_t token_id;
+    uint32_t logit_bits;
+    uint32_t probability_ppm;
+} G4LogitEntry;
+
+typedef struct G4TokenLogits {
+    uint32_t valid;
+    uint32_t sequence;
+    int32_t token_id;
+    uint32_t selected_logit_bits;
+    uint32_t selected_probability_ppm;
+    uint32_t top_k;
+    G4LogitEntry top[G4_LOGIT_TOP_K_MAX];
+} G4TokenLogits;
+
 typedef struct G4CommitRecord {
     int used;
     unsigned long long original_request_id;
@@ -191,6 +208,9 @@ typedef struct G4CommitRecord {
     size_t prompt_offset;
     size_t output_offset;
     size_t response_offset;
+    size_t logits_offset;
+    int logits_count;
+    int logit_top_k;
     unsigned char state_sha256[32];
     unsigned char mindset_sha256[32];
     unsigned char facts_sha256[32];
@@ -200,12 +220,15 @@ typedef struct G4JournalArena {
     int *prompt_ids;
     int *output_ids;
     char *responses;
+    G4TokenLogits *token_logits;
     size_t prompt_capacity;
     size_t output_capacity;
     size_t response_capacity;
+    size_t logits_capacity;
     size_t prompt_used;
     size_t output_used;
     size_t response_used;
+    size_t logits_used;
 } G4JournalArena;
 
 static G4JournalArena g_journal_arena;
@@ -1024,12 +1047,14 @@ static int parse_turn_header(
         uint32_t *temperature_bits,
         uint64_t *sampler_seed,
         uint32_t *sampler_top_k,
+        uint32_t *logit_top_k,
         int *tool_mode, int *input_mode) {
     unsigned long long raw_position, raw_prompt, raw_image;
     unsigned long long raw_output, raw_proof, raw_seed;
     unsigned long long raw_tool_mode = 0;
     unsigned long long raw_input_mode = 0;
     unsigned int raw_sampler, raw_temperature, raw_top_k;
+    unsigned int raw_logit_top_k = 0u;
     float temperature;
     char extra;
     char canonical[640];
@@ -1038,10 +1063,39 @@ static int parse_turn_header(
         !history_turns || !position || !client_request_sha256 ||
         !request_sha256 || !prompt_bytes || !image_path_bytes ||
         !output_limit || !proof_state || !sampler_abi ||
-        !temperature_bits || !sampler_seed || !sampler_top_k || !tool_mode ||
-        !input_mode)
+        !temperature_bits || !sampler_seed || !sampler_top_k || !logit_top_k ||
+        !tool_mode || !input_mode)
         return SALT_TFAIL(-1);
-    if (!strncmp(line, "SALT_GEMMA4_TURN_V5 ",
+    if (!strncmp(line, "SALT_GEMMA4_TURN_V6 ",
+                 sizeof "SALT_GEMMA4_TURN_V6 " - 1u)) {
+        if (sscanf(line,
+                "SALT_GEMMA4_TURN_V6 request=%llu session_epoch=%llu "
+                "turn_id=%llu history_turns=%llu position=%llu "
+                "prompt_bytes=%llu image_path_bytes=%llu "
+                "output_limit=%llu proof_state=%llu sampler_abi=%u "
+                "temperature_bits=%8x seed=%llu top_k=%u "
+                "tool_mode=%llu input_mode=%llu top_logprobs=%u "
+                "client_request_sha256=%64s request_sha256=%64s %c",
+                request_id, session_epoch, turn_id, history_turns,
+                &raw_position, &raw_prompt, &raw_image, &raw_output, &raw_proof,
+                &raw_sampler, &raw_temperature, &raw_seed, &raw_top_k,
+                &raw_tool_mode, &raw_input_mode, &raw_logit_top_k,
+                client_request_sha256, request_sha256, &extra) != 18)
+            return SALT_TFAIL(-1);
+        n = snprintf(canonical, sizeof canonical,
+                "SALT_GEMMA4_TURN_V6 request=%llu session_epoch=%llu "
+                "turn_id=%llu history_turns=%llu position=%llu "
+                "prompt_bytes=%llu image_path_bytes=%llu "
+                "output_limit=%llu proof_state=%llu sampler_abi=%u "
+                "temperature_bits=%08x seed=%llu top_k=%u "
+                "tool_mode=%llu input_mode=%llu top_logprobs=%u "
+                "client_request_sha256=%s request_sha256=%s\n",
+                *request_id, *session_epoch, *turn_id, *history_turns,
+                raw_position, raw_prompt, raw_image, raw_output, raw_proof,
+                raw_sampler, raw_temperature, raw_seed, raw_top_k,
+                raw_tool_mode, raw_input_mode, raw_logit_top_k,
+                client_request_sha256, request_sha256);
+    } else if (!strncmp(line, "SALT_GEMMA4_TURN_V5 ",
                  sizeof "SALT_GEMMA4_TURN_V5 " - 1u)) {
         if (sscanf(line,
                 "SALT_GEMMA4_TURN_V5 request=%llu session_epoch=%llu "
@@ -1155,7 +1209,8 @@ static int parse_turn_header(
         raw_position > INT_MAX || raw_prompt > G4_MAX_PROMPT_BYTES ||
         raw_image > G4_MAX_IMAGE_PATH || raw_output < 1 ||
         raw_output > (unsigned long long)g_output_limit || raw_proof > 1 ||
-        raw_tool_mode > 1 ||
+        raw_tool_mode > 1 || raw_input_mode > 1 ||
+        raw_logit_top_k > G4_LOGIT_TOP_K_MAX ||
         !is_sha256_hex(client_request_sha256) ||
         !is_sha256_hex(request_sha256) ||
         !((raw_sampler == G4_SAMPLER_GREEDY_V1 &&
@@ -1174,6 +1229,7 @@ static int parse_turn_header(
     *temperature_bits = (uint32_t)raw_temperature;
     *sampler_seed = (uint64_t)raw_seed;
     *sampler_top_k = (uint32_t)raw_top_k;
+    *logit_top_k = (uint32_t)raw_logit_top_k;
     *tool_mode = (int)raw_tool_mode;
     *input_mode = (int)raw_input_mode;
     return 0;
@@ -1320,6 +1376,100 @@ static int emit_ready(const SaltGemma4Text *model,
     return fflush(stdout) == 0 ? 0 : -1;
 }
 
+static uint32_t logit_float_bits(float value) {
+    uint32_t bits;
+    memcpy(&bits, &value, sizeof bits);
+    return bits;
+}
+
+static int capture_token_logits(G4TokenLogits *record,
+                                const float *logits, int vocabulary,
+                                uint32_t sequence, int32_t selected,
+                                uint32_t top_k) {
+    float maximum;
+    double mass = 0.0;
+    uint32_t count = 0u;
+    if (!record || !logits || vocabulary < 1 || selected < 0 ||
+        selected >= vocabulary || sequence == 0u || top_k == 0u ||
+        top_k > G4_LOGIT_TOP_K_MAX || !isfinite(logits[0]))
+        return SALT_TFAIL(-1);
+    maximum = logits[0];
+    memset(record, 0, sizeof *record);
+    for (int token = 0; token < vocabulary; token++) {
+        uint32_t insertion;
+        float value = logits[token];
+        if (!isfinite(value)) return SALT_TFAIL(-1);
+        if (value > maximum) maximum = value;
+        if (count == top_k) {
+            float last;
+            memcpy(&last, &record->top[count - 1u].logit_bits, sizeof last);
+            if (value <= last) continue;
+        }
+        insertion = count < top_k ? count++ : count - 1u;
+        while (insertion > 0u) {
+            float previous;
+            memcpy(&previous, &record->top[insertion - 1u].logit_bits,
+                   sizeof previous);
+            if (value <= previous) break;
+            record->top[insertion] = record->top[insertion - 1u];
+            insertion--;
+        }
+        record->top[insertion].token_id = token;
+        record->top[insertion].logit_bits = logit_float_bits(value);
+    }
+    for (int token = 0; token < vocabulary; token++) {
+        float weight = salt_expf(logits[token] - maximum);
+        if (!isfinite(weight) || weight < 0.0f) return SALT_TFAIL(-1);
+        mass += (double)weight;
+    }
+    if (!(mass > 0.0) || !isfinite(mass)) return SALT_TFAIL(-1);
+    record->valid = 1u;
+    record->sequence = sequence;
+    record->token_id = selected;
+    record->selected_logit_bits = logit_float_bits(logits[selected]);
+    record->selected_probability_ppm = (uint32_t)(
+        (double)salt_expf(logits[selected] - maximum) / mass * 1000000.0 + 0.5);
+    record->top_k = count;
+    for (uint32_t index = 0u; index < count; index++) {
+        float value;
+        memcpy(&value, &record->top[index].logit_bits, sizeof value);
+        record->top[index].probability_ppm = (uint32_t)(
+            (double)salt_expf(value - maximum) / mass * 1000000.0 + 0.5);
+    }
+    return 0;
+}
+
+static int emit_token_logits(unsigned long long request_id,
+                             const G4TokenLogits *record) {
+    if (!record || !record->valid || record->sequence == 0u ||
+        record->top_k == 0u || record->top_k > G4_LOGIT_TOP_K_MAX)
+        return SALT_TFAIL(-1);
+    if (fprintf(stdout,
+            "GEMMA4_SERVER_LOGITS_V1 request=%llu seq=%u token_id=%d "
+            "selected_logit_bits=%08x selected_probability_ppm=%u top_k=%u "
+            "top_ids=",
+            request_id, record->sequence, record->token_id,
+            record->selected_logit_bits, record->selected_probability_ppm,
+            record->top_k) < 0)
+        return SALT_TFAIL(-1);
+    for (uint32_t index = 0u; index < record->top_k; index++)
+        if (fprintf(stdout, "%s%d", index ? "," : "",
+                    record->top[index].token_id) < 0)
+            return SALT_TFAIL(-1);
+    if (fputs(" top_logit_bits=", stdout) == EOF) return SALT_TFAIL(-1);
+    for (uint32_t index = 0u; index < record->top_k; index++)
+        if (fprintf(stdout, "%s%08x", index ? "," : "",
+                    record->top[index].logit_bits) < 0)
+            return SALT_TFAIL(-1);
+    if (fputs(" top_probability_ppm=", stdout) == EOF) return SALT_TFAIL(-1);
+    for (uint32_t index = 0u; index < record->top_k; index++)
+        if (fprintf(stdout, "%s%u", index ? "," : "",
+                    record->top[index].probability_ppm) < 0)
+            return SALT_TFAIL(-1);
+    return fprintf(stdout, " runtime_ready=" G4_RUNTIME_READY_TEXT "\n") < 0
+        ? -1 : 0;
+}
+
 static int fill_record(SaltGemma4Text *model, G4CommitRecord *record,
                        unsigned long long request_id,
                        unsigned long long turn_id,
@@ -1331,6 +1481,7 @@ static int fill_record(SaltGemma4Text *model, G4CommitRecord *record,
                        const int *output_ids, int output_limit, int output_count,
                        int stop_token, int synthetic_close,
                        int position_before, int position_after,
+                       const G4TokenLogits *token_logits, int logit_top_k,
                        const char *response, int response_bytes) {
     if (!model || !record || !client_request_sha256 || !request_sha256 ||
         !mindset_sha256 || !prompt_ids || prompt_tokens < 1 ||
@@ -1345,6 +1496,10 @@ static int fill_record(SaltGemma4Text *model, G4CommitRecord *record,
             g_journal_arena.output_capacity - g_journal_arena.output_used ||
         (size_t)response_bytes >
             g_journal_arena.response_capacity - g_journal_arena.response_used ||
+        logit_top_k < 0 || logit_top_k > (int)G4_LOGIT_TOP_K_MAX ||
+        (logit_top_k != 0 && (!token_logits ||
+         (size_t)output_count >
+            g_journal_arena.logits_capacity - g_journal_arena.logits_used)) ||
         !is_sha256_hex(client_request_sha256) ||
         !is_sha256_hex(request_sha256))
         return SALT_TFAIL(-1);
@@ -1368,12 +1523,25 @@ static int fill_record(SaltGemma4Text *model, G4CommitRecord *record,
     record->prompt_offset = g_journal_arena.prompt_used;
     record->output_offset = g_journal_arena.output_used;
     record->response_offset = g_journal_arena.response_used;
+    record->logits_offset = g_journal_arena.logits_used;
+    record->logits_count = logit_top_k ? output_count : 0;
+    record->logit_top_k = logit_top_k;
     memcpy(g_journal_arena.prompt_ids + record->prompt_offset, prompt_ids,
            (size_t)prompt_tokens * sizeof *prompt_ids);
     memcpy(g_journal_arena.output_ids + record->output_offset, output_ids,
            (size_t)output_count * sizeof *output_ids);
     memcpy(g_journal_arena.responses + record->response_offset,
            response, (size_t)response_bytes);
+    if (logit_top_k) {
+        for (int index = 0; index < output_count; index++)
+            if (!token_logits[index].valid ||
+                token_logits[index].sequence != (uint32_t)index + 1u ||
+                token_logits[index].token_id != output_ids[index] ||
+                token_logits[index].top_k != (uint32_t)logit_top_k)
+                return SALT_TFAIL(-1);
+        memcpy(g_journal_arena.token_logits + record->logits_offset,
+               token_logits, (size_t)output_count * sizeof *token_logits);
+    }
     if (fill_state_digests(
             model, record->state_sha256, record->facts_sha256) != 0)
         return SALT_TFAIL(-1);
@@ -1382,6 +1550,7 @@ static int fill_record(SaltGemma4Text *model, G4CommitRecord *record,
     g_journal_arena.prompt_used += (size_t)prompt_tokens;
     g_journal_arena.output_used += (size_t)output_count;
     g_journal_arena.response_used += (size_t)response_bytes;
+    g_journal_arena.logits_used += (size_t)record->logits_count;
     record->used = 1;
     return 0;
 }
@@ -1393,6 +1562,19 @@ static int emit_record(unsigned long long request_id,
     const char *finish_reason;
     if (!record || !record->used || (replayed != 0 && replayed != 1))
         return SALT_TFAIL(-1);
+    if (record->logits_count != 0) {
+        if (record->logits_count != record->output_steps ||
+            record->logit_top_k < 1 ||
+            record->logit_top_k > (int)G4_LOGIT_TOP_K_MAX ||
+            (size_t)record->logits_count >
+                g_journal_arena.logits_capacity - record->logits_offset)
+            return SALT_TFAIL(-1);
+        for (int index = 0; index < record->logits_count; index++)
+            if (emit_token_logits(request_id,
+                    g_journal_arena.token_logits + record->logits_offset +
+                    (size_t)index) != 0)
+                return SALT_TFAIL(-1);
+    }
     finish_reason = record->stop_token == -1 ? "length" : "stop";
     if (fprintf(stdout,
         "%s request=%llu original_request=%llu session_epoch=%llu "
@@ -1498,6 +1680,8 @@ typedef struct G4SchedulerAdapter {
     int *output_ids;
     char *response;
     int response_capacity, emit_cycle;
+    G4TokenLogits *token_logits;
+    uint32_t logit_top_k;
     G4CommitRecord *record;
 } G4SchedulerAdapter;
 
@@ -1514,8 +1698,75 @@ static int scheduler_step(void *opaque, int32_t token, float *logits) {
 
 static int scheduler_emit(void *opaque, uint32_t count, int32_t token, int stop) {
     G4SchedulerAdapter *a = (G4SchedulerAdapter *)opaque;
+    if (a->logit_top_k) {
+        G4TokenLogits *record;
+        if (!a->token_logits || count == 0u || count > a->request.output_limit)
+            return SALT_TFAIL(-1);
+        record = &a->token_logits[count - 1u];
+        if (record->valid) {
+            if (record->sequence != count || record->token_id != token ||
+                record->top_k != a->logit_top_k)
+                return SALT_TFAIL(-1);
+        } else if (capture_token_logits(record, a->request.logits,
+                salt_gemma4_text_vocab_size(a->model), count, token,
+                a->logit_top_k) != 0)
+            return SALT_TFAIL(-1);
+    }
     return emit_token(a->model, a->output_ids, a->request_id, a->turn_id,
         (int)count, token, stop, a->response, a->response_capacity);
+}
+
+static int scheduler_observe_parent_logits(
+        void *opaque, uint32_t accepted_base, int32_t token,
+        const float *parent_logits, uint32_t vocabulary) {
+    G4SchedulerAdapter *a = (G4SchedulerAdapter *)opaque;
+    uint32_t output_base;
+    if (!a || !a->logit_top_k || !a->token_logits || !parent_logits ||
+        vocabulary != (uint32_t)salt_gemma4_text_vocab_size(a->model) ||
+        a->result.output_count > UINT32_MAX - accepted_base)
+        return SALT_TFAIL(-1);
+    output_base = a->result.output_count + accepted_base;
+    if (output_base >= a->request.output_limit)
+        return SALT_TFAIL(-1);
+    return capture_token_logits(&a->token_logits[output_base],
+        parent_logits, (int)vocabulary, output_base + 1u,
+        token, a->logit_top_k);
+}
+
+static int scheduler_observe_committed_logits(
+        void *opaque, uint32_t accepted_base,
+        const int32_t *tokens, uint32_t accepted_count,
+        const float *projection_logits, uint32_t projection_rows,
+        uint32_t vocabulary) {
+    G4SchedulerAdapter *a = (G4SchedulerAdapter *)opaque;
+    G4TokenLogits *root;
+    uint32_t output_base;
+    if (!a || !a->logit_top_k || !a->token_logits ||
+        vocabulary != (uint32_t)salt_gemma4_text_vocab_size(a->model) ||
+        a->result.output_count > UINT32_MAX - accepted_base)
+        return SALT_TFAIL(-1);
+    output_base = a->result.output_count + accepted_base;
+    if (output_base >= a->request.output_limit)
+        return SALT_TFAIL(-1);
+    root = &a->token_logits[output_base];
+    if (accepted_count == 0u) {
+        memset(root, 0, sizeof *root);
+        return 0;
+    }
+    if (!tokens || !projection_logits || projection_rows < accepted_count ||
+        accepted_count > a->request.output_limit - output_base ||
+        !root->valid || root->sequence != output_base + 1u ||
+        root->token_id != tokens[0] || root->top_k != a->logit_top_k)
+        return SALT_TFAIL(-1);
+    for (uint32_t index = 1u; index < accepted_count; index++) {
+        const float *source = projection_logits +
+            (size_t)(index - 1u) * vocabulary;
+        if (capture_token_logits(&a->token_logits[output_base + index],
+                source, (int)vocabulary, output_base + index + 1u,
+                tokens[index], a->logit_top_k) != 0)
+            return SALT_TFAIL(-1);
+    }
+    return 0;
 }
 
 static int scheduler_node(void *opaque, SaltDprNodeMaterial *material,
@@ -1719,6 +1970,7 @@ static int serve_loop(SaltGemma4Text *text_model,
     char header[640];
     char *prompt = NULL, *image_path = NULL;
     int *prompt_ids = NULL, *output_ids = NULL, *positions = NULL;
+    G4TokenLogits *token_logits = NULL;
     unsigned char *mm_types = NULL, *padding = NULL;
     unsigned char mindset_sha256[32];
     unsigned char build_identity_sha256[32];
@@ -1774,6 +2026,8 @@ static int serve_loop(SaltGemma4Text *text_model,
     image_path = (char *)malloc(G4_MAX_IMAGE_PATH + 1u);
     prompt_ids = (int *)malloc((size_t)g_context * sizeof *prompt_ids);
     output_ids = (int *)malloc((size_t)g_output_limit * sizeof *output_ids);
+    token_logits = (G4TokenLogits *)calloc(
+        (size_t)g_output_limit, sizeof *token_logits);
     mm_types = (unsigned char *)calloc((size_t)g_context, 1);
     logits = (float *)malloc(
         (size_t)salt_gemma4_text_vocab_size(text_model) * sizeof *logits);
@@ -1789,17 +2043,24 @@ static int serve_loop(SaltGemma4Text *text_model,
         ((size_t)g_context + G4_JOURNAL_CAPACITY) *
         sizeof *g_journal_arena.output_ids);
     g_journal_arena.responses = (char *)malloc(journal_response_capacity);
+    g_journal_arena.token_logits = (G4TokenLogits *)calloc(
+        (size_t)g_context + G4_JOURNAL_CAPACITY,
+        sizeof *g_journal_arena.token_logits);
     g_journal_arena.prompt_capacity = (size_t)g_context;
     g_journal_arena.output_capacity =
         (size_t)g_context + G4_JOURNAL_CAPACITY;
     g_journal_arena.response_capacity = journal_response_capacity;
+    g_journal_arena.logits_capacity =
+        (size_t)g_context + G4_JOURNAL_CAPACITY;
     g_journal_arena.prompt_used = 0;
     g_journal_arena.output_used = 0;
     g_journal_arena.response_used = 0;
+    g_journal_arena.logits_used = 0;
     if (!prompt || !image_path || !prompt_ids || !output_ids || !mm_types ||
-        !logits || !proposal_logits || !response || !journal ||
+        !token_logits || !logits || !proposal_logits || !response || !journal ||
         !g_journal_arena.prompt_ids ||
-        !g_journal_arena.output_ids || !g_journal_arena.responses) {
+        !g_journal_arena.output_ids || !g_journal_arena.responses ||
+        !g_journal_arena.token_logits) {
         fputs("gemma4 persistent server: allocation failed\n", stderr);
         goto done;
     }
@@ -1993,6 +2254,7 @@ static int serve_loop(SaltGemma4Text *text_model,
         goto done;
     scheduler.model = text_model;
     scheduler.output_ids = output_ids;
+    scheduler.token_logits = token_logits;
     scheduler.response = response;
     scheduler.response_capacity = response_capacity;
     scheduler.attention_store = g_dpr_attention_enabled ? &dpr_attention_store : NULL;
@@ -2082,6 +2344,7 @@ static int serve_loop(SaltGemma4Text *text_model,
         uint32_t request_temperature_bits = 0;
         uint64_t request_sampler_seed = 0;
         uint32_t request_sampler_top_k = 1;
+        uint32_t request_logit_top_k = 0u;
         int started = 0;
         int dpr_prefill_hits = 0, dpr_prefill_cached = 0;
         uint8_t dpr_prefill_source[32] = {0};
@@ -2221,6 +2484,7 @@ static int serve_loop(SaltGemma4Text *text_model,
             g_journal_arena.prompt_used = 0;
             g_journal_arena.output_used = 0;
             g_journal_arena.response_used = 0;
+            g_journal_arena.logits_used = 0;
             journal_count = 0;
             turn_id = import_turn;
             history_turns = import_history_turns;
@@ -2322,6 +2586,7 @@ static int serve_loop(SaltGemma4Text *text_model,
             g_journal_arena.prompt_used = 0;
             g_journal_arena.output_used = 0;
             g_journal_arena.response_used = 0;
+            g_journal_arena.logits_used = 0;
             journal_count = 0;
             history_turns = 0;
             if (g_dpr_attention_enabled &&
@@ -2386,10 +2651,11 @@ static int serve_loop(SaltGemma4Text *text_model,
                 &prompt_bytes, &image_path_bytes, &request_output_limit,
                 &request_proof_state, &request_sampler_abi,
                 &request_temperature_bits, &request_sampler_seed,
-                &request_sampler_top_k, &request_tool_mode,
+                &request_sampler_top_k, &request_logit_top_k,
+                &request_tool_mode,
                 &request_input_mode) != 0 ||
             request_id != expected_request || prompt_bytes < 1) {
-            fputs("gemma4 persistent server: malformed TURN_V3/V4/V5 header\n", stderr);
+            fputs("gemma4 persistent server: malformed TURN header\n", stderr);
             goto done;
         }
         g_proof_state = g_process_proof_state || request_proof_state;
@@ -2433,6 +2699,12 @@ static int serve_loop(SaltGemma4Text *text_model,
             g_dpr_mode != SALT_DPR_OFF) {
             if (emit_reject(request_id, "sampler_dpr_unsupported",
                     "positive temperature is not qualified with DPR") != 0)
+                goto done;
+            continue;
+        }
+        if (request_logit_top_k && g_dpr_mode != SALT_DPR_OFF) {
+            if (emit_reject(request_id, "logits_dpr_unsupported",
+                    "token-logit output is not qualified with DPR") != 0)
                 goto done;
             continue;
         }
@@ -2581,6 +2853,7 @@ static int serve_loop(SaltGemma4Text *text_model,
                 g_journal_arena.prompt_used = 0;
                 g_journal_arena.output_used = 0;
                 g_journal_arena.response_used = 0;
+                g_journal_arena.logits_used = 0;
             }
         }
         if (g_dpr_attention_enabled &&
@@ -2636,6 +2909,15 @@ static int serve_loop(SaltGemma4Text *text_model,
         scheduler.request_id = request_id;
         scheduler.turn_id = turn_id;
         scheduler.record = NULL;
+        scheduler.logit_top_k = request_logit_top_k;
+        memset(token_logits, 0,
+               (size_t)g_output_limit * sizeof *token_logits);
+        scheduler.bindings.generation.observe_parent_logits =
+            request_logit_top_k ? scheduler_observe_parent_logits : NULL;
+        scheduler.bindings.generation.observe_committed_logits =
+            request_logit_top_k ? scheduler_observe_committed_logits : NULL;
+        scheduler.bindings.generation.observe_committed_logits_context =
+            request_logit_top_k ? &scheduler : NULL;
         scheduler.dpr.mode = g_dpr_mode;
         memcpy(scheduler.qa_key, dpr_qa_key, sizeof scheduler.qa_key);
         scheduler.request.sampler = (SaltSamplerConfig) {
@@ -2785,6 +3067,7 @@ static int serve_loop(SaltGemma4Text *text_model,
                 prompt_ids + input_prefix, prefill_count, image_tokens, output_ids,
                 request_output_limit, output_count,
                 stop_token, synthetic_close, position_before, position_after,
+                token_logits, (int)request_logit_top_k,
                 response, response_bytes) != 0) {
             emit_fatal(request_id, "journal_commit",
                        "native result journal commit failed");
@@ -2838,12 +3121,14 @@ done:
     free(dpr_stats_slots);
     free(dpr_edge_slots);
     free(journal);
+    free(g_journal_arena.token_logits);
     free(g_journal_arena.responses);
     free(g_journal_arena.output_ids);
     free(g_journal_arena.prompt_ids);
     memset(&g_journal_arena, 0, sizeof g_journal_arena);
     free(features);
     free(response);
+    free(token_logits);
     free(proposal_logits);
     free(logits);
     free(mm_types);

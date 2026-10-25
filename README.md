@@ -97,6 +97,71 @@ curl -sS http://127.0.0.1:8090/v1/chat/completions \
   -d '{"model":"gemma-4-26b-a4b-it","messages":[{"role":"user","content":"Hello from Magnum Opus."}],"max_tokens":32}'
 ```
 
+#### Optional committed-token logits
+
+A Gemma rotation engine using native protocol v6 advertises
+`salt_token_logits` under `openai_chat_completions.response_formats` in
+`GET /v1/models`. Request up to eight target-authoritative entries per
+committed output token:
+
+```bash
+curl -sS http://127.0.0.1:8090/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model":"gemma-4-26b-a4b-it",
+    "messages":[{
+      "role":"user",
+      "content":"Which planet is known as the Red Planet? A. Venus B. Mars C. Jupiter D. Mercury. Answer with only the option letter."
+    }],
+    "temperature":0,
+    "top_k":1,
+    "max_tokens":8,
+    "response_format":{"type":"salt_token_logits","top_k":8}
+  }'
+```
+
+The ordinary response text and `usage` fields are unchanged. Metadata is added
+under `x_salt.token_logits`; streaming responses carry it in the final SSE
+event. An abbreviated record is:
+
+```json
+{
+  "sequence": 1,
+  "token_id": 236799,
+  "authority": "target",
+  "distribution": "full_vocabulary",
+  "calibrated": false,
+  "selected": {
+    "token_id": 236799,
+    "logit_bits": "419d94e0",
+    "logit": 19.69769287109375,
+    "probability_ppm": 1000000,
+    "probability_pct": 100.0
+  },
+  "top": [
+    {"token_id": 236799, "logit_bits": "419d94e0",
+     "logit": 19.69769287109375,
+     "probability_ppm": 1000000, "probability_pct": 100.0}
+  ]
+}
+```
+
+The engine scans the authoritative logits already used for selection, stores a
+bounded record in initialization-owned memory, and publishes it with the
+existing token commit. The option does **not** constrain or mask logits, change
+the sampler, alter PREFILL/DECODE/TARGET shape, add a model step, or add tokens
+to `usage`. One visible answer letter normally still counts the committed turn
+close token, so `completion_tokens` may be two. Idempotent replay returns the
+same records. Requests fail closed when the native protocol is older than v6 or
+when DPR is enabled.
+
+These are raw full-vocabulary softmax values rounded to integer parts per
+million. They are not calibrated factual confidence and are not renormalized
+over the displayed choices. Do not infer semantic ambiguity from a low or high
+token probability. If ambiguity matters, include explicit options such as
+`Cannot be determined`, `Conflicting evidence`, or `Not applicable`, then map
+the selected option to that application status.
+
 Keep the listener on loopback: the API has no built-in client authentication or
 TLS. Changing a context/output request does not require restarting a healthy
 server unless its startup capacity is insufficient.

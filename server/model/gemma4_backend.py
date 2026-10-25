@@ -168,6 +168,7 @@ DEFAULT_MODEL_ID = "gemma-4-26b-a4b-it"
 GEMMA4_LEGACY_ROW_BYTES = 450_560
 GEMMA4_LAYERS = 30
 GEMMA4_MODEL_MAX_CONTEXT = 262_144
+GEMMA4_VOCAB_SIZE = 262_144
 GEMMA4_MAX_PREFILL_CHUNK = 4_096
 GEMMA4_SLIDING_LAYERS = 25
 GEMMA4_FULL_LAYERS = 5
@@ -540,6 +541,101 @@ def _canonical_uint(value: str, field: str, *, allow_zero: bool = False) -> int:
     return parsed
 
 
+def _native_csv_uints(value: str, field: str, count: int) -> tuple[int, ...]:
+    parts = value.split(",") if value else []
+    if len(parts) != count:
+        raise BackendError(f"native {field} count drift")
+    return tuple(_canonical_uint(item, field, allow_zero=True) for item in parts)
+
+
+def _native_csv_float_bits(value: str, field: str,
+                           count: int) -> tuple[tuple[str, float], ...]:
+    parts = value.split(",") if value else []
+    if len(parts) != count or any(re.fullmatch(r"[0-9a-f]{8}", item) is None
+                                  for item in parts):
+        raise BackendError(f"native {field} count or encoding drift")
+    decoded = tuple((item, struct.unpack(">f", struct.pack(">I", int(item, 16)))[0])
+                    for item in parts)
+    if any(not math.isfinite(item[1]) for item in decoded):
+        raise BackendError(f"native {field} is not finite")
+    return decoded
+
+
+def _native_token_logits(fields: dict[str, str], expected_top_k: int) -> dict:
+    top_k = _canonical_uint(fields["top_k"], "top_k")
+    if top_k != expected_top_k or top_k > 8 or \
+            re.fullmatch(r"[0-9a-f]{8}", fields["selected_logit_bits"]) is None or \
+            not _runtime_ready_field(fields["runtime_ready"]):
+        raise BackendError("native token-logit shape drift")
+    sequence = _canonical_uint(fields["seq"], "seq")
+    token_id = _canonical_uint(fields["token_id"], "token_id", allow_zero=True)
+    selected_ppm = _canonical_uint(
+        fields["selected_probability_ppm"], "selected_probability_ppm",
+        allow_zero=True,
+    )
+    if selected_ppm > 1_000_000:
+        raise BackendError("native selected probability drift")
+    selected_bits = fields["selected_logit_bits"]
+    selected_logit = struct.unpack(
+        ">f", struct.pack(">I", int(selected_bits, 16)),
+    )[0]
+    if not math.isfinite(selected_logit):
+        raise BackendError("native selected logit is not finite")
+    ids = _native_csv_uints(fields["top_ids"], "top_ids", top_k)
+    logits = _native_csv_float_bits(fields["top_logit_bits"], "top_logit_bits", top_k)
+    probabilities = _native_csv_uints(
+        fields["top_probability_ppm"], "top_probability_ppm", top_k,
+    )
+    if token_id >= GEMMA4_VOCAB_SIZE or any(value >= GEMMA4_VOCAB_SIZE for value in ids) or \
+            len(set(ids)) != top_k or \
+            any(value > 1_000_000 for value in probabilities):
+        raise BackendError("native top-logit identity or probability drift")
+    for index in range(1, top_k):
+        if logits[index][1] > logits[index - 1][1] or \
+                (logits[index][1] == logits[index - 1][1] and
+                 ids[index] < ids[index - 1]):
+            raise BackendError("native top-logit ordering drift")
+    if any(probabilities[index] > probabilities[index - 1]
+           for index in range(1, top_k)):
+        raise BackendError("native top-logit probability ordering drift")
+    selected_in_top = token_id in ids
+    if selected_in_top:
+        selected_index = ids.index(token_id)
+        if logits[selected_index][0] != selected_bits or \
+                probabilities[selected_index] != selected_ppm:
+            raise BackendError("native selected/top logit drift")
+    elif selected_logit > logits[-1][1] or \
+            (selected_logit == logits[-1][1] and token_id < ids[-1]) or \
+            selected_ppm > probabilities[-1]:
+        raise BackendError("native selected logit exceeds reported top logits")
+    probability_terms = top_k if selected_in_top else top_k + 1
+    probability_mass = sum(probabilities) + (0 if selected_in_top else selected_ppm)
+    if probability_mass > 1_000_000 + (probability_terms // 2):
+        raise BackendError("native reported probability mass drift")
+    top = tuple({
+        "token_id": ids[index],
+        "logit_bits": logits[index][0],
+        "logit": logits[index][1],
+        "probability_ppm": probabilities[index],
+        "probability_pct": probabilities[index] / 10_000.0,
+    } for index in range(top_k))
+    return {
+        "sequence": sequence,
+        "token_id": token_id,
+        "authority": "target",
+        "distribution": "full_vocabulary",
+        "calibrated": False,
+        "selected": {
+            "token_id": token_id,
+            "logit_bits": selected_bits,
+            "logit": selected_logit,
+            "probability_ppm": selected_ppm,
+            "probability_pct": selected_ppm / 10_000.0,
+        },
+        "top": top,
+    }
+
+
 def _canonical_int(value: str, field: str, *, minimum: int) -> int:
     if re.fullmatch(r"-?[0-9]+", value) is None or value in ("-0", "+0") or \
             (value.startswith("0") and len(value) > 1) or \
@@ -660,6 +756,11 @@ class PersistentGemmaEngine:
     TOKEN_KEYS = (
         "request", "session_epoch", "turn_id", "seq", "token_id",
         "stop", "bytes",
+    )
+    LOGITS_KEYS = (
+        "request", "seq", "token_id", "selected_logit_bits",
+        "selected_probability_ppm", "top_k", "top_ids",
+        "top_logit_bits", "top_probability_ppm", "runtime_ready",
     )
     COMMIT_KEYS = (
         "request", "original_request", "session_epoch", "turn_id",
@@ -882,7 +983,7 @@ class PersistentGemmaEngine:
                     fields = _exact_fields(line, marker.decode(), self.READY_KEYS)
                     if self.ready.is_set():
                         raise BackendError("duplicate persistent V2 READY")
-                    if (_canonical_uint(fields["protocol"], "protocol") not in (3, 4, 5) or
+                    if (_canonical_uint(fields["protocol"], "protocol") not in (3, 4, 5, 6) or
                             _canonical_uint(fields["model_context_limit"],
                                             "model_context_limit") !=
                             GEMMA4_MODEL_MAX_CONTEXT or
@@ -982,6 +1083,10 @@ class PersistentGemmaEngine:
                 elif marker == b"GEMMA4_SERVER_TOKEN_V2":
                     fields = _exact_fields(line, marker.decode(), self.TOKEN_KEYS)
                     self.events.put(("token", (fields, self._read_payload(fields))))
+                elif marker == b"GEMMA4_SERVER_LOGITS_V1":
+                    self.events.put(("logits", _exact_fields(
+                        line, marker.decode(), self.LOGITS_KEYS,
+                    )))
                 elif marker == b"GEMMA4_SERVER_COMMIT_V3":
                     fields = _exact_fields(line, marker.decode(), self.COMMIT_KEYS)
                     commit_fields = dict(fields)
@@ -1140,6 +1245,7 @@ class PersistentGemmaEngine:
                 proof_state: bool = False,
                 tool_mode: bool = False,
                 input_mode: bool = False,
+                top_logprobs: int = 0,
                 ) -> RunnerResult:
         if self.closed or self.process.poll() is not None or self.phase != "READY":
             raise BackendError("persistent Gemma V2 engine is not ready")
@@ -1154,6 +1260,13 @@ class PersistentGemmaEngine:
             raise RequestError("input_mode must be a boolean")
         if input_mode and getattr(self, "protocol_version", 3) < 5:
             raise RequestError("OpenAI input mode requires a V5 runner")
+        if isinstance(top_logprobs, bool) or not isinstance(top_logprobs, int) or \
+                top_logprobs < 0 or top_logprobs > 8:
+            raise RequestError("top_logprobs must be an integer from 0 to 8")
+        if top_logprobs and getattr(self, "protocol_version", 3) < 6:
+            raise RequestError("token-logit output requires a V6 runner")
+        if top_logprobs and self.dpr_mode != "off":
+            raise RequestError("token-logit output is not qualified with DPR")
 # SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
         if self.sampler_abi not in (1, 2) or \
                 re.fullmatch(r"[0-9a-f]{8}", self.temperature_bits) is None or \
@@ -1209,7 +1322,17 @@ class PersistentGemmaEngine:
             f"request_sha256={request_sha256}\n"
         ).encode("ascii")
 # SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
-        if input_mode:
+        if top_logprobs:
+            header = header.replace(
+                b"SALT_GEMMA4_TURN_V3 ", b"SALT_GEMMA4_TURN_V6 ", 1,
+            )
+            header = header.replace(
+                b"client_request_sha256=",
+                (f"tool_mode={int(tool_mode)} input_mode={int(input_mode)} "
+                 f"top_logprobs={top_logprobs} client_request_sha256=").encode("ascii"),
+                1,
+            )
+        elif input_mode:
             header = header.replace(b"SALT_GEMMA4_TURN_V3 ", b"SALT_GEMMA4_TURN_V5 ", 1)
             header = header.replace(b"client_request_sha256=",
                 f"tool_mode={int(tool_mode)} input_mode=1 client_request_sha256=".encode("ascii"), 1)
@@ -1222,6 +1345,7 @@ class PersistentGemmaEngine:
         input_tokens = None
         self.last_dpr_result = None
         memory_snapshots: list[dict[str, str]] = []
+        token_logits: list[dict] = []
         dpr_prefill_result: dict[str, str] | None = None
         dpr_waterfall_result: dict[str, str] | None = None
         pending_mentor: dict[str, str] | None = None
@@ -1539,6 +1663,15 @@ class PersistentGemmaEngine:
                     if on_token is not None:
                         on_token(seq, token_id, bool(stop))
                     accumulator.feed(seq, token_id, stop, payload)
+                elif kind == "logits":
+                    fields = cast(dict[str, str], value)
+                    if _canonical_uint(fields["request"], "request") != request_id or \
+                            not top_logprobs:
+                        raise BackendError("persistent V2 token-logit request drift")
+                    item = _native_token_logits(fields, top_logprobs)
+                    if item["sequence"] != len(token_logits) + 1:
+                        raise BackendError("persistent V2 token-logit sequence drift")
+                    token_logits.append(item)
                 elif kind == "reject":
                     fields, payload = cast(tuple[dict[str, str], bytes], value)
                     if _canonical_uint(fields["request"], "request") != request_id:
@@ -1596,7 +1729,13 @@ class PersistentGemmaEngine:
                         result, dpr_result=self.last_dpr_result,
                         memory_snapshots=tuple(memory_snapshots),
                         dpr_waterfall=dpr_waterfall_result,
+                        token_logits=tuple(token_logits),
                     )
+                    if ((len(result.token_logits) != result.completion_tokens)
+                            if top_logprobs else bool(result.token_logits)) or any(
+                            item["token_id"] != result.output_ids[index]
+                            for index, item in enumerate(result.token_logits)):
+                        raise BackendError("persistent V2 token-logit commit drift")
                     accumulator.finish(result)
                     self.session_epoch = result.session_epoch
                     self.turn_id = result.turn_id
@@ -1627,6 +1766,12 @@ class PersistentGemmaEngine:
                         replayed=True,
                         tool_mode=tool_mode,
                     )
+                    result = replace(result, token_logits=tuple(token_logits))
+                    if ((len(result.token_logits) != result.completion_tokens)
+                            if top_logprobs else bool(result.token_logits)) or any(
+                            item["token_id"] != result.output_ids[index]
+                            for index, item in enumerate(result.token_logits)):
+                        raise BackendError("persistent V2 token-logit replay drift")
                     self._emit_replay_deltas(result, on_start, on_delta)
                     self.last_committed_request_id = result.client_request_sha256
                     self.active_request = None
@@ -1899,7 +2044,8 @@ class PersistentGemmaEngine:
     def replay(self, *, client_request_sha256: str, request_sha256: str,
                on_start: Callable[[], None],
                on_delta: Callable[[str, str], None],
-               tool_mode: bool = False) -> RunnerResult:
+               tool_mode: bool = False,
+               top_logprobs: int = 0) -> RunnerResult:
         if self.closed or self.process.poll() is not None or self.phase != "READY":
             raise BackendError("persistent Gemma V2 engine is not ready")
         client_request_sha256 = self._identity_digest(
@@ -1919,6 +2065,7 @@ class PersistentGemmaEngine:
             f"request_sha256={request_sha256}\n"
         ).encode("ascii")
         self._write_command(frame)
+        token_logits: list[dict] = []
         deadline = time.monotonic() + self.timeout
         try:
             while True:
@@ -1926,6 +2073,16 @@ class PersistentGemmaEngine:
                 if remaining <= 0:
                     raise queue.Empty
                 kind, value = self.events.get(timeout=remaining)
+                if kind == "logits":
+                    fields = cast(dict[str, str], value)
+                    if _canonical_uint(fields["request"], "request") != request_id or \
+                            not top_logprobs:
+                        raise BackendError("persistent V2 replay token-logit request drift")
+                    item = _native_token_logits(fields, top_logprobs)
+                    if item["sequence"] != len(token_logits) + 1:
+                        raise BackendError("persistent V2 replay token-logit sequence drift")
+                    token_logits.append(item)
+                    continue
                 if kind == "replay":
                     fields, payload = cast(tuple[dict[str, str], bytes], value)
                     result = self._result(
@@ -1942,6 +2099,12 @@ class PersistentGemmaEngine:
                         replayed=True,
                         tool_mode=tool_mode,
                     )
+                    result = replace(result, token_logits=tuple(token_logits))
+                    if ((len(result.token_logits) != result.completion_tokens)
+                            if top_logprobs else bool(result.token_logits)) or any(
+                            item["token_id"] != result.output_ids[index]
+                            for index, item in enumerate(result.token_logits)):
+                        raise BackendError("persistent V2 token-logit replay drift")
                     self._emit_replay_deltas(result, on_start, on_delta)
                     self.last_committed_request_id = result.client_request_sha256
                     self.active_request = None
@@ -2260,6 +2423,7 @@ class Controls:
     seed: int = 0
     top_k: int = 1
     rng_abi: str = "none"
+    top_logprobs: int = 0
 # SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
 
 
@@ -2310,6 +2474,7 @@ class RunnerResult:
     dpr_result: dict | None = None
     memory_snapshots: tuple[dict[str, str], ...] = ()
     dpr_waterfall: dict[str, str] | None = None
+    token_logits: tuple[dict, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -3024,6 +3189,22 @@ def _sampler_controls(body: dict) -> tuple[str, int, float, str, int, int, str]:
         f"{temperature_bits:08x}", seed, top_k, "splitmix64-counter-v1",
     )
 # SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
+
+
+def _logit_output_top_k(body: dict) -> int:
+    value = body.get("response_format")
+    if value is None or value == {"type": "text"}:
+        return 0
+    if not isinstance(value, dict) or set(value) != {"type", "top_k"} or \
+            value.get("type") != "salt_token_logits":
+        raise RequestError("response_format must be text or salt_token_logits")
+    top_k = value.get("top_k")
+    if isinstance(top_k, bool) or not isinstance(top_k, int) or \
+            top_k < 1 or top_k > 8:
+        raise RequestError("salt_token_logits top_k must be an integer from 1 to 8")
+    return top_k
+
+
 def resolve_controls(body: dict, *, server_kv_budget_gb: float,
                      context_tokens: int = 512,
                      max_output_tokens: int = 128,
@@ -3035,6 +3216,7 @@ def resolve_controls(body: dict, *, server_kv_budget_gb: float,
     effort = _reasoning_effort(body)
 # SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
     sampler = _sampler_controls(body)
+    top_logprobs = _logit_output_top_k(body)
 # SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
     explicit_output = _output_token_value(body)
     if not isinstance(context_tokens, int) or isinstance(context_tokens, bool) or \
@@ -3084,6 +3266,7 @@ def resolve_controls(body: dict, *, server_kv_budget_gb: float,
         seed=sampler[4],
         top_k=sampler[5],
         rng_abi=sampler[6],
+        top_logprobs=top_logprobs,
 # SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
     )
 
@@ -4566,12 +4749,20 @@ class Gemma4Backend:
             "sessions": ("complete-request-authority" if self.config.session_mode == "openai"
                          else "one-live-kv-session-per-launch"),
             "private_protocol": (
+                "gemma4-persistent-v6" if getattr(self.engine, "protocol_version", 3) >= 6 else
                 "gemma4-persistent-v5" if getattr(self.engine, "protocol_version", 3) >= 5 else
                 "gemma4-persistent-v4" if getattr(self.engine, "protocol_version", 3) >= 4
                 else "gemma4-persistent-v3"
             ),
             "openai_chat_completions": {
                 "text": True, "models": True, "usage": True,
+                "response_formats": (["text", "salt_token_logits"]
+                                     if getattr(self.engine, "protocol_version", 3) >= 6
+                                     else ["text"]),
+                **({"token_logits": {
+                    "authority": "target", "maximum_top_k": 8,
+                    "calibrated": False, "state_effect": "none",
+                }} if getattr(self.engine, "protocol_version", 3) >= 6 else {}),
                 "function_tools": getattr(self.engine, "protocol_version", 3) >= 4,
                 "tool_choice": ["none", "auto", "required", "named"],
                 "tool_argument_streaming": "commit-validated-buffered",
@@ -4810,8 +5001,8 @@ class Gemma4Backend:
         if body.get("audio") is not None:
             raise RequestError("audio output is not supported")
         response_format = body.get("response_format")
-        if response_format is not None and response_format != {"type": "text"}:
-            raise RequestError("structured response formats are not supported")
+        if response_format is not None:
+            _logit_output_top_k(body)
         truncation = body.get("truncation")
         if truncation is not None and truncation != "disabled":
             raise RequestError("automatic truncation is not supported")
@@ -5041,6 +5232,8 @@ class Gemma4Backend:
             )
         if self.engine is None:
             raise BackendError("persistent Gemma engine has not started")
+        if controls.top_logprobs and self.engine.protocol_version < 6:
+            raise RequestError("salt_token_logits requires native protocol 6")
         started = on_stream_start or (lambda: None)
         public_delta = on_stream_delta or (lambda _kind, _value: None)
         def delta(kind: str, value: str) -> None:
@@ -5052,6 +5245,7 @@ class Gemma4Backend:
                 client_request_sha256=client_request_sha256,
                 request_sha256=request_sha256,
                 on_start=started, on_delta=delta,
+                top_logprobs=controls.top_logprobs,
                 **({"tool_mode": True} if tool_mode else {}),
             )
             if not result.replayed:
@@ -5166,6 +5360,7 @@ class Gemma4Backend:
                 on_start=started, on_delta=delta,
                 on_token=on_native_token,
                 proof_state=strict_proof,
+                top_logprobs=controls.top_logprobs,
                 **({"tool_mode": True} if tool_mode else {}),
                 **({"input_mode": True} if openai_mode else {}),
             )
@@ -5334,6 +5529,8 @@ def _chat_payload(completion: Completion, *, model: str,
     payload["x_salt"]["dpr"] = result.dpr_result
     payload["x_salt"]["memory_snapshots"] = list(result.memory_snapshots)
 # SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
+    if result.token_logits:
+        payload["x_salt"]["token_logits"] = list(result.token_logits)
     if completion.mentor_state is not None:
         payload["x_salt"]["mentor_state"] = completion.mentor_state
     if completion.kv_cache.mode in ("prefix", "prefix-replay"):
@@ -5439,6 +5636,8 @@ def _responses_payload(completion: Completion, *, model: str,
     payload["x_salt"]["dpr"] = result.dpr_result
     payload["x_salt"]["memory_snapshots"] = list(result.memory_snapshots)
 # SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
+    if result.token_logits:
+        payload["x_salt"]["token_logits"] = list(result.token_logits)
     if status == "incomplete":
         payload["incomplete_details"] = {"reason": "max_output_tokens"}
     if completion.mentor_state is not None:
@@ -5988,6 +6187,8 @@ def handler_for(backend: Gemma4Backend):
             })
             if "session_mode" in payload["x_salt"]:
                 done["x_salt"]["session_mode"] = payload["x_salt"]["session_mode"]
+            if "token_logits" in payload["x_salt"]:
+                done["x_salt"]["token_logits"] = payload["x_salt"]["token_logits"]
             self._write_sse(done)
             if include_usage:
                 self._write_sse({

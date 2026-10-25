@@ -77,7 +77,7 @@
       "snapshot_path": "models/gemma4-26b-a4b/compat/v6/server/gemma4_backend.py",
       "snapshot_sha256": "361facedbc836412b3423eee3fea0261aeec01fdec3dc0ba061c7961ceaa7562",
       "live_projection": "pin-live-source-v1",
-      "live_sha256": "3523dd3c343d6222f3a5bc5a42907161ac30061414efb0dc552b423ccd276568"
+      "live_sha256": "b724668d419140e48102c60db8470697be557f9b8e4729659f2476ed2d99d5f8"
     },
     {
       "logical_path": "server/gemma4_compat.py",
