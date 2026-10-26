@@ -246,6 +246,12 @@ assigns sessions, spills/restores only idle committed sessions when needed, and
 estimates remaining work from observed DPR coverage. Production serving source
 does not live under `tools/`; QA wrappers remain non-production.
 
+The isolated rotation runtime's native protocol v6 optionally publishes a
+bounded target-logit record for each committed output token. The canonical
+request, response fields, usage accounting, and ambiguity guidance are in
+[`Optional committed-token logits`](../../README.md#optional-committed-token-logits).
+Older native protocols advertise only the ordinary `text` response format.
+
 For full-context GB10 hosting, use `server/model/gemma4-endpoint-launch.sh` with the
 explicit `spark-hmm` recipe, CTX262144/O128, W8, four engines, and one heavy
 request at a time. For the low-cost V520 candidate, use the same endpoint entry

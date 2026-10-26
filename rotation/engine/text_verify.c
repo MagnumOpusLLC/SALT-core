@@ -2990,6 +2990,13 @@ static int target_sublane_execute(
             goto fail;
         }
         memset(&step, 0, sizeof step);
+        if (binding->observe_parent_logits &&
+            binding->observe_parent_logits(
+                binding->observe_committed_logits_context,
+                accepted,
+                candidate_token_ids[(size_t)round * workers],
+                parent, program->vocabulary) != 0)
+            goto fail;
         if (binding->target(binding->context, controller,
                 candidate_token_ids + (size_t)round * workers,
                 workers, parent, &step) != 0) {
@@ -3028,6 +3035,15 @@ static int target_sublane_execute(
                        step.target.accepted_count) {
             goto fail;
         }
+        if (binding->observe_committed_logits &&
+            binding->observe_committed_logits(
+                binding->observe_committed_logits_context,
+                accepted,
+                candidate_token_ids + (size_t)round * workers,
+                step.target.accepted_count,
+                step.target.projection_logits, step.target.projection_rows,
+                program->vocabulary) != 0)
+            goto fail;
         if (add_backend_stats(&backend, &step.target.backend) != 0 ||
             UINT32_MAX - model_rows < step.target.projection_rows ||
             UINT32_MAX - accepted < step.target.accepted_count)
@@ -3941,6 +3957,9 @@ static int schedule_native_binding_valid(const SaltTextSchedulerBindings *b) {
         (n->executor->layer_lookahead && !ops->prepare_next_layer) ||
         b->generation.program || b->generation.policy || b->generation.projection ||
         b->generation.select_proposal || b->generation.target ||
+        b->generation.observe_parent_logits ||
+        b->generation.observe_committed_logits ||
+        b->generation.observe_committed_logits_context ||
         b->generation.prove_prefix || b->generation.materialize_known ||
         b->generation.target_sublane_matrix || b->generation.target_sublane_ready_items ||
         b->generation.target_sublane_ready_capacity ||

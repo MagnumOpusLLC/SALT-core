@@ -3924,6 +3924,11 @@ typedef struct HistoryTargetContract {
     uint32_t strict_parent_root;
     uint32_t proof_limit, proof_calls, proof_checks;
     uint32_t materializations, materialized_rows;
+#ifdef SALT_TEXT_COMMITTED_LOGIT_OBSERVER
+    uint32_t logit_rounds, logit_rows;
+    uint32_t logit_parent_base, logit_parent_ready;
+    int32_t logit_parent_token;
+#endif
     SaltAreaNfqMatrix sublane_matrix;
     SaltAreaNfqRoute sublane_routes[64];
     SaltAreaNfqItem sublane_items[64];
@@ -3993,6 +3998,53 @@ static int ht_observe_target(void *context, const SaltTextGenerated *g,
     if (g->proposal_source == SALT_TEXT_PROPOSAL_SOURCE_PROJECTION) f->projection_hits++;
     return 0;
 }
+
+#ifdef SALT_TEXT_COMMITTED_LOGIT_OBSERVER
+static int ht_observe_parent_logits(
+        void *context, uint32_t accepted_base, int32_t token,
+        const float *parent_logits, uint32_t vocabulary) {
+    HistoryTargetContract *f = context;
+    int32_t selected = 0;
+    if (!f || !parent_logits || vocabulary != 10u ||
+        accepted_base != f->logit_rows || f->logit_parent_ready)
+        return -1;
+    for (uint32_t index = 1u; index < vocabulary; index++)
+        if (parent_logits[index] > parent_logits[selected])
+            selected = (int32_t)index;
+    if (selected != token) return -1;
+    f->logit_parent_base = accepted_base;
+    f->logit_parent_token = token;
+    f->logit_parent_ready = 1u;
+    return 0;
+}
+
+static int ht_observe_committed_logits(
+        void *context, uint32_t accepted_base,
+        const int32_t *tokens, uint32_t accepted_count,
+        const float *projection_logits, uint32_t projection_rows,
+        uint32_t vocabulary) {
+    HistoryTargetContract *f = context;
+    if (!f || vocabulary != 10u || !f->logit_parent_ready ||
+        accepted_base != f->logit_parent_base || accepted_base != f->logit_rows)
+        return -1;
+    f->logit_parent_ready = 0u;
+    if (accepted_count == 0u) return 0;
+    if (!tokens || !projection_logits || projection_rows < accepted_count ||
+        tokens[0] != f->logit_parent_token)
+        return -1;
+    for (uint32_t index = 1u; index < accepted_count; index++) {
+        const float *source = projection_logits +
+            (size_t)(index - 1u) * vocabulary;
+        int32_t selected = 0;
+        for (uint32_t token = 1u; token < vocabulary; token++)
+            if (source[token] > source[selected]) selected = (int32_t)token;
+        if (selected != tokens[index]) return -1;
+    }
+    f->logit_rounds++;
+    f->logit_rows += accepted_count;
+    return 0;
+}
+#endif
 
 static int ht_select_proposal(void *context,
         SaltTextTokenEpochController *controller,
@@ -4291,6 +4343,11 @@ static int two_lane_target_sublane_contract(void) {
         b.is_stop = ht_stop;
         b.select_proposal = ht_select_proposal;
         b.target = ht_target;
+#ifdef SALT_TEXT_COMMITTED_LOGIT_OBSERVER
+        b.observe_parent_logits = ht_observe_parent_logits;
+        b.observe_committed_logits = ht_observe_committed_logits;
+        b.observe_committed_logits_context = &f;
+#endif
         b.target_sublane_matrix = &f.sublane_matrix;
         b.target_sublane_ready_items = f.sublane_ready;
         b.target_sublane_ready_capacity = 8u;
@@ -4340,6 +4397,12 @@ static int two_lane_target_sublane_contract(void) {
                   f.state.position == 80u + expected_accepted &&
                   f.sublane_matrix.resolved && !f.sublane_matrix.ready,
               "two-lane X40/W8/Y5 ownership or first-j termination changed");
+#ifdef SALT_TEXT_COMMITTED_LOGIT_OBSERVER
+        CHECK(f.logit_rounds == expected_rounds &&
+                  f.logit_rows == expected_accepted &&
+                  f.logit_parent_ready == 0u,
+              "two-lane target logit observation changed");
+#endif
         CHECK(memcmp(generated.candidate_token_ids, truth,
                   (size_t)expected_accepted * sizeof truth[0]) == 0,
               "two-lane target changed the accepted global prefix");
@@ -5107,6 +5170,14 @@ static int native_schedule_binding_contract(void) {
     NATIVE_REFUSE(b.generation.projection = &f.projection, "native projection admitted");
     NATIVE_REFUSE(b.generation.select_proposal = schedule_test_select_proposal, "native proposal admitted");
     NATIVE_REFUSE(b.generation.target = schedule_test_target, "native TARGET admitted");
+#ifdef SALT_TEXT_COMMITTED_LOGIT_OBSERVER
+    NATIVE_REFUSE(b.generation.observe_parent_logits = ht_observe_parent_logits,
+                  "native parent-logit observer admitted");
+    NATIVE_REFUSE(b.generation.observe_committed_logits = ht_observe_committed_logits,
+                  "native committed-logit observer admitted");
+    NATIVE_REFUSE(b.generation.observe_committed_logits_context = &f,
+                  "native logit observer context admitted");
+#endif
     NATIVE_REFUSE(b.generation.prove_prefix = ht_prove_prefix, "native prefix proof admitted");
     NATIVE_REFUSE(b.generation.materialize_known = ht_materialize_known, "native materializer admitted");
     NATIVE_REFUSE(b.generation.target_sublane_matrix = &matrix, "native target matrix admitted");

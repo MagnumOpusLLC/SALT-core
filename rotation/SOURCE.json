@@ -9,7 +9,15 @@
     "rotation/build-server.sh": "Use the repository .venv Python by default.",
     "rotation/build-server-cpu.sh": "Use the repository .venv Python by default.",
     "rotation/engine.config": "Keep the external MTP assistant disabled until its separately supplied artifact is authenticated.",
-    "server/serve-launch.sh": "Canonicalize and forward the exact preload-state file validated by the public launcher."
+    "server/serve-launch.sh": "Canonicalize and forward the exact preload-state file validated by the public launcher.",
+    "rotation/engine/model/inference.c": "Emit bounded target-logit records from the existing token commit without changing inference shape.",
+    "rotation/engine/include/salt/text_verify.h": "Declare one observation-only callback for completed target-row logits.",
+    "rotation/engine/text_verify.c": "Observe each completed TARGET round without changing scheduling, selection, or state.",
+    "server/model/gemma4_backend.py": "Validate and transport committed native token-logit records without rescoring.",
+    "tests/test_text_verify.c": "Verify observation-only logit association across multi-round TARGET.",
+    "tools/test/gemma4-server-test.py": "Verify bounded output-mode parsing and native metadata rejection.",
+    "README.md": "Document the protocol-v6 committed-token-logit request, response, usage, and interpretation.",
+    "models/gemma4-26b-a4b/README.md": "Scope token-logit publication to the isolated rotation runtime and link canonical usage."
   },
   "excluded": [
     "rotation/validation",
